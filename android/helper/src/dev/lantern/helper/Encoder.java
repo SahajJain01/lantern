@@ -11,6 +11,7 @@ import android.view.Surface;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -23,6 +24,8 @@ final class Encoder {
     /** KEY_REPEAT_PREVIOUS_FRAME_AFTER is in microseconds. */
     static final long REPEAT_AFTER_US = 100_000;
     private static final long DEQUEUE_TIMEOUT_US = 10_000;
+    /** close() waits at most this long for the drain's in-flight dequeue before releasing anyway. */
+    static final long CLOSE_LOCK_MS = 1000;
     /** Test hook (--display-test --recreate): skip the reuse path to measure the fallback. */
     static volatile boolean forceRecreate;
 
@@ -94,6 +97,13 @@ final class Encoder {
     private int width;
     private int height;
     private volatile boolean closed;
+    /** Bumped by every reconfigure: packets copied from an older codec configuration are dropped. */
+    private volatile int generation;
+    /** Why there is no codec (recreate failed); null while healthy. Guarded by lock. */
+    private String failure;
+    private volatile DrainLoop loop;
+    /** Drain-thread-only copy buffer; the sink runs after the codec buffer is released. */
+    private ByteBuffer scratch = ByteBuffer.allocate(1 << 16);
     /** Set by reconfigure; cleared (and logged) at the first encoded frame afterwards. */
     private long resizeStartMs = -1;
     private String resizePath;
@@ -197,6 +207,7 @@ final class Encoder {
                 throw new IllegalStateException("encoder closed");
             }
             resizeStartMs = SystemClock.elapsedRealtime();
+            generation++;
             Surface old = surface;
             surface = null;
             try {
@@ -215,12 +226,21 @@ final class Encoder {
                 codec = null;
                 try {
                     codec = create();
-                } catch (java.io.IOException io) {
-                    throw new IllegalStateException("encoder recreate", io);
+                    surface = configureAndStart(codec, w, h);
+                } catch (java.io.IOException | RuntimeException re) {
+                    failure = "recreate " + w + "x" + h + " failed: " + re;
+                    if (codec != null) {
+                        try {
+                            codec.release();
+                        } catch (RuntimeException ignored) {
+                        }
+                        codec = null;
+                    }
+                    throw new IllegalStateException("encoder recreate", re);
                 }
-                surface = configureAndStart(codec, w, h);
                 resizePath = "recreate";
             }
+            failure = null;
             if (old != null) {
                 old.release();
             }
@@ -246,52 +266,114 @@ final class Encoder {
         }
     }
 
-    /**
-     * Blocking loop: hands every output buffer to {@code sink} until {@link #close}. The data buffer
-     * is only valid during the call.
-     */
+    /** {@link #drainTo(VideoSink, int, DrainLoop.Recovery, DrainLoop.FailureListener)} without owner hooks. */
     void drainTo(VideoSink sink, int win) {
-        while (!closed) {
-            lock.lock();
-            try {
-                if (closed || codec == null || surface == null) {
-                    continue;
-                }
-                int index;
-                try {
-                    index = codec.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US);
-                } catch (IllegalStateException e) {
-                    continue; // codec mid-reconfigure or released; loop re-checks state
-                }
-                if (index < 0) {
-                    continue;
-                }
-                try {
-                    ByteBuffer data = codec.getOutputBuffer(index);
-                    boolean config = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-                    boolean key = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
-                    if (data != null && info.size > 0) {
-                        data.position(info.offset).limit(info.offset + info.size);
-                        if (!config && resizeStartMs >= 0) {
-                            Droid.log("resize_ms=" + (SystemClock.elapsedRealtime() - resizeStartMs)
-                                + " path=" + resizePath + " size=" + width + "x" + height + " win=" + win);
-                            resizeStartMs = -1;
-                        }
-                        sink.packet(win, info.presentationTimeUs, config, key, data);
-                    }
-                } finally {
-                    codec.releaseOutputBuffer(index, false);
-                }
-            } finally {
-                lock.unlock();
+        drainTo(sink, win, null, null);
+    }
+
+    /**
+     * Blocking loop (see {@link DrainLoop}) until {@link #close} or a reported failure. Each packet is
+     * copied out and its codec buffer released under the lock; {@code sink} runs unlocked, so a sink
+     * that blocks cannot stall reconfigure/close. {@code recovery} handles recoverable codec errors;
+     * {@code failed} hears once about fatal codec errors and sink exceptions.
+     */
+    void drainTo(VideoSink sink, int win, DrainLoop.Recovery recovery, DrainLoop.FailureListener failed) {
+        DrainLoop l = new DrainLoop(lock, new DrainLoop.Source() {
+            @Override
+            public DrainLoop.Packet dequeue() {
+                return dequeueLocked(win);
             }
+
+            @Override
+            public DrainLoop.Fault classify(Exception e) {
+                return Encoder.classify(e);
+            }
+
+            @Override
+            public int generation() {
+                return generation;
+            }
+        }, sink, win, recovery, failed);
+        l.logger = Droid::log;
+        loop = l;
+        if (closed) {
+            return;
+        }
+        l.run();
+    }
+
+    static DrainLoop.Fault classify(Exception e) {
+        if (e instanceof MediaCodec.CodecException) {
+            MediaCodec.CodecException ce = (MediaCodec.CodecException) e;
+            if (ce.isTransient()) {
+                return DrainLoop.Fault.TRANSIENT;
+            }
+            if (ce.isRecoverable()) {
+                return DrainLoop.Fault.RECOVERABLE;
+            }
+        }
+        // Plain IllegalStateException: the codec is released or in the error state. Reconfigure and
+        // close hold the lock, so it is never a mid-reconfigure race.
+        return DrainLoop.Fault.FATAL;
+    }
+
+    /** Lock held (DrainLoop). */
+    private DrainLoop.Packet dequeueLocked(int win) {
+        if (closed) {
+            return DrainLoop.IDLE;
+        }
+        if (codec == null || surface == null) {
+            if (failure != null) {
+                throw new IllegalStateException("no codec: " + failure);
+            }
+            return DrainLoop.IDLE;
+        }
+        int index = codec.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US);
+        if (index < 0) {
+            return null;
+        }
+        try {
+            ByteBuffer data = codec.getOutputBuffer(index);
+            if (data == null || info.size <= 0) {
+                return null;
+            }
+            boolean config = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+            boolean key = (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+            data.position(info.offset).limit(info.offset + info.size);
+            if (scratch.capacity() < info.size) {
+                scratch = ByteBuffer.allocate(Math.max(info.size, scratch.capacity() * 2));
+            }
+            scratch.clear();
+            scratch.put(data);
+            scratch.flip();
+            if (!config && resizeStartMs >= 0) {
+                Droid.log("resize_ms=" + (SystemClock.elapsedRealtime() - resizeStartMs)
+                    + " path=" + resizePath + " size=" + width + "x" + height + " win=" + win);
+                resizeStartMs = -1;
+            }
+            return new DrainLoop.Packet(generation, info.presentationTimeUs, config, key, scratch);
+        } finally {
+            codec.releaseOutputBuffer(index, false);
         }
     }
 
     /** Idempotent. */
     void close() {
         closed = true;
-        lock.lock();
+        DrainLoop l = loop;
+        if (l != null) {
+            l.stop();
+        }
+        boolean locked;
+        try {
+            locked = lock.tryLock(CLOSE_LOCK_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            locked = false;
+        }
+        if (!locked) {
+            Droid.log("encoder: close could not take the lock in " + CLOSE_LOCK_MS + " ms, releasing anyway");
+        }
         try {
             if (codec != null) {
                 try {
@@ -306,7 +388,9 @@ final class Encoder {
                 surface = null;
             }
         } finally {
-            lock.unlock();
+            if (locked) {
+                lock.unlock();
+            }
         }
     }
 }

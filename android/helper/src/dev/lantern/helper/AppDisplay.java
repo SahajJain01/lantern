@@ -59,6 +59,7 @@ public final class AppDisplay implements AutoCloseable {
     }
 
     static final long TASK_WAIT_MS = 3000;
+    static final long DRAIN_JOIN_MS = 1000;
 
     private final int win;
     private final String pkg;
@@ -70,6 +71,9 @@ public final class AppDisplay implements AutoCloseable {
     private android.hardware.display.DisplayManager.DisplayListener listener;
     private android.hardware.display.DisplayManager publicDm;
     private volatile ResizeListener resizeListener;
+    private final Object failureLock = new Object();
+    private StreamListener streamListener;
+    private String failure;
     private int displayId = -1;
     private int taskId = -1;
     private int width;
@@ -114,11 +118,13 @@ public final class AppDisplay implements AutoCloseable {
 
         drain = new Thread(() -> {
             try {
-                encoder.drainTo(sink, win);
+                encoder.drainTo(sink, win, this::recoverEncoder, this::streamFailed);
             } catch (RuntimeException e) {
-                Droid.log("drain win=" + win + " ended: " + e);
+                streamFailed("drain: " + e);
             }
         }, "lantern-drain-" + win);
+        // A sink stuck in a socket write must not keep the process alive after close abandons it.
+        drain.setDaemon(true);
         drain.start();
 
         listenerThread.start();
@@ -253,6 +259,56 @@ public final class AppDisplay implements AutoCloseable {
         resizeListener = l;
     }
 
+    /**
+     * Hears once when the stream dies (fatal codec error, failed recovery, or the sink threw). If the
+     * stream already failed, {@code l} is told immediately. Not called for a normal {@link #close}.
+     */
+    public void setStreamListener(StreamListener l) {
+        String f;
+        synchronized (failureLock) {
+            streamListener = l;
+            f = failure;
+        }
+        if (f != null && l != null) {
+            l.streamFailed(win, f);
+        }
+    }
+
+    /** Non-null once the stream failed (see {@link StreamListener}). */
+    public String streamFailure() {
+        synchronized (failureLock) {
+            return failure;
+        }
+    }
+
+    private void streamFailed(String reason) {
+        StreamListener l;
+        synchronized (failureLock) {
+            if (failure != null) {
+                return;
+            }
+            failure = reason;
+            l = streamListener;
+        }
+        Droid.log("stream_failed win=" + win + " reason=" + reason);
+        if (l != null) {
+            l.streamFailed(win, reason);
+        }
+    }
+
+    /** Recoverable codec error (drain thread): stop/configure/start at the current size, repoint the display. */
+    private void recoverEncoder() {
+        int w;
+        int h;
+        int d;
+        synchronized (this) {
+            w = width;
+            h = height;
+            d = dpi;
+        }
+        resize(w, h, d);
+    }
+
     /** True when no task remains on the display (the app exited, e.g. Back on its root). */
     public boolean taskVanished() {
         return tasks().isEmpty();
@@ -337,9 +393,15 @@ public final class AppDisplay implements AutoCloseable {
         encoder.close();
         if (drain != null) {
             try {
-                drain.join(1000);
+                drain.join(DRAIN_JOIN_MS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            }
+            if (drain.isAlive()) {
+                // Only a sink still blocked in packet() gets here (the loop itself has stopped).
+                Droid.log("close: win=" + win + " drain still in sink after " + DRAIN_JOIN_MS
+                    + " ms, interrupting and abandoning it");
+                drain.interrupt();
             }
         }
         Droid.log("close: win=" + win + " display=" + displayId + " released");

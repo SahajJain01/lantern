@@ -104,6 +104,7 @@ public final class Main {
             long t0 = android.os.SystemClock.elapsedRealtime();
             try (AppDisplay d = AppDisplay.open(1, pkg, 0, 1280, 800, 160, sink)) {
                 d.setResizeListener((win, w, h) -> Droid.log("listener Resized win=" + win + " " + w + "x" + h));
+                d.setStreamListener((win, reason) -> System.out.println("stream_failed win=" + win + " " + reason));
                 System.out.println("display=" + d.displayId() + " task=" + d.taskId()
                     + " open_ms=" + (android.os.SystemClock.elapsedRealtime() - t0));
                 System.out.flush();
