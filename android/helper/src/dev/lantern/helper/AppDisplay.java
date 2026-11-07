@@ -21,7 +21,7 @@ import java.util.List;
  * One phone app on its own virtual display, encoded to a {@link VideoSink}. {@link #close()} quits the
  * app (removes every task on the display) and releases the display and encoder.
  */
-public final class AppDisplay implements AutoCloseable {
+public final class AppDisplay implements DisplayHandle {
     /** Pure policy (no Android classes): host tests call this. */
     static final class Policy {
         // android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_* (Global Constraints).
@@ -51,11 +51,6 @@ public final class AppDisplay implements AutoCloseable {
         static int[] rotated(int w, int h, int from, int to) {
             return (from % 2) == (to % 2) ? new int[] {w, h} : new int[] {h, w};
         }
-    }
-
-    /** Orientation change reported to the host (Task 5 routes it as {@code Resized{w,h}}). */
-    public interface ResizeListener {
-        void resized(int win, int w, int h);
     }
 
     static final long TASK_WAIT_MS = 3000;
@@ -239,22 +234,33 @@ public final class AppDisplay implements AutoCloseable {
         }
     }
 
+    @Override
     public int displayId() {
         return displayId;
     }
 
+    @Override
     public int taskId() {
         return taskId;
     }
 
+    /** Opened.codec: {@code "h265"} for HEVC, else {@code "h264"}. */
+    @Override
+    public String codec() {
+        return encoder.mime().equals(android.media.MediaFormat.MIMETYPE_VIDEO_HEVC) ? "h265" : "h264";
+    }
+
+    @Override
     public synchronized int width() {
         return width;
     }
 
+    @Override
     public synchronized int height() {
         return height;
     }
 
+    @Override
     public void setResizeListener(ResizeListener l) {
         resizeListener = l;
     }
@@ -263,6 +269,7 @@ public final class AppDisplay implements AutoCloseable {
      * Hears once when the stream dies (fatal codec error, failed recovery, or the sink threw). If the
      * stream already failed, {@code l} is told immediately. Not called for a normal {@link #close}.
      */
+    @Override
     public void setStreamListener(StreamListener l) {
         String f;
         synchronized (failureLock) {
@@ -310,16 +317,19 @@ public final class AppDisplay implements AutoCloseable {
     }
 
     /** True when no task remains on the display (the app exited, e.g. Back on its root). */
+    @Override
     public boolean taskVanished() {
         return tasks().isEmpty();
     }
 
     /** IDR on the next frame (focus, new subscriber). */
+    @Override
     public void requestKeyframe() {
         encoder.requestSyncFrame();
     }
 
     /** Display gets exactly {@code w×h}; the encoder gets it aligned down to 16. */
+    @Override
     public synchronized void resize(int w, int h, int newDpi) {
         if (closed) {
             throw new IllegalStateException("closed");

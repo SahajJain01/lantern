@@ -121,6 +121,15 @@ public final class Proto {
         return b.array();
     }
 
+    /** Same as above from a buffer's remaining bytes (consumes them): one copy, straight from the codec. */
+    public static byte[] encodeVideo(long ptsUs, boolean config, boolean key, ByteBuffer data) {
+        ByteBuffer b = ByteBuffer.allocate(9 + data.remaining());
+        b.putLong(ptsUs);
+        b.put((byte) ((config ? VIDEO_FLAG_CONFIG : 0) | (key ? VIDEO_FLAG_KEY : 0)));
+        b.put(data);
+        return b.array();
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Input
 

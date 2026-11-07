@@ -30,12 +30,97 @@ public final class Main {
                 }
                 System.exit(displayTest(args[1]));
                 return;
+            case "serve":
+                if (args.length != 3 || !args[2].matches("[0-9a-f]{32}")) {
+                    break;
+                }
+                System.exit(serve(args[1], args[2]));
+                return;
             default:
                 break;
         }
-        System.err.println("usage: dev.lantern.helper.Main --version | --ping | --session-test <seconds>"
-            + " | --display-test <pkg> [--recreate]");
+        System.err.println("usage: dev.lantern.helper.Main serve <socket-name> <token: 32 hex>"
+            + " | --version | --ping | --session-test <seconds> | --display-test <pkg> [--recreate]");
         System.exit(2);
+    }
+
+    /** A helper nobody connects to must not linger. */
+    static final long ACCEPT_TIMEOUT_MS = 30_000;
+
+    /**
+     * Serves exactly one lanternd connection on the abstract socket {@code name}. After a valid Hello
+     * it starts Cleanup and the Session (so an unauthenticated client changes nothing), runs the
+     * {@link Router} until EOF/Bye/error, then closes everything and exits 0.
+     */
+    private static int serve(String name, String token) {
+        Droid.prepare();
+        Droid.log("serve: socket=" + name + " pid=" + Droid.pid());
+        final android.net.LocalSocket client;
+        final boolean[] accepted = {false};
+        try (android.net.LocalServerSocket server = new android.net.LocalServerSocket(name)) {
+            Thread watchdog = new Thread(() -> {
+                try {
+                    Thread.sleep(ACCEPT_TIMEOUT_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                synchronized (accepted) {
+                    if (!accepted[0]) {
+                        Droid.log("serve: no client after " + ACCEPT_TIMEOUT_MS + " ms, exiting");
+                        System.exit(3);
+                    }
+                }
+            }, "lantern-accept-watchdog");
+            watchdog.setDaemon(true);
+            watchdog.start();
+            System.out.println("listening " + name);
+            System.out.flush();
+            client = server.accept();
+            synchronized (accepted) {
+                accepted[0] = true;
+            }
+            watchdog.interrupt();
+        } catch (java.io.IOException e) {
+            Droid.log("serve: listen/accept on " + name + " failed: " + e);
+            System.err.println("serve: " + e);
+            return 1;
+        }
+        Droid.log("serve: client connected");
+        try {
+            java.io.DataInputStream in = new java.io.DataInputStream(
+                new java.io.BufferedInputStream(client.getInputStream(), 1 << 16));
+            java.io.DataOutputStream out = new java.io.DataOutputStream(
+                new java.io.BufferedOutputStream(client.getOutputStream(), 1 << 16));
+            Router router = new Router(in, out, AppDisplay::open, new Input(), Control.CODEC, token,
+                () -> Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log)),
+                () -> {
+                    // shutdown first: close() alone may not wake a thread blocked in write.
+                    try {
+                        client.shutdownInput();
+                    } catch (java.io.IOException | RuntimeException ignored) {
+                        // already closed
+                    }
+                    try {
+                        client.shutdownOutput();
+                    } catch (java.io.IOException | RuntimeException ignored) {
+                        // already closed
+                    }
+                    client.close();
+                },
+                Droid::log);
+            router.run();
+        } catch (java.io.IOException e) {
+            Droid.log("serve: " + e);
+            return 1;
+        } finally {
+            try {
+                client.close();
+            } catch (java.io.IOException ignored) {
+                // done anyway
+            }
+        }
+        Droid.log("serve: exit");
+        return 0;
     }
 
     /** Starts a session, holds it for {@code seconds}, closes it. Prints {@code pid=N} for kill tests. */

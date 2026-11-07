@@ -44,6 +44,20 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `error` | `msg: string` |
 | `bye` | none |
 
+## Session rules (phone helper)
+
+- The first frame must be `hello` on stream 0 with `version: 1` and the helper's token. The helper
+  replies `hello{version:1, token:""}`; on a wrong version or token (or anything else first) it sends
+  one `error{msg}` on stream 0 and closes the connection. Phone state (stay-awake, panel) only
+  changes after a valid hello.
+- `opened` is sent before any video for that window. `codec` is `"h265"` or `"h264"`.
+- `resized{w,h}` answers `resize`, and is also sent unprompted when the app rotates its display.
+- A per-window failure (open, resize or the video stream) is `error{msg}` followed by
+  `closed{reason:"error"}` on that window's stream; the session continues.
+- Frames for an unknown or already-closed window are ignored. A protocol error (bad JSON, unknown
+  `t`, bad input payload, video from the host) ends the session with `error{msg}` on stream 0.
+- `bye` (or EOF) ends the session: the helper closes every window without sending `closed`.
+
 ## Golden vectors
 
 `host/proto/golden/*.bin` are complete encoded frames (header + payload) used by both the Rust and
