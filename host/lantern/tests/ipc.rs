@@ -811,3 +811,93 @@ async fn client_that_never_opens_is_closed() {
     assert!(t0.elapsed() >= ipc::OPEN_TIMEOUT - Duration::from_millis(100));
     daemon.shutdown().await;
 }
+
+fn open_with(user: u32, w: u32, h: u32, dpi: u32) -> Frame {
+    control(
+        0,
+        Control::Open {
+            pkg: "com.example".into(),
+            user,
+            w,
+            h,
+            dpi,
+            activation_token: None,
+        },
+    )
+}
+
+/// The helper throws ProtocolError (ending every window) on an open outside its ranges
+/// (Router.java open/range), so the daemon must reject it and never forward it.
+#[tokio::test]
+async fn out_of_range_open_is_rejected_and_not_forwarded() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    helper.next_session().await;
+    let too_big_user = i32::MAX as u32 + 1;
+    let bad = [
+        open_with(too_big_user, 1280, 800, 160),
+        open_with(u32::MAX, 1280, 800, 160),
+        open_with(0, 0, 800, 160),
+        open_with(0, 16385, 800, 160),
+        open_with(0, 1280, 0, 160),
+        open_with(0, 1280, 16385, 160),
+        open_with(0, 1280, 800, 0),
+        open_with(0, 1280, 800, 4097),
+    ];
+    for frame in bad {
+        let (mut client, reply) = connect_open(&daemon.sock, frame.clone()).await;
+        let reply = reply.unwrap_or_else(|| panic!("no error reply for {:?}", decode(&frame)));
+        assert!(
+            matches!(decode(&reply), Control::Error { .. }),
+            "expected an error for {:?}, got {:?}",
+            decode(&frame),
+            decode(&reply)
+        );
+        assert_eof(&mut client).await;
+    }
+    helper.assert_quiet().await;
+
+    // The inclusive upper bounds are accepted and forwarded unchanged.
+    let edge = open_with(i32::MAX as u32, 16384, 16384, 4096);
+    let mut client = UnixStream::connect(&daemon.sock).await.unwrap();
+    send(&mut client, &edge).await;
+    let fwd = helper.next().await;
+    assert_eq!(decode(&fwd), decode(&edge));
+    daemon.shutdown().await;
+}
+
+/// Same for resize (Router.java resize/range): an out-of-range one costs only that window.
+#[tokio::test]
+async fn out_of_range_resize_drops_only_that_client() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (mut good, good_win) = open_window(&daemon.sock, &mut helper, "com.good", 0).await;
+    let bad = [
+        (0, 800, 160),
+        (16385, 800, 160),
+        (1280, 0, 160),
+        (1280, 16385, 160),
+        (1280, 800, 0),
+        (1280, 800, 4097),
+    ];
+    for (i, (w, h, dpi)) in bad.into_iter().enumerate() {
+        let (mut client, win) =
+            open_window(&daemon.sock, &mut helper, &format!("com.bad{i}"), 0).await;
+        send(&mut client, &control(win, Control::Resize { w, h, dpi })).await;
+        assert_eof(&mut client).await;
+        let close = helper.next().await;
+        assert_eq!(
+            (close.stream, decode(&close)),
+            (win, Control::Close),
+            "resize {w}x{h}@{dpi} must close only its window, never reach the helper"
+        );
+    }
+    helper.assert_quiet().await;
+
+    for (w, h, dpi) in [(1, 1, 1), (16384, 16384, 4096)] {
+        let resize = control(good_win, Control::Resize { w, h, dpi });
+        send(&mut good, &resize).await;
+        assert_eq!(helper.next().await, resize, "in-range resize is forwarded");
+    }
+    daemon.shutdown().await;
+}

@@ -178,10 +178,32 @@ fn control(stream: u32, c: Control) -> Frame {
     }
 }
 
+/// Limits the helper enforces on host control messages. A value outside them makes the helper
+/// throw `ProtocolError`, ending the whole session (every window), so the daemon checks them
+/// first. Mirrors `Router.open`/`Router.resize`/`Router.range` in
+/// android/helper/src/dev/lantern/helper/Router.java; keep the two in sync. `focus` and `close`
+/// carry no range-checked fields.
+pub mod limits {
+    use std::ops::RangeInclusive;
+
+    /// `open.w`, `open.h`, `resize.w`, `resize.h`: `range(m, "w"|"h", 1, 16384)`.
+    pub const SIZE: RangeInclusive<u32> = 1..=16384;
+    /// `open.dpi`, `resize.dpi`: `range(m, "dpi", 1, 4096)`.
+    pub const DPI: RangeInclusive<u32> = 1..=4096;
+    /// `open.user`: `range(m, "user", 0, Integer.MAX_VALUE)`.
+    pub const USER: RangeInclusive<u32> = 0..=i32::MAX as u32;
+
+    /// Whether a window geometry is within what the helper accepts.
+    pub fn geometry_ok(w: u32, h: u32, dpi: u32) -> bool {
+        SIZE.contains(&w) && SIZE.contains(&h) && DPI.contains(&dpi)
+    }
+}
+
 /// Checks a client frame on its window's own stream and returns what to forward to the
-/// helper, or `None` for a protocol error. A malformed input payload would end the whole
-/// helper session (every window), so it is caught here and costs only this client. The
-/// activation token is daemon↔window only and is stripped from a client's `focus`.
+/// helper, or `None` for a protocol error. A malformed input payload or a resize outside
+/// [`limits`] would end the whole helper session (every window), so it is caught here and
+/// costs only this client. The activation token is daemon↔window only and is stripped from a
+/// client's `focus`.
 fn client_frame_for_helper(frame: Frame) -> Option<Frame> {
     match frame.kind {
         Kind::Input => InputEvent::decode(&frame.payload).is_ok().then_some(frame),
@@ -193,7 +215,8 @@ fn client_frame_for_helper(frame: Frame) -> Option<Frame> {
                     activation_token: None,
                 },
             )),
-            Control::Resize { .. } | Control::Close => Some(frame),
+            Control::Resize { w, h, dpi } => limits::geometry_ok(w, h, dpi).then_some(frame),
+            Control::Close => Some(frame),
             _ => None,
         },
     }
@@ -420,6 +443,17 @@ impl Hub {
             self.reply_and_finish(cid, control(0, Control::Error { msg }));
             return Ok(());
         };
+        if !limits::USER.contains(&user) || !limits::geometry_ok(w, h, dpi) {
+            tracing::warn!(cid, pkg, user, w, h, dpi, "open out of range; rejecting it");
+            let msg = format!(
+                "open out of range: user={user} (0..={}), w={w} h={h} (1..={}), dpi={dpi} (1..={})",
+                limits::USER.end(),
+                limits::SIZE.end(),
+                limits::DPI.end()
+            );
+            self.reply_and_finish(cid, control(0, Control::Error { msg }));
+            return Ok(());
+        }
         let Some(helper) = helper else {
             self.reply_and_finish(
                 cid,
