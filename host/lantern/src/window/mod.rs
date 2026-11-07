@@ -10,6 +10,7 @@ pub mod decode;
 pub mod geometry;
 pub mod input;
 pub mod keymap;
+pub mod outcome;
 pub mod render;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use lantern_proto::{
-    read_frame, write_frame, CloseReason, Control, Frame, InputEvent, Kind, VideoPacket,
+    read_frame, write_frame, Control, Frame, InputEvent, Kind, VideoPacket,
 };
 use serde::{Deserialize, Serialize};
 use winit::application::ApplicationHandler;
@@ -38,6 +39,7 @@ use debounce::Debouncer;
 use decode::{Decoder, Nv12Frame};
 use geometry::{display_request, rotation_request, ResizeRequests, ResizedKind};
 use input::InputState;
+use outcome::{Exit, OpenState};
 use render::Renderer;
 
 pub const DEFAULT_LOGICAL: (u32, u32) = (1280, 800);
@@ -253,8 +255,8 @@ struct App {
     launch_token: Option<String>,
     logical: (u32, u32),
     open_sent: bool,
-    /// Window id from `opened`.
-    win: Option<u32>,
+    /// Our window id (from `opened`) and the phone's last error.
+    state: OpenState,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     activator: Option<activation::Activator>,
@@ -270,7 +272,6 @@ struct App {
     last_frame: Option<Nv12Frame>,
     closing: Option<Instant>,
     disconnected: Option<Instant>,
-    error_msg: Option<String>,
     exit_code: i32,
     /// Logical window size to remember, captured at exit.
     final_size: Option<(u32, u32)>,
@@ -292,7 +293,7 @@ impl App {
     }
 
     fn send_input(&self, ev: Option<InputEvent>) {
-        if let (Some(ev), Some(win)) = (ev, self.win) {
+        if let (Some(ev), Some(win)) = (ev, self.state.win()) {
             if self.closing.is_none() && self.disconnected.is_none() {
                 self.send(Frame {
                     kind: Kind::Input,
@@ -306,6 +307,13 @@ impl App {
     fn exit(&mut self, el: &ActiveEventLoop, code: i32) {
         self.exit_code = code;
         el.exit();
+    }
+
+    fn finish(&mut self, el: &ActiveEventLoop, exit: Exit) {
+        if let Some(message) = &exit.message {
+            eprintln!("lantern: {message}");
+        }
+        self.exit(el, exit.code);
     }
 
     /// Drops everything holding Wayland objects (activation, wgpu surface, window) while
@@ -385,7 +393,7 @@ impl App {
 
     /// Asks the phone for a display matching the window's physical size.
     fn maybe_resize(&mut self, (pw, ph): (u32, u32)) {
-        let Some(win) = self.win else { return };
+        let Some(win) = self.state.win() else { return };
         if self.closing.is_some() || self.disconnected.is_some() {
             return;
         }
@@ -437,18 +445,16 @@ impl App {
 
     fn on_control(&mut self, el: &ActiveEventLoop, stream: u32, c: Control) {
         match c {
-            Control::Error { msg, .. } if stream == 0 && self.win.is_none() => {
-                eprintln!("lantern: {msg}");
-                self.exit(el, 1);
-            }
             Control::Error { msg, .. } => {
                 tracing::error!(stream, msg, "error from phone");
-                self.error_msg = Some(msg);
+                if let Some(exit) = self.state.on_error(stream, msg) {
+                    self.finish(el, exit);
+                }
             }
             Control::Focus { activation_token } => {
-                if self.win == Some(stream) {
+                if self.state.win() == Some(stream) {
                     self.activate(activation_token);
-                } else if self.win.is_none() {
+                } else if self.state.win().is_none() {
                     self.pending_focus = Some((stream, activation_token));
                 }
             }
@@ -458,9 +464,9 @@ impl App {
                 codec,
                 w,
                 h,
-            } if self.win.is_none() => {
+            } if self.state.win().is_none() => {
                 tracing::info!(win = stream, phone_display, task, %codec, w, h, "opened");
-                self.win = Some(stream);
+                self.state.opened(stream);
                 self.display = (w, h);
                 if let Err(error) = self.create_window(el) {
                     eprintln!("lantern: {error:#}");
@@ -473,25 +479,17 @@ impl App {
                     }
                 }
             }
-            Control::Resized { w, h } if self.win == Some(stream) => {
+            Control::Resized { w, h } if self.state.win() == Some(stream) => {
                 tracing::info!(w, h, "resized");
                 self.on_resized(w, h);
             }
-            Control::Closed { reason } if self.win == Some(stream) => {
-                tracing::info!(?reason, "closed");
-                match reason {
-                    CloseReason::Error => {
-                        eprintln!(
-                            "lantern: {}",
-                            self.error_msg
-                                .as_deref()
-                                .unwrap_or("the window failed on the phone")
-                        );
-                        self.exit(el, 1);
-                    }
-                    CloseReason::Closed | CloseReason::AppExited => self.exit(el, 0),
+            Control::Closed { reason } => match self.state.on_closed(stream, reason) {
+                Some(exit) => {
+                    tracing::info!(stream, ?reason, "closed");
+                    self.finish(el, exit);
                 }
-            }
+                None => tracing::debug!(stream, ?reason, "ignored closed"),
+            },
             other => tracing::debug!(stream, ?other, "ignored control"),
         }
     }
@@ -512,8 +510,8 @@ impl App {
             tracing::info!(win, "already open; focused the existing window");
             self.exit(el, 0);
         } else {
-            eprintln!("lantern: the daemon closed the connection");
-            self.exit(el, 1);
+            let exit = self.state.on_disconnected();
+            self.finish(el, exit);
         }
     }
 
@@ -521,7 +519,7 @@ impl App {
         if self.closing.is_some() {
             return;
         }
-        if let Some(win) = self.win {
+        if let Some(win) = self.state.win() {
             tracing::info!(win, "closing");
             self.send_control(win, Control::Close);
         }
@@ -633,7 +631,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => self.scale = scale_factor,
             WindowEvent::Focused(true) => {
-                if let (Some(win), None) = (self.win, self.closing) {
+                if let (Some(win), None) = (self.state.win(), self.closing) {
                     self.send_control(
                         win,
                         Control::Focus {
@@ -778,7 +776,7 @@ pub fn run(pkg: &str) -> Result<i32> {
         launch_token,
         logical: remembered_size(pkg),
         open_sent: false,
-        win: None,
+        state: OpenState::default(),
         window: None,
         renderer: None,
         activator: None,
@@ -791,7 +789,6 @@ pub fn run(pkg: &str) -> Result<i32> {
         last_frame: None,
         closing: None,
         disconnected: None,
-        error_msg: None,
         exit_code: 0,
         final_size: None,
         debug_steps: debug_steps.into(),

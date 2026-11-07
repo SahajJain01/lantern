@@ -554,6 +554,42 @@ async fn helper_closed_is_forwarded_and_releases_window() {
     daemon.shutdown().await;
 }
 
+/// An open the phone cannot do: the helper answers error{msg} then closed{error} on N with no
+/// opened. Both must reach the window client (which prints msg and exits 1, window::outcome).
+#[tokio::test]
+async fn failed_open_error_and_closed_reach_the_client() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let deadline = Instant::now() + STEP;
+    let mut client = loop {
+        let mut client = UnixStream::connect(&daemon.sock).await.unwrap();
+        send(&mut client, &open("com.foo", 0, None)).await;
+        match timeout(Duration::from_millis(200), read_frame_async(&mut client)).await {
+            Err(_) => break client, // forwarded; waiting on the helper
+            Ok(_) => {
+                assert!(Instant::now() < deadline, "phone session never became active");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let fwd = helper.next().await;
+    let win = fwd.stream;
+    assert!(matches!(decode(&fwd), Control::Open { .. }));
+    let error = control(win, Control::error("no launch intent for com.foo"));
+    let closed = control(
+        win,
+        Control::Closed {
+            reason: CloseReason::Error,
+        },
+    );
+    helper.send(error.clone());
+    helper.send(closed.clone());
+    assert_eq!(recv(&mut client).await, Some(error));
+    assert_eq!(recv(&mut client).await, Some(closed));
+    assert_eof(&mut client).await;
+    daemon.shutdown().await;
+}
+
 #[tokio::test]
 async fn wrong_stream_drops_the_client() {
     let (mut helper, port) = FakeHelper::spawn().await;
