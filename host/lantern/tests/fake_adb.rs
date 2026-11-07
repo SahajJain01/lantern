@@ -45,6 +45,7 @@ case "$1" in
     ;;
   push) exit 0 ;;
   forward)
+    if [ "$2" = --list ]; then cat '{forwards}' 2>/dev/null; exit 0; fi
     if [ "$2" != --remove ]; then sleep {forward_delay}; fi
     exit 0
     ;;
@@ -53,6 +54,7 @@ exit 0
 "#,
             log = log.display(),
             pidfile = pidfile.display(),
+            forwards = dir.join("forwards").display(),
         );
         std::fs::write(&program, script).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -194,6 +196,47 @@ async fn failed_start_cleans_up_too() {
     let calls = fake.calls();
     let port = forward_port(&calls);
     assert!(calls.contains(&format!("-s fake-serial forward --remove {port}")));
+    wait_dead(fake.helper_pid()).await;
+}
+
+/// A SIGKILLed daemon cannot remove its forward; the next session start must remove every
+/// `localabstract:lantern-*` forward of its own serial (and nothing else) before adding its own.
+#[tokio::test]
+async fn start_removes_stale_lantern_forwards_of_its_serial() {
+    let fake = FakeAdb::new("stale", "0");
+    std::fs::write(
+        fake.dir.join("forwards"),
+        "fake-serial tcp:1111 localabstract:lantern-0badf00d\n\
+         other-serial tcp:2222 localabstract:lantern-12345678\n\
+         fake-serial tcp:3333 localabstract:scrcpy\n\
+         fake-serial tcp:4444 localabstract:lantern-feedface\n",
+    )
+    .unwrap();
+    let _ = start(&fake.adb()).await;
+    let calls = fake.calls();
+    let pos = |needle: &str| calls.iter().position(|c| c == needle);
+    let stale_1 = pos("-s fake-serial forward --remove tcp:1111");
+    let stale_4 = pos("-s fake-serial forward --remove tcp:4444");
+    assert!(
+        stale_1.is_some() && stale_4.is_some(),
+        "stale forwards kept: {calls:#?}"
+    );
+    for kept in ["tcp:2222", "tcp:3333"] {
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.ends_with(&format!("--remove {kept}"))),
+            "removed {kept}: {calls:#?}"
+        );
+    }
+    let created = calls
+        .iter()
+        .position(|c| c.starts_with("-s fake-serial forward tcp:"))
+        .expect("forward never created");
+    assert!(
+        stale_1.unwrap() < created && stale_4.unwrap() < created,
+        "{calls:#?}"
+    );
     wait_dead(fake.helper_pid()).await;
 }
 

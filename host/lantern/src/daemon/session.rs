@@ -238,6 +238,9 @@ fn helper_command(remote: &str, name: &str, token: &str) -> String {
 /// Starts a helper session. Every await is bounded, and the future is cancel-safe: dropping it
 /// at any point kills the helper and removes any forward it created.
 pub async fn start(adb: &Adb) -> Result<SessionConn> {
+    // One daemon owns a serial, so every lantern forward of it that exists now is a leftover
+    // of a daemon that died without cleaning up.
+    adb.remove_stale_lantern_forwards().await;
     let helper_sha = hex(&Sha256::digest(HELPER_JAR));
     let remote = format!("/data/local/tmp/lantern-helper-{helper_sha}.jar");
     let installed = adb

@@ -150,6 +150,30 @@ fn stream_end_marks_everything_offline() {
     assert_eq!(tracker.update(&[]), [offline("20e9318")]);
 }
 
+// Same line format as `adb forward --list` prints (checked against adb 1.0.41 with 20e9318
+// attached: `20e9318 tcp:44795 localabstract:lantern-83196eb5`). The list covers every device.
+const FORWARD_LIST: &str = "20e9318 tcp:46791 localabstract:lantern-7b54a3f9\n\
+other99 tcp:5000 localabstract:lantern-deadbeef\n\
+20e9318 tcp:8080 tcp:8080\n\
+20e9318 tcp:6000 localabstract:scrcpy_1234\n\
+\n\
+20e9318 tcp:39207 localabstract:lantern-00c0ffee\n";
+
+#[test]
+fn stale_lantern_forwards_are_this_serials_lantern_sockets_only() {
+    assert_eq!(
+        stale_lantern_forwards(FORWARD_LIST, "20e9318"),
+        ["tcp:46791", "tcp:39207"]
+    );
+    assert_eq!(
+        stale_lantern_forwards(FORWARD_LIST, "other99"),
+        ["tcp:5000"]
+    );
+    assert!(stale_lantern_forwards(FORWARD_LIST, "20e931").is_empty());
+    assert!(stale_lantern_forwards("", "20e9318").is_empty());
+    assert!(stale_lantern_forwards("garbage\n\n", "20e9318").is_empty());
+}
+
 #[test]
 fn non_hex_length_is_an_error() {
     let mut decoder = TrackDevicesDecoder::default();

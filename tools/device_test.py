@@ -27,9 +27,12 @@ LANTERN = shutil.which("lantern") or str(Path.home() / ".local/bin/lantern")
 UNIT = "lanternd.service"
 SETTINGS = "com.android.settings"
 JELLY = "org.lineageos.jelly"
-STAY_ON_RESTORED = os.environ.get("LANTERN_STAY_ON_RESTORED", "15")
+# The phone's own stay_on_while_plugged_in value, which a session must restore. Item 1 reads it
+# with the daemon stopped (or set LANTERN_STAY_ON_RESTORED to skip that).
+STAY_ON_RESTORED = os.environ.get("LANTERN_STAY_ON_RESTORED") or None
 STAY_ON_SESSION = "7"  # Session.STAY_ON in the helper
 RESIZE_LOGICAL = 900
+KILL_SIGNAL = "TERM"  # item 7; --signal=KILL
 LOG_DIR = Path(tempfile.mkdtemp(prefix="lantern-device-test-"))
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -101,7 +104,10 @@ def wait_ready(timeout=10):
 class Window:
     """One `lantern open <pkg>` process, stderr logged to a file."""
 
+    every = []  # all windows started, so the suite can kill whatever is left on any exit
+
     def __init__(self, pkg, tag, debug_input=None):
+        Window.every.append(self)
         self.pkg = pkg
         self.log = LOG_DIR / f"{tag}.log"
         env = dict(os.environ, LANTERN_LOG="info", NO_COLOR="1")
@@ -140,6 +146,7 @@ class Window:
                 self.p.wait(3)
             except subprocess.TimeoutExpired:
                 self.p.kill()
+                self.p.wait(3)
         self.f.close()
 
 
@@ -181,8 +188,36 @@ def phone_state():
 
 
 def restored(st):
-    return (st["stay_on"] == STAY_ON_RESTORED and st["panel"] == "On" and st["displays"] == ["0"]
-            and not st["forwards"] and not st["helper_pids"])
+    return (st["stay_on"] == stay_on_baseline() and st["panel"] == "On"
+            and st["displays"] == ["0"] and not st["forwards"] and not st["helper_pids"])
+
+
+def released(st):
+    """No session on the phone (the guard, which restores the setting, has exited too)."""
+    return (st["panel"] == "On" and st["displays"] == ["0"] and not st["forwards"]
+            and not st["helper_pids"])
+
+
+def read_stay_on_baseline():
+    """Stops lanternd, reads the phone's own stay-awake value, and leaves lanternd stopped."""
+    global STAY_ON_RESTORED
+    systemctl("stop", UNIT)
+    st, _ = wait_until("phone released after stop", 10, lambda: released(s := phone_state()) and s,
+                       interval=0.2)
+    if STAY_ON_RESTORED is None:
+        STAY_ON_RESTORED = st["stay_on"]
+    note(f"baseline with lanternd stopped: stay_on={st['stay_on']} (expected restore value "
+         f"{STAY_ON_RESTORED})")
+
+
+def stay_on_baseline():
+    if STAY_ON_RESTORED is None:
+        try:
+            read_stay_on_baseline()
+        finally:
+            systemctl("start", UNIT)
+        wait_ready(15)
+    return str(STAY_ON_RESTORED)
 
 
 def armed(st):
@@ -261,8 +296,12 @@ class Suite:
         self.settings = None
 
     def session_starts_on_plug(self):
-        # Restart the daemon so the session start is observed from scratch.
-        systemctl("restart", UNIT)
+        # Stop the daemon (reading the phone's own stay-awake value while no session runs), then
+        # start it so the session start is observed from scratch.
+        try:
+            read_stay_on_baseline()
+        finally:
+            systemctl("start", UNIT)
         sh("adb", "-s", SERIAL, "wait-for-device", timeout=60)
         st, secs = wait_ready(10)
         note(f"ready {secs:.1f} s after wait-for-device: {json.dumps(st)}")
@@ -312,8 +351,11 @@ class Suite:
         w = self.settings
         assert w is not None
         t0 = time.time()
+        scales = []
         for line in kwin_on(SETTINGS, RESIZE, "lantern_resize", WIDTH=width, HEIGHT=height):
             note(f"kwin: {line}")
+            scales += re.findall(r"scale=([0-9.]+)$", line)
+        check(len(scales) == 1, f"KWin reported no output scale for the window: {scales}")
 
         def answered():
             reqs = w.find("resize", after=t0)
@@ -333,17 +375,17 @@ class Suite:
         note(f"window requested {req['w']}x{req['h']} dpi={req['dpi']} "
              f"(logical {width}x{height}, scale {int(req['w']) / width:.4g}); "
              f"helper Resized {got['w']}x{got['h']} {ats - t0:.3f} s after the KWin resize "
-             f"({ats - rts:.3f} s after the window's request)")
-        return req, got, ats - t0
+             f"({ats - rts:.3f} s after the window's request); KWin output scale {scales[0]}")
+        return req, got, ats - t0, float(scales[0])
 
     def resize_reflows(self):
         # Step away first: the window may already be 900x900 (its size is remembered), and a
         # no-op resize sends nothing.
         self.resize_to(1000, 700)
-        req, got, secs = self.resize_to(RESIZE_LOGICAL, RESIZE_LOGICAL)
-        scale = int(req["w"]) / RESIZE_LOGICAL
-        check(int(req["w"]) == int(req["h"]) == round(RESIZE_LOGICAL * scale),
-              f"request {req} is not {RESIZE_LOGICAL}*scale")
+        req, got, secs, scale = self.resize_to(RESIZE_LOGICAL, RESIZE_LOGICAL)
+        want = round(RESIZE_LOGICAL * scale)
+        check(int(req["w"]) == int(req["h"]) == want,
+              f"request {req['w']}x{req['h']} is not {RESIZE_LOGICAL} x KWin scale {scale} = {want}")
         check(secs <= 1.0, f"Resized took {secs:.3f} s (> 1 s)")
 
     def close_quits(self):
@@ -384,18 +426,59 @@ class Suite:
         wait_until("jelly task gone from other displays", 5, lambda: not tasks_off_display0(JELLY))
 
     def daemon_kill_restores_phone(self):
-        t0 = time.monotonic()
-        systemctl("kill", UNIT)
-        st, secs = wait_until("phone restored", 5, lambda: restored(s := phone_state()) and s,
-                              interval=0.2)
-        note(f"restored {secs:.1f} s after kill: {st}")
-        active = systemctl("is-active", UNIT, check_rc=False).strip()
-        note(f"{UNIT} after kill: {active}; starting it again")
-        systemctl("start", UNIT)
+        stay_on_baseline()  # before the kill: reading it later would stop/start lanternd
+        if KILL_SIGNAL == "KILL":
+            return self.daemon_sigkill_recovers()
+        try:
+            systemctl("kill", UNIT)
+            st, secs = wait_until("phone restored", 5,
+                                  lambda: restored(s := phone_state()) and s, interval=0.2)
+            note(f"restored {secs:.1f} s after kill: {st}")
+            active = systemctl("is-active", UNIT, check_rc=False).strip()
+            note(f"{UNIT} after kill: {active}; starting it again")
+        finally:
+            systemctl("start", UNIT)
         st, secs = wait_ready(15)
         note(f"ready again after {secs:.1f} s")
 
+    def daemon_sigkill_recovers(self):
+        """SIGKILL: the daemon cannot clean up. The helper and its guard still exit and restore
+        the phone, systemd restarts the daemon (Restart=on-failure), and the new session start
+        removes the dead daemon's adb forward."""
+        before = phone_state()
+        check(armed(before), f"phone not armed before the kill: {before}")
+        old_fwd, old_pids = before["forwards"], set(before["helper_pids"])
+        since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        seen_restored = []
+        try:
+            systemctl("kill", "-s", "KILL", UNIT)
+
+            def recovered():
+                st = phone_state()
+                if restored(st):
+                    seen_restored.append(st)
+                return (armed(st) and old_pids.isdisjoint(st["helper_pids"])
+                        and st["forwards"] != old_fwd and st)
+            st, secs = wait_until("new session armed without the old forward", 15, recovered,
+                                  interval=0.2)
+        finally:
+            if systemctl("is-active", UNIT, check_rc=False).strip() != "active":
+                systemctl("start", UNIT)
+        note(f"before: forwards={old_fwd} helper_pids={sorted(old_pids)}")
+        note(f"after {secs:.1f} s: {st}")
+        note(f"restored state observed between the sessions: {'yes' if seen_restored else 'no'}")
+        removed = [ANSI.sub("", l).split(": ", 1)[-1] for l in
+                   sh("journalctl", "--user", "-u", UNIT, "--since", since, "--no-pager",
+                      "-o", "cat").splitlines() if "stale lantern forward" in l]
+        note(f"daemon log: {removed}")
+        check(len(st["forwards"]) == 1 and st["forwards"][0] not in old_fwd,
+              f"stale forward kept: {st['forwards']}")
+        rst, rsecs = wait_ready(15)
+        check(rst["serial"] == SERIAL, f"status {rst}")
+        note(f"lanternd restarted by systemd; ready: {json.dumps(rst)}")
+
     def usb_yank(self):
+        stay_on_baseline()
         before = status()
         pids = phone_state()["helper_pids"]
         check(before["state"] == "ready", f"not ready before the yank: {before}")
@@ -416,7 +499,7 @@ class Suite:
         new = phone_state()["helper_pids"]
         note(f"fresh session {secs:.1f} s after replug; helper pids {pids} -> {new}")
         check(set(new).isdisjoint(pids), "helper process was not replaced")
-        check(any("stay_on_while_plugged_in to " + STAY_ON_RESTORED in l for l in restores),
+        check(any("stay_on_while_plugged_in to " + stay_on_baseline() in l for l in restores),
               "no stay-awake restore logged")
 
 
@@ -438,7 +521,12 @@ def main():
     ap.add_argument("--manual", action="store_true", help="also run item 8 (usb_yank, prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
     ap.add_argument("--only", nargs="*", help="run only these items")
+    ap.add_argument("--signal", choices=["TERM", "KILL"], default="TERM",
+                    help="item 7: TERM (clean stop, default) or KILL (no cleanup; systemd "
+                         "restarts lanternd and its new session must drop the stale forward)")
     args = ap.parse_args()
+    global KILL_SIGNAL
+    KILL_SIGNAL = args.signal
     if args.state:
         try:
             st = status()
@@ -452,25 +540,31 @@ def main():
         items = [i for i in ITEMS if i in args.only]
     print(f"lantern device test: serial={SERIAL} binary={LANTERN} logs={LOG_DIR}", flush=True)
     results = []
-    for n, name in enumerate(items, 1):
-        idx = ITEMS.index(name) + 1
-        print(f"[{idx}] {name}", flush=True)
-        t0 = time.monotonic()
-        try:
-            getattr(suite, name)()
-            ok, why = True, ""
-        except (Fail, subprocess.TimeoutExpired, OSError, KeyError, ValueError) as e:
-            ok, why = False, f": {e}"
-        results.append(ok)
-        print(f"{'PASS' if ok else 'FAIL'} {idx} {name} ({time.monotonic() - t0:.1f} s){why}",
-              flush=True)
-        if not ok and suite.settings and name in ("open_settings_creates_one_display",
-                                                  "second_open_focuses", "resize_reflows"):
-            # Later items need the Settings window; close it so nothing is left open.
-            kwin_on(SETTINGS, CLOSE, "lantern_close")
-            suite.settings.kill()
-    if suite.settings:
-        suite.settings.kill()
+    try:
+        for name in items:
+            idx = ITEMS.index(name) + 1
+            print(f"[{idx}] {name}", flush=True)
+            t0 = time.monotonic()
+            try:
+                getattr(suite, name)()
+                ok, why = True, ""
+            except Exception as e:  # any failure is this item's FAIL; the rest still run
+                ok, why = False, f": {type(e).__name__}: {e}"
+            results.append(ok)
+            print(f"{'PASS' if ok else 'FAIL'} {idx} {name} ({time.monotonic() - t0:.1f} s){why}",
+                  flush=True)
+            if not ok and suite.settings and suite.settings.p.poll() is None:
+                # Close the Settings window a failed item left open (KWin close = quit the app),
+                # then make sure its process is gone.
+                try:
+                    kwin_on(SETTINGS, CLOSE, "lantern_close")
+                except Exception as e:
+                    note(f"could not close Settings through KWin: {e}")
+                suite.settings.kill()
+    finally:
+        # Whatever happened (including Ctrl-C), no `lantern open` process outlives the suite.
+        for w in Window.every:
+            w.kill()
     if not args.manual and not args.only:
         print("SKIP 8 usb_yank (needs a person: run with --manual)")
     print(f"{sum(results)}/{len(results)} PASS", flush=True)

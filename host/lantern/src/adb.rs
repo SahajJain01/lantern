@@ -97,6 +97,29 @@ impl Adb {
         self.run(command, ADB_CALL_TIMEOUT).await.map(|_| ())
     }
 
+    /// Removes this serial's leftover `localabstract:lantern-*` forwards, which a daemon that was
+    /// killed (SIGKILL, crash) could not remove itself. Best effort: failures are only logged.
+    /// Call it before creating this session's forward.
+    pub async fn remove_stale_lantern_forwards(&self) {
+        let mut command = self.command();
+        command.arg("forward").arg("--list");
+        let list = match self.run(command, ADB_CALL_TIMEOUT).await {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(%error, "could not list adb forwards");
+                return;
+            }
+        };
+        for local in stale_lantern_forwards(&list, &self.serial) {
+            let mut command = self.command();
+            command.arg("forward").arg("--remove").arg(&local);
+            match self.run(command, ADB_CALL_TIMEOUT).await {
+                Ok(_) => tracing::info!(local, "removed stale lantern forward"),
+                Err(error) => tracing::warn!(%error, local, "could not remove stale forward"),
+            }
+        }
+    }
+
     /// Forward removal for `Drop` paths, which cannot await. Bounded by `ADB_DROP_TIMEOUT`; the
     /// adb client is killed if it has not finished by then.
     pub fn remove_forward_blocking(&self, local_tcp: u16) {
@@ -145,6 +168,24 @@ impl Adb {
             .context("spawn adb shell")?;
         Ok(child)
     }
+}
+
+/// The local specs (`tcp:<port>`) of `serial`'s forwards to a `localabstract:lantern-*` socket in
+/// `adb forward --list` output. The list covers every device, one `serial local remote` per line.
+pub fn stale_lantern_forwards(list: &str, serial: &str) -> Vec<String> {
+    list.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(owner), Some(local), Some(remote))
+                    if owner == serial && remote.starts_with("localabstract:lantern-") =>
+                {
+                    Some(local.to_owned())
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

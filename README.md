@@ -13,8 +13,16 @@ Two parts, both in the one `lantern` binary:
 Requirements: KDE Plasma on Wayland, `adb` on `PATH` with the phone authorized for USB debugging
 (Android 15+, API 35), VA-API for hardware decoding (software decoding is the fallback), the
 Rust toolchain, and the JDK and Android build tools for the helper (`~/.local/opt/pd-toolchain`).
-lanternd serves the only connected device, or `20e9318` when several are connected. To pin
-one, set `LANTERN_SERIAL` (`systemctl --user edit lanternd`, `Environment=LANTERN_SERIAL=…`).
+lanternd serves the only connected device. With several devices connected, set
+`LANTERN_SERIAL` to the one it should serve (`systemctl --user edit lanternd`, then
+`[Service]` / `Environment=LANTERN_SERIAL=<serial>`; `adb devices` lists the serials).
+
+lanternd runs `adb` from the systemd user manager's `PATH`, not your shell's. If `adb` lives
+somewhere else (for example `~/Android/Sdk/platform-tools`), add it to that `PATH`: either in
+`~/.config/environment.d/*.conf` (`PATH=$HOME/Android/Sdk/platform-tools:$PATH`, applies from the
+next login) or with `systemctl --user edit lanternd` and
+`Environment=PATH=<dir with adb>:/usr/local/bin:/usr/bin:/bin`. Check with
+`systemctl --user show-environment | grep ^PATH`.
 
 ## Build and install
 
@@ -67,8 +75,12 @@ session), lanternd starts a session on the phone at once, even if no window is o
 
 The phone is restored whenever the session ends: when you stop lanternd
 (`systemctl --user stop lanternd`), unplug the phone, the daemon dies, or you log out. Restored
-means the panel is on, the stay-awake setting has its old value, there are no Lantern displays,
-forwards or helper processes, and only the jar file remains.
+means the panel is on, the stay-awake setting has its old value, there are no Lantern displays
+or helper processes, and only the jar file remains on the phone. A daemon that stops cleanly
+also removes its `adb forward`. One that is killed outright (`SIGKILL`, a crash) cannot, so its
+forward stays in the PC's adb server until the next session for that phone starts: every session
+start first removes that phone's leftover `localabstract:lantern-*` forwards. To drop one by
+hand, `adb forward --list` shows it and `adb forward --remove tcp:<port>` removes it.
 
 ## Undo / uninstall
 
@@ -89,11 +101,16 @@ the phone. If the phone was unplugged when a session died and still shows a chan
 ```sh
 python3 tools/build.py install && python3 tools/device_test.py           # items 1–7, unattended
 python3 tools/device_test.py --manual                                    # adds 8: USB unplug/replug, prompts
+python3 tools/device_test.py --signal=KILL                               # item 7 with SIGKILL
 python3 tools/device_test.py --state                                     # status + phone readbacks
 ```
 
-The test restarts lanternd. It opens only `com.android.settings` and `org.lineageos.jelly`,
-briefly, and drives windows through the KWin scripting D-Bus.
+The test restarts lanternd. Item 1 stops it first and reads the phone's own
+`stay_on_while_plugged_in` value, which later items expect to see restored; set
+`LANTERN_STAY_ON_RESTORED=<value>` to give it instead. `--signal=KILL` checks that systemd
+restarts a SIGKILLed lanternd and that the new session removes the dead daemon's forward.
+The test opens only `com.android.settings` and `org.lineageos.jelly`, briefly, and drives
+windows through the KWin scripting D-Bus.
 
 ## Layout
 
