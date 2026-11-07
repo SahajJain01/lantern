@@ -140,13 +140,48 @@ Settings and Messaging. That was 5 apps.
 None refused the display or rendered black. The games were not played past their splash or
 update screens.
 
+## Follow-up tests with Sahaj present (2026-11-07 evening)
+
+**S2 locked phone, real case: PASS** (`spikes/raw/s2real_1794057894`). The phone was asleep with the
+keyguard showing (`Dozing`, `showing=true`, screen off). It was woken with the power key, so the
+keyguard was still showing. Then stock scrcpy 5 (`ALWAYS_UNLOCKED`) ran with `--new-display` and
+`--turn-screen-off` for 30 s: 3,641 frames in 29.8 s. Frames at 2, 15 and 29 s all show the live
+probe app with its counter advancing (238 → 1830 → 3543), and the keyguard stayed up throughout.
+**The helper must wake the phone but does not need to unlock it.** The 2 s frame shows a
+system taskbar on the virtual display, which comes from scrcpy's system-decorations flag. Lantern
+must leave `SHOULD_SHOW_SYSTEM_DECORATIONS` unset.
+
+**S4 real gamepad, GameSir over scrcpy UHID: delivered, but pinned to a display**
+(`spikes/raw/s4pad_1794057457915006316`). 137 button presses (keycodes 96/97/100/102/103/62/23)
+reached the probe as gamepad-source key events. All of them went to the display scrcpy was
+mirroring, including after `setFocusedTask` moved focus to the other display (`FocusedDisplayId:
+89` confirmed). The cause is in scrcpy 5's `UhidManager`: on API 35+ it calls
+`InputManager.addUniqueIdAssociationByPort(port, displayUniqueId)`, which pins the UHID device to
+one display. **Design impact:** Lantern should re-associate each pad's input port to the active
+window's display when PC focus changes. That is more deterministic than following focus.
+
+**S5 IME, physical USB unplug: setting restored by the phone alone**
+(`spikes/raw/s5yank_1794057546594114700`). The test was armed and heartbeats ran for about 287 s.
+Sahaj then unplugged the cable for 10.1 s. The device log shows `ime_restored ok=true` about 5 s
+after the last heartbeat, while unplugged, and `default_input_method` read `LatinIME` right after
+replug. The script's bound-IME check matched nothing because Android 17's `dumpsys input_method`
+has different field names (it has `imeToken=… [component]`), so its "pass=false" is a check bug.
+The bound IME was not independently confirmed before cleanup ran.
+
+**Host finding, not about the phone:** the GameSir Tegenaria Lite (3537:1093) re-enumerates on USB
+every 2–3 s whenever no program has its evdev node open. Autosuspend is already off
+(`power/control=on`). While a reader held it open for 15 s there were 0 disconnects, and the
+disconnects resumed right after it was released. Windows keeps it stable because its HID game
+stack always reads controllers. **Design impact:** `lanternd` should open gamepads for the whole
+session; that also prevents this churn.
+
 ## Not verified (needs Sahaj or a later test)
 
-- **Real gamepad button press** routed to the focused display (plan Task 4 Step 2).
+- **Gamepad re-association** to a different display (Lantern's own UHID path); scrcpy pins it.
 - **Third-party app notification** click targeting. No third-party messaging app is installed.
-- **Physical USB yank** IME restore. Only the heartbeat timeout was tested.
+- **Bound IME** after a physical yank (setting restore is proven; see follow-ups).
 - **Text input into real apps** (browser address bar, messaging). Only the probe EditText was tested.
-- **Secure (PIN) keyguard** with `ALWAYS_UNLOCKED`.
+- **Secure (PIN) keyguard** with `ALWAYS_UNLOCKED` (the swipe-keyguard real case passes).
 - **Encoder reconfigure without recreate**, and end-to-end latency versus scrcpy.
 
 ## Phone state after the spikes

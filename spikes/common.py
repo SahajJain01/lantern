@@ -115,8 +115,14 @@ def logcat_lines(timeout_s):
 
 def shell_probe(*args):
     require_device()
-    adb("push", ROOT / "out/probe-shell.jar", "/data/local/tmp/lantern-probe.jar")
-    adb("push", SCRCPY_SERVER, "/data/local/tmp/lantern-probe-scrcpy.jar")
+    # Never rewrite a jar a running probe may still lazily load classes from.
+    import hashlib
+    for local, remote in ((ROOT / "out/probe-shell.jar", "/data/local/tmp/lantern-probe.jar"),
+                          (SCRCPY_SERVER, "/data/local/tmp/lantern-probe-scrcpy.jar")):
+        want = hashlib.sha256(Path(local).read_bytes()).hexdigest()
+        have = adb("shell", f"sha256sum {remote} 2>/dev/null", check=False).split(" ")[0]
+        if have != want:
+            adb("push", local, remote)
     command = "CLASSPATH=/data/local/tmp/lantern-probe.jar:/data/local/tmp/lantern-probe-scrcpy.jar app_process / dev.lantern.probeshell.Main "
     return subprocess.Popen([ADB, "-s", SERIAL, "shell", "-T", command + shlex.join(map(str,args))],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
