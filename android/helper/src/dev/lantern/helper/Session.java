@@ -32,15 +32,18 @@ public final class Session implements AutoCloseable {
     private final SettingsBackend settings;
     private final Power power;
     private final Guard guard;
+    private final JournalStore store;
     private final Cleanup.Journal journal;
     private boolean settingWritten;
     private boolean panelOff;
     private boolean closed;
 
-    private Session(SettingsBackend settings, Power power, Guard guard, Cleanup.Journal journal) {
+    private Session(SettingsBackend settings, Power power, Guard guard, JournalStore store,
+            Cleanup.Journal journal) {
         this.settings = settings;
         this.power = power;
         this.guard = guard;
+        this.store = store;
         this.journal = journal;
     }
 
@@ -49,8 +52,29 @@ public final class Session implements AutoCloseable {
     }
 
     public static Session start(SettingsBackend s, Power p, Guard g) {
-        Session session = new Session(s, p, g, new Cleanup.Journal(NS, KEY, s.get(NS, KEY)));
-        g.arm(session.journal.toJson());
+        return start(s, p, g, JournalStore.none());
+    }
+
+    /**
+     * The original value comes from the persisted journal if one exists (an earlier session died
+     * without restoring: the current value may be its STAY_ON), else from the setting itself. The
+     * journal is persisted, then the guard armed, before anything is changed.
+     */
+    public static Session start(SettingsBackend s, Power p, Guard g, JournalStore store) {
+        Cleanup.Journal recovered = store.load();
+        Cleanup.Journal journal = recovered != null && NS.equals(recovered.ns) && KEY.equals(recovered.key)
+            ? recovered
+            : new Cleanup.Journal(NS, KEY, s.get(NS, KEY));
+        store.save(journal);
+        Session session = new Session(s, p, g, store, journal);
+        try {
+            g.arm(session.journal.toJson());
+        } catch (RuntimeException e) {
+            if (journal != recovered) {
+                store.clear(); // nothing changed; a recovered journal must survive, though
+            }
+            throw e;
+        }
         try {
             session.settingWritten = true; // set first: a throwing put may still have written
             s.put(NS, KEY, STAY_ON);
@@ -72,7 +96,10 @@ public final class Session implements AutoCloseable {
         return journal;
     }
 
-    /** Idempotent. Panel back on, then the original setting; the guard is disarmed last. */
+    /**
+     * Idempotent. Panel back on, then the original setting (even if the panel call throws an
+     * Error), then the persisted journal is removed; the guard is disarmed last.
+     */
     @Override
     public synchronized void close() {
         if (closed) {
@@ -80,24 +107,29 @@ public final class Session implements AutoCloseable {
         }
         closed = true;
         RuntimeException failure = null;
-        if (panelOff) {
-            try {
-                power.setPanel(true);
-            } catch (RuntimeException e) {
-                failure = e;
+        try {
+            if (panelOff) {
+                try {
+                    power.setPanel(true);
+                } catch (RuntimeException e) {
+                    failure = e;
+                }
             }
-        }
-        if (settingWritten) {
-            try {
-                journal.restore(settings);
-            } catch (RuntimeException e) {
-                failure = failure == null ? e : failure;
+        } finally {
+            if (settingWritten) {
+                try {
+                    journal.restore(settings);
+                } catch (RuntimeException e) {
+                    failure = failure == null ? e : failure;
+                }
             }
         }
         if (failure != null) {
-            // Leave the guard armed: Cleanup retries the restore when this process exits.
+            // Leave the guard armed and the journal on disk: Cleanup retries the restore when
+            // this process exits, and the next session still knows the original.
             throw failure;
         }
+        store.clear();
         guard.disarm();
     }
 }

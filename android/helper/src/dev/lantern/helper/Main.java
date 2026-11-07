@@ -92,7 +92,8 @@ public final class Main {
             java.io.DataOutputStream out = new java.io.DataOutputStream(
                 new java.io.BufferedOutputStream(client.getOutputStream(), 1 << 16));
             Router router = new Router(in, out, AppDisplay::open, new Input(), Control.CODEC, token,
-                () -> Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log)),
+                () -> Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log),
+                    JournalStore.device(Droid::log)),
                 () -> {
                     // shutdown first: close() alone may not wake a thread blocked in write.
                     try {
@@ -129,7 +130,8 @@ public final class Main {
         System.out.println("pid=" + Droid.pid());
         System.out.flush();
         Droid.log("session-test start pid=" + Droid.pid() + " seconds=" + seconds);
-        try (Session s = Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log))) {
+        try (Session s = Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log),
+                JournalStore.device(Droid::log))) {
             Droid.log("session started, journal=" + s.journal().toJson());
             System.out.println("session started");
             System.out.flush();

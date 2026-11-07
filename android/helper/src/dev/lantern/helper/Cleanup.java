@@ -74,14 +74,24 @@ public final class Cleanup {
 
     /** Restores what the parent session changed: panel on, then the original setting. */
     public static void apply(Journal j, SettingsBackend s, Power p, Consumer<String> log) {
+        apply(j, s, p, JournalStore.none(), log);
+    }
+
+    /**
+     * As above; the setting is restored even if the panel call throws (any Throwable), and the
+     * persisted journal is removed only after the restore succeeded.
+     */
+    public static void apply(Journal j, SettingsBackend s, Power p, JournalStore store, Consumer<String> log) {
         try {
             p.setPanel(true);
             log.accept("cleanup: panel on");
         } catch (RuntimeException e) {
             log.accept("cleanup: panel on failed: " + e);
+        } finally {
+            j.restore(s);
+            log.accept("cleanup: restored " + j.ns + "/" + j.key + " to " + (j.orig == null ? "<absent>" : j.orig));
+            store.clear();
         }
-        j.restore(s);
-        log.accept("cleanup: restored " + j.ns + "/" + j.key + " to " + (j.orig == null ? "<absent>" : j.orig));
     }
 
     /** Blocks until the parent closes the pipe. False only if the parent said {@code done}. */
@@ -238,8 +248,8 @@ public final class Cleanup {
         }
         Droid.log("cleanup: parent died, restoring");
         try {
-            apply(j, new ShellSettings(), new DevicePower(), Droid::log);
-        } catch (RuntimeException e) {
+            apply(j, new ShellSettings(), new DevicePower(), JournalStore.device(Droid::log), Droid::log);
+        } catch (RuntimeException | Error e) {
             Droid.log("cleanup: restore failed: " + e);
             System.exit(1);
         }
