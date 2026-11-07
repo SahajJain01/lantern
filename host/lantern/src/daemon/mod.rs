@@ -2,11 +2,16 @@ pub mod registry;
 pub mod session;
 
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
+use futures_core::Stream;
 use futures_util::StreamExt;
 use session::SessionConn;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::Instant;
 
 use crate::adb::{track_devices, Adb, DeviceEvent};
 use crate::daemon::session::start;
@@ -21,38 +26,92 @@ fn select_serial(configured: Option<&str>, connected: &HashSet<String>) -> Optio
     Some("20e9318".to_owned())
 }
 
-async fn close_session(session: &mut Option<SessionConn>) {
-    if let Some(session) = session.take() {
+/// Backoff for restarting a session after a failed start or helper death, while the target
+/// device stays connected.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Delay before the first retry; doubles per consecutive failure.
+    pub initial: Duration,
+    pub max: Duration,
+    /// A session that lived at least this long resets the failure count when it dies.
+    pub stable_after: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+            stable_after: Duration::from_secs(60),
+        }
+    }
+}
+
+impl RetryPolicy {
+    fn delay(&self, failures: u32) -> Duration {
+        let shift = failures.saturating_sub(1).min(16);
+        self.initial.saturating_mul(1 << shift).min(self.max)
+    }
+}
+
+async fn close_session(session: &mut Option<(SessionConn, Instant)>) {
+    if let Some((session, _)) = session.take() {
         let serial = session.serial().to_owned();
         session.close().await;
         tracing::info!(serial, "session closed");
     }
 }
 
-pub async fn run() -> Result<()> {
-    let configured = std::env::var("LANTERN_SERIAL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let mut events = Box::pin(track_devices());
+type Starting<F> = Option<(String, Pin<Box<F>>)>;
+
+fn cancel_start<F>(starting: &mut Starting<F>, why: &str) {
+    if let Some((serial, future)) = starting.take() {
+        // Dropping the start future drops its PendingSession, which kills the helper and
+        // removes the forward.
+        drop(future);
+        tracing::info!(serial, why, "session start cancelled");
+    }
+}
+
+/// The daemon's state machine, generic over its inputs so tests can drive it with fake devices,
+/// fake helpers and a fake shutdown signal.
+///
+/// Every branch is polled concurrently: a session start in flight never blocks shutdown or
+/// device events, and helper death is noticed through `SessionConn::closed`.
+pub async fn run_loop<E, S, F, D>(
+    configured: Option<String>,
+    events: E,
+    mut starter: S,
+    shutdown: D,
+    policy: RetryPolicy,
+) -> Result<()>
+where
+    E: Stream<Item = DeviceEvent>,
+    S: FnMut(String) -> F,
+    F: Future<Output = Result<SessionConn>>,
+    D: Future<Output = &'static str>,
+{
+    tokio::pin!(events);
+    tokio::pin!(shutdown);
     let mut connected = HashSet::new();
-    let mut active: Option<SessionConn> = None;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut active: Option<(SessionConn, Instant)> = None;
+    let mut starting: Starting<F> = None;
+    let mut retry_at: Option<Instant> = None;
+    let mut failures: u32 = 0;
 
     loop {
+        let idle = active.is_none() && starting.is_none();
+        let wake = retry_at.unwrap_or_else(Instant::now);
         tokio::select! {
-            _ = sigint.recv() => {
-                tracing::info!("SIGINT received");
-                close_session(&mut active).await;
-                return Ok(());
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("SIGTERM received");
+            why = &mut shutdown => {
+                tracing::info!("{why} received");
+                cancel_start(&mut starting, why);
                 close_session(&mut active).await;
                 return Ok(());
             }
             event = events.next() => {
                 let Some(event) = event else {
+                    cancel_start(&mut starting, "device stream ended");
                     close_session(&mut active).await;
                     bail!("adb track-devices ended");
                 };
@@ -61,28 +120,89 @@ pub async fn run() -> Result<()> {
                         tracing::info!(serial, "device online");
                         connected.insert(serial.clone());
                         let target = select_serial(configured.as_deref(), &connected);
-                        if active.is_none() && target.as_deref() == Some(serial.as_str()) {
-                            let adb = Adb::new(serial.clone());
-                            match start(&adb).await {
-                                Ok(session) => {
-                                    tracing::info!(serial, helper = session.helper_sha(), "session ready");
-                                    active = Some(session);
-                                }
-                                Err(error) => tracing::error!(serial, %error, "session start failed"),
-                            }
+                        if idle && target.as_deref() == Some(serial.as_str()) {
+                            failures = 0;
+                            retry_at = Some(Instant::now());
                         }
                     }
                     DeviceEvent::Offline(serial) => {
                         tracing::info!(serial, "device offline");
                         connected.remove(&serial);
-                        if active.as_ref().map(SessionConn::serial) == Some(serial.as_str()) {
+                        if starting.as_ref().map(|(s, _)| s.as_str()) == Some(serial.as_str()) {
+                            cancel_start(&mut starting, "device offline");
+                        }
+                        if active.as_ref().map(|(s, _)| s.serial()) == Some(serial.as_str()) {
                             close_session(&mut active).await;
+                        }
+                        let target = select_serial(configured.as_deref(), &connected);
+                        if target.as_deref().is_none_or(|t| !connected.contains(t)) {
+                            retry_at = None;
+                            failures = 0;
                         }
                     }
                 }
             }
+            _ = tokio::time::sleep_until(wake), if idle && retry_at.is_some() => {
+                retry_at = None;
+                let target = select_serial(configured.as_deref(), &connected)
+                    .filter(|target| connected.contains(target));
+                if let Some(serial) = target {
+                    tracing::info!(serial, attempt = failures + 1, "starting session");
+                    starting = Some((serial.clone(), Box::pin(starter(serial))));
+                }
+            }
+            result = async { starting.as_mut().expect("guarded").1.as_mut().await }, if starting.is_some() => {
+                let (serial, _) = starting.take().expect("guarded");
+                match result {
+                    Ok(session) => {
+                        tracing::info!(serial, helper = session.helper_sha(), "session ready");
+                        active = Some((session, Instant::now()));
+                    }
+                    Err(error) => {
+                        failures += 1;
+                        let delay = policy.delay(failures);
+                        tracing::error!(serial, error = format!("{error:#}"), retry_in = ?delay, "session start failed");
+                        retry_at = Some(Instant::now() + delay);
+                    }
+                }
+            }
+            why = async { active.as_mut().expect("guarded").0.closed().await }, if active.is_some() => {
+                let lived = active.as_ref().map(|(_, since)| since.elapsed()).unwrap_or_default();
+                let serial = active.as_ref().map(|(s, _)| s.serial().to_owned()).unwrap_or_default();
+                tracing::warn!(serial, why, ?lived, "helper session ended unexpectedly");
+                close_session(&mut active).await;
+                if lived >= policy.stable_after {
+                    failures = 0;
+                }
+                failures += 1;
+                let delay = policy.delay(failures);
+                tracing::info!(serial, retry_in = ?delay, "restarting session");
+                retry_at = Some(Instant::now() + delay);
+            }
         }
     }
+}
+
+pub async fn run() -> Result<()> {
+    let configured = std::env::var("LANTERN_SERIAL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let shutdown = async move {
+        tokio::select! {
+            _ = sigint.recv() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+        }
+    };
+    run_loop(
+        configured,
+        track_devices(),
+        |serial| async move { start(&Adb::new(serial)).await },
+        shutdown,
+        RetryPolicy::default(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -115,5 +235,16 @@ mod tests {
             select_serial(None, &devices(&["one", "two"])),
             Some("20e9318".into())
         );
+    }
+
+    #[test]
+    fn retry_delay_doubles_and_caps() {
+        let policy = RetryPolicy {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(5),
+            stable_after: Duration::from_secs(60),
+        };
+        let delays: Vec<u64> = (1..=5).map(|n| policy.delay(n).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 5, 5]);
     }
 }

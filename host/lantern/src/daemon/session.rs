@@ -4,9 +4,9 @@ use anyhow::{bail, Context, Result};
 use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, Kind};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Child;
+use tokio::process::{Child, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
@@ -15,11 +15,19 @@ use crate::adb::Adb;
 
 const HELPER_JAR: &[u8] = include_bytes!("../../assets/helper.jar");
 
+/// The only protocol version this daemon speaks.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Why a live session ended on its own (as opposed to being closed by the daemon).
+pub type EndReason = &'static str;
+
 pub struct SessionConn {
     pub tx: mpsc::Sender<Frame>,
     pub rx: mpsc::Receiver<Frame>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
+    output: Option<JoinHandle<()>>,
+    done: mpsc::Receiver<EndReason>,
     child: Option<Child>,
     adb: Adb,
     forward: Option<u16>,
@@ -27,12 +35,90 @@ pub struct SessionConn {
 }
 
 impl SessionConn {
+    /// Wraps an already-handshaken helper connection with no adb resources attached. Used by the
+    /// in-process fake-helper tests; `start` uses the same path with its child and forward.
+    pub fn attach(stream: TcpStream, adb: Adb, helper_sha: impl Into<String>) -> Self {
+        Self::from_parts(stream, adb, None, None, None, helper_sha.into())
+    }
+
+    fn from_parts(
+        stream: TcpStream,
+        adb: Adb,
+        child: Option<Child>,
+        helper_output: Option<Lines<BufReader<ChildStdout>>>,
+        forward: Option<u16>,
+        helper_sha: String,
+    ) -> Self {
+        let _ = stream.set_nodelay(true);
+        let (done_tx, done) = mpsc::channel::<EndReason>(4);
+        let (tx, mut outbound) = mpsc::channel::<Frame>(64);
+        let (inbound, rx) = mpsc::channel::<Frame>(64);
+        let (mut read_half, mut write_half) = stream.into_split();
+
+        let reader_done = done_tx.clone();
+        let reader = tokio::spawn(async move {
+            let reason = loop {
+                match read_frame_async(&mut read_half).await {
+                    Ok(Some(frame)) => {
+                        if inbound.send(frame).await.is_err() {
+                            break "session receiver dropped";
+                        }
+                    }
+                    Ok(None) => break "helper closed the connection",
+                    Err(error) => {
+                        tracing::debug!(%error, "helper read ended");
+                        break "helper connection failed";
+                    }
+                }
+            };
+            let _ = reader_done.try_send(reason);
+        });
+        let writer = tokio::spawn(async move {
+            while let Some(frame) = outbound.recv().await {
+                if let Err(error) = write_frame_async(&mut write_half, &frame).await {
+                    tracing::debug!(%error, "helper write ended");
+                    break;
+                }
+            }
+        });
+        // The adb shell's stdout reaches EOF exactly when the helper process (or the adb
+        // transport carrying it) has gone, so it doubles as the child-exit signal.
+        let output = helper_output.map(|mut lines| {
+            let output_done = done_tx.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "lantern::helper", "{line}");
+                }
+                let _ = output_done.try_send("helper process exited");
+            })
+        });
+
+        Self {
+            tx,
+            rx,
+            reader: Some(reader),
+            writer: Some(writer),
+            output,
+            done,
+            child,
+            adb,
+            forward,
+            helper_sha,
+        }
+    }
+
     pub fn serial(&self) -> &str {
         self.adb.serial()
     }
 
     pub fn helper_sha(&self) -> &str {
         &self.helper_sha
+    }
+
+    /// Resolves when the helper side ends the session: socket EOF/error or helper process exit.
+    /// Cancel-safe; pending forever while the session is healthy.
+    pub async fn closed(&mut self) -> EndReason {
+        self.done.recv().await.unwrap_or("session tasks ended")
     }
 
     /// Closes both socket halves before waiting for the helper. A jammed peer therefore cannot
@@ -44,18 +130,24 @@ impl SessionConn {
             payload: Control::Bye.encode(),
         };
         let _ = timeout(Duration::from_millis(250), self.tx.send(bye)).await;
-
+        if let Some(writer) = self.writer.take() {
+            // Let the writer flush the Bye before the socket is torn down.
+            let _ = timeout(Duration::from_millis(250), async {
+                while self.tx.capacity() < self.tx.max_capacity() && !writer.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            writer.abort();
+            let _ = timeout(Duration::from_secs(1), writer).await;
+        }
         if let Some(reader) = self.reader.take() {
             reader.abort();
             let _ = timeout(Duration::from_secs(1), reader).await;
         }
-        if let Some(writer) = self.writer.take() {
-            writer.abort();
-            let _ = timeout(Duration::from_secs(1), writer).await;
-        }
 
         if let Some(port) = self.forward.take() {
-            if let Err(error) = self.adb.remove_forward(port) {
+            if let Err(error) = self.adb.remove_forward(port).await {
                 tracing::debug!(%error, port, "forward already removed");
             }
         }
@@ -66,26 +158,31 @@ impl SessionConn {
                 let _ = timeout(Duration::from_secs(1), child.wait()).await;
             }
         }
+        if let Some(output) = self.output.take() {
+            output.abort();
+        }
     }
 }
 
 impl Drop for SessionConn {
     fn drop(&mut self) {
-        if let Some(reader) = self.reader.take() {
-            reader.abort();
-        }
-        if let Some(writer) = self.writer.take() {
-            writer.abort();
+        for task in [self.reader.take(), self.writer.take(), self.output.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
         }
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
         }
         if let Some(port) = self.forward.take() {
-            let _ = self.adb.remove_forward(port);
+            self.adb.remove_forward_blocking(port);
         }
     }
 }
 
+/// Owns everything a half-started session has created. Dropping it (start failed, or the start
+/// future was cancelled by a signal or an Offline) kills the helper and removes the forward.
 struct PendingSession {
     adb: Adb,
     child: Option<Child>,
@@ -98,7 +195,7 @@ impl Drop for PendingSession {
             let _ = child.start_kill();
         }
         if let Some(port) = self.forward.take() {
-            let _ = self.adb.remove_forward(port);
+            self.adb.remove_forward_blocking(port);
         }
     }
 }
@@ -117,17 +214,20 @@ fn helper_command(remote: &str, name: &str, token: &str) -> String {
     format!("CLASSPATH={remote} exec app_process / dev.lantern.helper.Main serve {name} {token}")
 }
 
+/// Starts a helper session. Every await is bounded, and the future is cancel-safe: dropping it
+/// at any point kills the helper and removes any forward it created.
 pub async fn start(adb: &Adb) -> Result<SessionConn> {
     let helper_sha = hex(&Sha256::digest(HELPER_JAR));
     let remote = format!("/data/local/tmp/lantern-helper-{helper_sha}.jar");
     let installed = adb
         .shell(&["sha256sum", &remote])
+        .await
         .map(|output| output.split_whitespace().next() == Some(helper_sha.as_str()))
         .unwrap_or(false);
     if !installed {
         let host = std::env::temp_dir().join(format!("lantern-helper-{helper_sha}.jar"));
         std::fs::write(&host, HELPER_JAR).context("write embedded helper jar")?;
-        let pushed = adb.push(&host.to_string_lossy(), &remote);
+        let pushed = adb.push(&host.to_string_lossy(), &remote).await;
         let _ = std::fs::remove_file(&host);
         pushed?;
     }
@@ -147,9 +247,7 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
     let stdout = pending
         .child
         .as_mut()
-        .unwrap()
-        .stdout
-        .take()
+        .and_then(|child| child.stdout.take())
         .context("helper stdout")?;
     let mut stdout = BufReader::new(stdout).lines();
     let line = timeout(Duration::from_secs(5), stdout.next_line())
@@ -160,19 +258,18 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
     if line.trim() != format!("listening {name}") {
         bail!("unexpected helper startup output: {line:?}");
     }
-    tokio::spawn(async move {
-        while let Ok(Some(line)) = stdout.next_line().await {
-            tracing::debug!(target: "lantern::helper", "{line}");
-        }
-    });
+    tracing::debug!(name, "helper listening");
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("allocate local port")?;
     let port = listener.local_addr()?.port();
     drop(listener);
-    adb.forward(port, &name)?;
+    // Recorded before the call: if this future is cancelled mid-`adb forward`, the forward may
+    // already exist server-side, and removing a missing forward is harmless.
     pending.forward = Some(port);
+    adb.forward(port, &name).await?;
+    tracing::debug!(port, name, "forward created");
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let stream = loop {
@@ -185,53 +282,25 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
             Err(error) => return Err(error).context("connect to helper for 3 s"),
         }
     };
-    let stream = handshake(stream, &token, 1).await?;
-    let _ = stream.set_nodelay(true);
+    let stream = handshake(stream, &token).await?;
 
-    let (tx, mut outbound) = mpsc::channel::<Frame>(64);
-    let (inbound, rx) = mpsc::channel::<Frame>(64);
-    let (mut read_half, mut write_half) = stream.into_split();
-    let reader = tokio::spawn(async move {
-        loop {
-            match read_frame_async(&mut read_half).await {
-                Ok(Some(frame)) => {
-                    if inbound.send(frame).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::debug!(%error, "helper read ended");
-                    break;
-                }
-            }
-        }
-    });
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = outbound.recv().await {
-            if let Err(error) = write_frame_async(&mut write_half, &frame).await {
-                tracing::debug!(%error, "helper write ended");
-                break;
-            }
-        }
-    });
-
-    pending.forward.take();
-    Ok(SessionConn {
-        tx,
-        rx,
-        reader: Some(reader),
-        writer: Some(writer),
-        child: pending.child.take(),
-        adb: adb.clone(),
-        forward: Some(port),
+    let child = pending.child.take();
+    let forward = pending.forward.take();
+    Ok(SessionConn::from_parts(
+        stream,
+        adb.clone(),
+        child,
+        Some(stdout),
+        forward,
         helper_sha,
-    })
+    ))
 }
 
-pub async fn handshake(mut stream: TcpStream, token: &str, version: u32) -> Result<TcpStream> {
+/// Sends `Hello{PROTOCOL_VERSION, token}` and requires the helper's `Hello{PROTOCOL_VERSION, ""}`
+/// echo.
+pub async fn handshake(mut stream: TcpStream, token: &str) -> Result<TcpStream> {
     let hello = Control::Hello {
-        version,
+        version: PROTOCOL_VERSION,
         token: token.to_owned(),
     };
     write_frame_async(
@@ -254,8 +323,16 @@ pub async fn handshake(mut stream: TcpStream, token: &str, version: u32) -> Resu
         bail!("expected hello reply in a control frame on stream 0");
     }
     match Control::decode(&reply.payload).context("decode hello reply")? {
-        Control::Hello { version: 1, token } if token.is_empty() => Ok(stream),
-        Control::Hello { version, .. } => bail!("helper protocol version mismatch: {version}"),
+        Control::Hello { version, token } if version == PROTOCOL_VERSION => {
+            if token.is_empty() {
+                Ok(stream)
+            } else {
+                bail!("helper Hello echo carried a token; expected an empty token, refusing session")
+            }
+        }
+        Control::Hello { version, .. } => bail!(
+            "helper speaks protocol v{version}, lantern expects v{PROTOCOL_VERSION}; rebuild/redeploy helper"
+        ),
         Control::Error { msg } => bail!("helper rejected handshake: {msg}"),
         other => bail!("expected hello reply, got {other:?}"),
     }
