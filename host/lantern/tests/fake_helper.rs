@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use futures_util::stream::{self, StreamExt};
 use lantern::adb::{Adb, DeviceEvent};
-use lantern::daemon::session::{handshake, SessionConn};
+use lantern::daemon::session::{handshake, HandshakeError, SessionConn};
 use lantern::daemon::{run_loop, RetryPolicy};
 use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, Kind};
 use tokio::net::{TcpListener, TcpStream};
@@ -92,6 +92,102 @@ async fn session_handshake_rejects_token_in_echo() {
         "unexpected error: {error}"
     );
     assert!(!error.contains("version"), "unexpected error: {error}");
+}
+
+async fn handshake_error(reply: Control) -> anyhow::Error {
+    let (port, helper) = fake_helper(reply).await;
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let error = handshake(stream, TOKEN).await.unwrap_err();
+    helper.await.unwrap();
+    error
+}
+
+/// Protocol failures are typed so the daemon can tell them apart from transient start failures.
+#[tokio::test]
+async fn handshake_protocol_failures_are_typed() {
+    let version = handshake_error(hello(2, "")).await;
+    assert!(matches!(
+        version.downcast_ref::<HandshakeError>(),
+        Some(HandshakeError::VersionMismatch {
+            helper: 2,
+            expected: 1
+        })
+    ));
+    let echo = handshake_error(hello(1, "x")).await;
+    assert!(matches!(
+        echo.downcast_ref::<HandshakeError>(),
+        Some(HandshakeError::TokenEcho)
+    ));
+    let rejected = handshake_error(Control::Error {
+        msg: "bad token".into(),
+    })
+    .await;
+    assert!(rejected.downcast_ref::<HandshakeError>().is_none());
+}
+
+/// Runs `run_loop` with a starter whose every helper answers `reply`; returns the loop's result
+/// and how many starts it made. Shutdown never fires, so only a fatal error ends the loop.
+async fn run_loop_against(reply: Control) -> (anyhow::Result<()>, usize) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            answer_hello(&mut socket, TOKEN, reply.clone()).await;
+        }
+    });
+    let starts = Arc::new(AtomicUsize::new(0));
+    let starter = {
+        let starts = starts.clone();
+        move |serial: String| {
+            starts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+                // Extra context on top, as callers may add: the type must survive it.
+                let stream = handshake(stream, TOKEN)
+                    .await
+                    .map_err(|error| error.context("start session"))?;
+                Ok(SessionConn::attach(stream, Adb::new(serial), "sha"))
+            }
+        }
+    };
+    let result = timeout(
+        Duration::from_secs(2),
+        run_loop(
+            None,
+            online_then_idle("dev"),
+            starter,
+            std::future::pending(),
+            fast_policy(),
+        ),
+    )
+    .await
+    .expect("run_loop kept retrying a handshake protocol failure");
+    // Longer than several fast_policy backoffs: a stray retry would be counted here.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    (result, starts.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn daemon_exits_on_version_mismatch_without_retry() {
+    let (result, starts) = run_loop_against(hello(2, "")).await;
+    let error = format!("{:#}", result.expect_err("version mismatch must be fatal"));
+    assert!(
+        error.contains("helper speaks protocol v2, lantern expects v1; rebuild/redeploy helper"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(starts, 1, "version mismatch was retried");
+}
+
+#[tokio::test]
+async fn daemon_exits_on_token_echo_without_retry() {
+    let (result, starts) = run_loop_against(hello(1, "x")).await;
+    let error = format!("{:#}", result.expect_err("token echo must be fatal"));
+    assert!(
+        error.contains("Hello echo carried a token"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(starts, 1, "token-echo refusal was retried");
 }
 
 #[tokio::test]

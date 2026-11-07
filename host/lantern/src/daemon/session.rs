@@ -296,6 +296,37 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
     ))
 }
 
+/// A handshake that reached the helper but broke the protocol. Retrying cannot help: the helper
+/// jar is embedded and content-addressed, so the same helper answers the same way every time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeError {
+    VersionMismatch { helper: u32, expected: u32 },
+    TokenEcho,
+}
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionMismatch { helper, expected } => write!(
+                f,
+                "helper speaks protocol v{helper}, lantern expects v{expected}; rebuild/redeploy helper"
+            ),
+            Self::TokenEcho => f.write_str(
+                "helper Hello echo carried a token; expected an empty token, refusing session",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HandshakeError {}
+
+impl HandshakeError {
+    /// Finds a protocol failure anywhere in `error`'s chain, under any added context.
+    pub fn find(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
 /// Sends `Hello{PROTOCOL_VERSION, token}` and requires the helper's `Hello{PROTOCOL_VERSION, ""}`
 /// echo.
 pub async fn handshake(mut stream: TcpStream, token: &str) -> Result<TcpStream> {
@@ -327,12 +358,14 @@ pub async fn handshake(mut stream: TcpStream, token: &str) -> Result<TcpStream> 
             if token.is_empty() {
                 Ok(stream)
             } else {
-                bail!("helper Hello echo carried a token; expected an empty token, refusing session")
+                Err(HandshakeError::TokenEcho.into())
             }
         }
-        Control::Hello { version, .. } => bail!(
-            "helper speaks protocol v{version}, lantern expects v{PROTOCOL_VERSION}; rebuild/redeploy helper"
-        ),
+        Control::Hello { version, .. } => Err(HandshakeError::VersionMismatch {
+            helper: version,
+            expected: PROTOCOL_VERSION,
+        }
+        .into()),
         Control::Error { msg } => bail!("helper rejected handshake: {msg}"),
         other => bail!("expected hello reply, got {other:?}"),
     }

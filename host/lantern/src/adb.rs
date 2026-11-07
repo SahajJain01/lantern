@@ -246,6 +246,9 @@ impl DeviceTracker {
     }
 }
 
+/// A `track-devices` client that stayed up this long resets the restart backoff.
+const TRACK_STABLE_AFTER: Duration = Duration::from_secs(5);
+
 /// Streams device edges from `adb track-devices`. If the adb client exits (e.g. the adb server
 /// was killed) every known device is reported offline and the client is restarted with backoff;
 /// the next full list then re-reports whatever is present.
@@ -259,6 +262,7 @@ pub fn track_devices_with(program: impl Into<OsString>) -> impl Stream<Item = De
         let mut tracker = DeviceTracker::default();
         let mut backoff = Duration::from_millis(250);
         loop {
+            let spawned = tokio::time::Instant::now();
             let child = Command::new(&program)
                 .arg("track-devices")
                 .stdin(Stdio::null())
@@ -288,7 +292,6 @@ pub fn track_devices_with(program: impl Into<OsString>) -> impl Stream<Item = De
                                 }
                             };
                             for list in lists {
-                                backoff = Duration::from_millis(250);
                                 for event in tracker.update(&list) {
                                     yield event;
                                 }
@@ -303,6 +306,11 @@ pub fn track_devices_with(program: impl Into<OsString>) -> impl Stream<Item = De
             }
             for event in tracker.update(&[]) {
                 yield event;
+            }
+            // Only a client that stayed up resets the backoff; one that decodes a list and dies
+            // at once (flapping adb) keeps backing off.
+            if spawned.elapsed() >= TRACK_STABLE_AFTER {
+                backoff = Duration::from_millis(250);
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));

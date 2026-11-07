@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use lantern::adb::Adb;
 use lantern::daemon::session::start;
-use tokio::time::{timeout, Instant};
+use tokio::time::Instant;
 
 struct FakeAdb {
     dir: PathBuf,
@@ -119,17 +119,42 @@ fn forward_port(calls: &[String]) -> String {
     line.split_whitespace().nth(3).unwrap().to_owned()
 }
 
+fn has_forward(calls: &[String]) -> bool {
+    calls
+        .iter()
+        .any(|c| c.starts_with("-s fake-serial forward tcp:"))
+}
+
+/// Drives `start` until the fake has logged the `adb forward` call (plus `grace`), then drops
+/// the future, as SIGINT or an Offline would. Panics if start finishes first.
+async fn cancel_start_after_forward(fake: &FakeAdb, grace: Duration) {
+    let adb = fake.adb();
+    let fut = start(&adb);
+    tokio::pin!(fut);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        tokio::select! {
+            result = &mut fut => panic!("start finished before cancel: ok={}", result.is_ok()),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                if has_forward(&fake.calls()) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "start never reached adb forward");
+            }
+        }
+    }
+    tokio::select! {
+        result = &mut fut => panic!("start finished before cancel: ok={}", result.is_ok()),
+        _ = tokio::time::sleep(grace) => {}
+    }
+}
+
 #[tokio::test]
 async fn cancelled_start_removes_forward_and_kills_helper() {
     let fake = FakeAdb::new("connect", "0");
     // Nothing listens behind the fake forward, so start() sits in its 3 s connect-retry loop;
-    // cancel it there, as SIGINT would.
-    let result = timeout(Duration::from_millis(700), start(&fake.adb())).await;
-    assert!(
-        result.is_err(),
-        "start should still be pending: {result:?}",
-        result = result.as_ref().map(|r| r.is_ok())
-    );
+    // cancel it there (shortly after the forward call), as SIGINT would.
+    cancel_start_after_forward(&fake, Duration::from_millis(200)).await;
     let calls = fake.calls();
     let port = forward_port(&calls);
     assert!(
@@ -142,8 +167,8 @@ async fn cancelled_start_removes_forward_and_kills_helper() {
 #[tokio::test]
 async fn cancel_while_adb_forward_runs_still_removes_it() {
     let fake = FakeAdb::new("forwarding", "30");
-    let result = timeout(Duration::from_millis(700), start(&fake.adb())).await;
-    assert!(result.is_err());
+    // The fake logs the call before sleeping 30 s, so this cancels mid-`adb forward`.
+    cancel_start_after_forward(&fake, Duration::ZERO).await;
     let calls = fake.calls();
     let port = forward_port(&calls);
     assert!(
@@ -170,4 +195,45 @@ async fn failed_start_cleans_up_too() {
     let port = forward_port(&calls);
     assert!(calls.contains(&format!("-s fake-serial forward --remove {port}")));
     wait_dead(fake.helper_pid()).await;
+}
+
+/// A flapping adb: every `track-devices` client prints one list and exits at once. Decoding a
+/// list must not reset the restart backoff (only a client that stayed up >= 5 s does), so the
+/// restarts slow down 250 ms -> 500 ms -> 1 s instead of hammering every 250 ms.
+#[tokio::test]
+async fn flapping_track_devices_backs_off() {
+    use futures_util::StreamExt;
+    use lantern::adb::{track_devices_with, DeviceEvent};
+
+    let fake = FakeAdb::new("flap", "0");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '000bdev\\tdevice\\n'\nexit 0\n",
+        fake.log.display()
+    );
+    std::fs::write(&fake.program, script).unwrap();
+    let events = track_devices_with(&fake.program);
+    tokio::pin!(events);
+    let mut onlines = 0;
+    let window = tokio::time::sleep(Duration::from_millis(1600));
+    tokio::pin!(window);
+    loop {
+        tokio::select! {
+            event = events.next() => {
+                if matches!(event, Some(DeviceEvent::Online(ref s)) if s == "dev") {
+                    onlines += 1;
+                }
+            }
+            _ = &mut window => break,
+        }
+    }
+    // Spawns at ~0, 0.25, 0.75 s (next at 1.75 s). Without backoff growth: ~6-7.
+    assert!(
+        (2..=4).contains(&onlines),
+        "track-devices restarted {onlines} times in 1.6 s"
+    );
+    let spawns = fake.calls().len();
+    assert!(
+        (onlines..=onlines + 1).contains(&spawns),
+        "spawns={spawns} onlines={onlines}"
+    );
 }

@@ -14,7 +14,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::Instant;
 
 use crate::adb::{track_devices, Adb, DeviceEvent};
-use crate::daemon::session::start;
+use crate::daemon::session::{start, HandshakeError};
 
 fn select_serial(configured: Option<&str>, connected: &HashSet<String>) -> Option<String> {
     if let Some(serial) = configured {
@@ -157,6 +157,13 @@ where
                     Ok(session) => {
                         tracing::info!(serial, helper = session.helper_sha(), "session ready");
                         active = Some((session, Instant::now()));
+                    }
+                    Err(error) if HandshakeError::find(&error).is_some() => {
+                        // The embedded helper answers the same way on every attempt; retrying
+                        // would only spin. Stop with the explained error (non-zero exit).
+                        tracing::error!(serial, error = format!("{error:#}"), "helper protocol mismatch; not retrying");
+                        close_session(&mut active).await;
+                        return Err(error.context(format!("session start on {serial} failed")));
                     }
                     Err(error) => {
                         failures += 1;
