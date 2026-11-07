@@ -278,7 +278,11 @@ pub async fn wait_for_previous_helpers(adb: &Adb, bound: Duration) -> Result<()>
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(" ");
-    tracing::warn!(pids = list, ?bound, "previous helper still alive; killing it");
+    tracing::warn!(
+        pids = list,
+        ?bound,
+        "previous helper still alive; killing it"
+    );
     if let Err(error) = adb.shell(&[&format!("kill -9 {list}")]).await {
         tracing::warn!(%error, "kill previous helper");
     }
@@ -515,12 +519,10 @@ fn helper_version_error(msg: &str, code: Option<String>, version: Option<u32>) -
     if !msg.starts_with(PREFIX) {
         return None;
     }
-    let parsed = msg
-        .split_once("helper speaks ")
-        .and_then(|(_, rest)| {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse().ok()
-        });
+    let parsed = msg.split_once("helper speaks ").and_then(|(_, rest)| {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    });
     Some(parsed.unwrap_or(0))
 }
 

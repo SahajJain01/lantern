@@ -54,7 +54,8 @@ fn scratch(tag: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("lantern-cli-{tag}-{}-{nanos}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("lantern-cli-{tag}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -70,7 +71,10 @@ fn status_without_a_daemon_exits_1() {
     let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
-    assert!(stderr.contains("lanternd is not running"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("lanternd is not running"),
+        "stderr: {stderr}"
+    );
     assert!(output.stdout.is_empty());
 }
 
@@ -105,7 +109,11 @@ fn status_prints_the_running_daemons_state_as_json() {
     std::fs::create_dir_all(&bin).unwrap();
     // An adb whose track-devices never lists a device: the daemon stays idle.
     let adb = bin.join("adb");
-    std::fs::write(&adb, "#!/bin/sh\ncase \"$*\" in *track-devices*) exec sleep 30;; esac\nexit 1\n").unwrap();
+    std::fs::write(
+        &adb,
+        "#!/bin/sh\ncase \"$*\" in *track-devices*) exec sleep 30;; esac\nexit 1\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
@@ -118,7 +126,10 @@ fn status_prints_the_running_daemons_state_as_json() {
     let sock = dir.join("lantern/daemon.sock");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !sock.exists() {
-        assert!(std::time::Instant::now() < deadline, "daemon never listened");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never listened"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
@@ -130,7 +141,12 @@ fn status_prints_the_running_daemons_state_as_json() {
     let exit = daemon.wait().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         json,

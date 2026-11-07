@@ -47,7 +47,10 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 
 fn encode_header(f: &Frame) -> io::Result<[u8; 9]> {
     if f.payload.len() > MAX_PAYLOAD as usize {
-        return Err(invalid(format!("payload {} exceeds MAX_PAYLOAD", f.payload.len())));
+        return Err(invalid(format!(
+            "payload {} exceeds MAX_PAYLOAD",
+            f.payload.len()
+        )));
     }
     let len = f.payload.len() as u32 + HEADER_AFTER_LEN;
     let mut h = [0u8; 9];
@@ -101,17 +104,26 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
     let (kind, stream) = parse_rest(&rest)?;
     let mut payload = vec![0u8; n];
     r.read_exact(&mut payload)?;
-    Ok(Some(Frame { kind, stream, payload }))
+    Ok(Some(Frame {
+        kind,
+        stream,
+        payload,
+    }))
 }
 
-pub async fn write_frame_async<W: AsyncWrite + Unpin + ?Sized>(w: &mut W, f: &Frame) -> io::Result<()> {
+pub async fn write_frame_async<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    f: &Frame,
+) -> io::Result<()> {
     let h = encode_header(f)?;
     w.write_all(&h).await?;
     w.write_all(&f.payload).await
 }
 
 /// Async variant of [`read_frame`], same EOF semantics.
-pub async fn read_frame_async<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> io::Result<Option<Frame>> {
+pub async fn read_frame_async<R: AsyncRead + Unpin + ?Sized>(
+    r: &mut R,
+) -> io::Result<Option<Frame>> {
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < 4 {
@@ -129,7 +141,11 @@ pub async fn read_frame_async<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -> io::R
     let (kind, stream) = parse_rest(&rest)?;
     let mut payload = vec![0u8; n];
     r.read_exact(&mut payload).await?;
-    Ok(Some(Frame { kind, stream, payload }))
+    Ok(Some(Frame {
+        kind,
+        stream,
+        payload,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -146,7 +162,10 @@ pub enum CloseReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Control {
-    Hello { version: u32, token: String },
+    Hello {
+        version: u32,
+        token: String,
+    },
     Open {
         pkg: String,
         user: u32,
@@ -158,16 +177,31 @@ pub enum Control {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activation_token: Option<String>,
     },
-    Opened { display: i32, task: i32, codec: String, w: u32, h: u32 },
-    Resize { w: u32, h: u32, dpi: u32 },
-    Resized { w: u32, h: u32 },
+    Opened {
+        display: i32,
+        task: i32,
+        codec: String,
+        w: u32,
+        h: u32,
+    },
+    Resize {
+        w: u32,
+        h: u32,
+        dpi: u32,
+    },
+    Resized {
+        w: u32,
+        h: u32,
+    },
     /// `{"t":"focus"}` when `activation_token` is `None`, byte-identical to the v1 unit form.
     Focus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activation_token: Option<String>,
     },
     Close,
-    Closed { reason: CloseReason },
+    Closed {
+        reason: CloseReason,
+    },
     /// `code`/`version` are optional and absent on the wire when `None`, so `{"t":"error","msg":..}`
     /// is unchanged. The helper sets `code:"version"` plus its own `version` on a handshake
     /// version mismatch (docs/protocol.md).
@@ -328,16 +362,40 @@ const INPUT_KEY: u8 = 3;
 /// Input event. `x`/`y` are normalized to 0..1 of the display.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
-    Pointer { action: PointerAction, id: u64, x: f32, y: f32, buttons: u32, pressure: f32 },
-    Scroll { x: f32, y: f32, h: f32, v: f32 },
-    Key { action: KeyAction, keycode: u32, meta: u32, repeat: u32 },
+    Pointer {
+        action: PointerAction,
+        id: u64,
+        x: f32,
+        y: f32,
+        buttons: u32,
+        pressure: f32,
+    },
+    Scroll {
+        x: f32,
+        y: f32,
+        h: f32,
+        v: f32,
+    },
+    Key {
+        action: KeyAction,
+        keycode: u32,
+        meta: u32,
+        repeat: u32,
+    },
 }
 
 impl InputEvent {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(26);
         match *self {
-            InputEvent::Pointer { action, id, x, y, buttons, pressure } => {
+            InputEvent::Pointer {
+                action,
+                id,
+                x,
+                y,
+                buttons,
+                pressure,
+            } => {
                 b.push(INPUT_POINTER);
                 b.push(action as u8);
                 b.extend_from_slice(&id.to_be_bytes());
@@ -352,7 +410,12 @@ impl InputEvent {
                     b.extend_from_slice(&f.to_be_bytes());
                 }
             }
-            InputEvent::Key { action, keycode, meta, repeat } => {
+            InputEvent::Key {
+                action,
+                keycode,
+                meta,
+                repeat,
+            } => {
                 b.push(INPUT_KEY);
                 b.push(action as u8);
                 b.extend_from_slice(&keycode.to_be_bytes());
@@ -374,7 +437,12 @@ impl InputEvent {
                 buttons: c.u32()?,
                 pressure: c.f32()?,
             },
-            INPUT_SCROLL => InputEvent::Scroll { x: c.f32()?, y: c.f32()?, h: c.f32()?, v: c.f32()? },
+            INPUT_SCROLL => InputEvent::Scroll {
+                x: c.f32()?,
+                y: c.f32()?,
+                h: c.f32()?,
+                v: c.f32()?,
+            },
             INPUT_KEY => InputEvent::Key {
                 action: KeyAction::try_from(c.u8()?)?,
                 keycode: c.u32()?,
@@ -384,7 +452,10 @@ impl InputEvent {
             t => return Err(invalid(format!("unknown input type {t}"))),
         };
         if !c.0.is_empty() {
-            return Err(invalid(format!("{} trailing bytes in input event", c.0.len())));
+            return Err(invalid(format!(
+                "{} trailing bytes in input event",
+                c.0.len()
+            )));
         }
         Ok(ev)
     }
@@ -423,9 +494,21 @@ mod tests {
 
     fn frames() -> Vec<Frame> {
         vec![
-            Frame { kind: Kind::Control, stream: 0, payload: br#"{"t":"bye"}"#.to_vec() },
-            Frame { kind: Kind::Video, stream: 7, payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10] },
-            Frame { kind: Kind::Input, stream: 0xdead_beef, payload: vec![] },
+            Frame {
+                kind: Kind::Control,
+                stream: 0,
+                payload: br#"{"t":"bye"}"#.to_vec(),
+            },
+            Frame {
+                kind: Kind::Video,
+                stream: 7,
+                payload: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            },
+            Frame {
+                kind: Kind::Input,
+                stream: 0xdead_beef,
+                payload: vec![],
+            },
         ]
     }
 
@@ -445,7 +528,15 @@ mod tests {
     #[test]
     fn frame_header_layout() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &Frame { kind: Kind::Video, stream: 0x0102_0304, payload: vec![0xaa, 0xbb] }).unwrap();
+        write_frame(
+            &mut buf,
+            &Frame {
+                kind: Kind::Video,
+                stream: 0x0102_0304,
+                payload: vec![0xaa, 0xbb],
+            },
+        )
+        .unwrap();
         assert_eq!(buf, [0, 0, 0, 7, 2, 1, 2, 3, 4, 0xaa, 0xbb]);
     }
 
@@ -473,7 +564,11 @@ mod tests {
 
     #[test]
     fn oversize_rejected_on_write() {
-        let f = Frame { kind: Kind::Video, stream: 1, payload: vec![0; MAX_PAYLOAD as usize + 1] };
+        let f = Frame {
+            kind: Kind::Video,
+            stream: 1,
+            payload: vec![0; MAX_PAYLOAD as usize + 1],
+        };
         let e = write_frame(&mut Vec::new(), &f).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidData);
     }
@@ -488,7 +583,14 @@ mod tests {
 
     #[test]
     fn control_json_shape() {
-        let c = Control::Open { pkg: "com.android.settings".into(), user: 0, w: 1280, h: 800, dpi: 160, activation_token: None };
+        let c = Control::Open {
+            pkg: "com.android.settings".into(),
+            user: 0,
+            w: 1280,
+            h: 800,
+            dpi: 160,
+            activation_token: None,
+        };
         assert_eq!(
             serde_json::to_string(&c).unwrap(),
             r#"{"t":"open","pkg":"com.android.settings","user":0,"w":1280,"h":800,"dpi":160}"#
@@ -502,7 +604,11 @@ mod tests {
             state: SessionState::Ready,
             serial: Some("20e9318".into()),
             helper: Some("ab12".into()),
-            windows: vec![WindowInfo { id: 1, pkg: "com.android.settings".into(), user: 0 }],
+            windows: vec![WindowInfo {
+                id: 1,
+                pkg: "com.android.settings".into(),
+                user: 0,
+            }],
         });
         let json = r#"{"t":"status_report","state":"ready","serial":"20e9318","helper":"ab12","windows":[{"id":1,"pkg":"com.android.settings","user":0}]}"#;
         assert_eq!(String::from_utf8(report.encode()).unwrap(), json);
@@ -525,46 +631,109 @@ mod tests {
 
     #[test]
     fn activation_token_is_optional_on_open_and_focus() {
-        let open = Control::Open { pkg: "p".into(), user: 0, w: 1, h: 2, dpi: 3, activation_token: Some("tok".into()) };
+        let open = Control::Open {
+            pkg: "p".into(),
+            user: 0,
+            w: 1,
+            h: 2,
+            dpi: 3,
+            activation_token: Some("tok".into()),
+        };
         let s = serde_json::to_string(&open).unwrap();
-        assert_eq!(s, r#"{"t":"open","pkg":"p","user":0,"w":1,"h":2,"dpi":3,"activation_token":"tok"}"#);
+        assert_eq!(
+            s,
+            r#"{"t":"open","pkg":"p","user":0,"w":1,"h":2,"dpi":3,"activation_token":"tok"}"#
+        );
         assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), open);
-        let bare: Control = serde_json::from_str(r#"{"t":"open","pkg":"p","user":0,"w":1,"h":2,"dpi":3}"#).unwrap();
-        assert!(matches!(bare, Control::Open { activation_token: None, .. }));
+        let bare: Control =
+            serde_json::from_str(r#"{"t":"open","pkg":"p","user":0,"w":1,"h":2,"dpi":3}"#).unwrap();
+        assert!(matches!(
+            bare,
+            Control::Open {
+                activation_token: None,
+                ..
+            }
+        ));
 
-        let focus = Control::Focus { activation_token: Some("tok".into()) };
+        let focus = Control::Focus {
+            activation_token: Some("tok".into()),
+        };
         let s = serde_json::to_string(&focus).unwrap();
         assert_eq!(s, r#"{"t":"focus","activation_token":"tok"}"#);
         assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), focus);
-        assert_eq!(serde_json::from_str::<Control>(r#"{"t":"focus"}"#).unwrap(), Control::Focus { activation_token: None });
+        assert_eq!(
+            serde_json::from_str::<Control>(r#"{"t":"focus"}"#).unwrap(),
+            Control::Focus {
+                activation_token: None
+            }
+        );
     }
 
     #[test]
     fn error_code_fields_are_optional_and_absent_by_default() {
         // v1 bytes unchanged when there is no code.
-        assert_eq!(serde_json::to_string(&Control::error("boom")).unwrap(), r#"{"t":"error","msg":"boom"}"#);
-        assert_eq!(serde_json::from_str::<Control>(r#"{"t":"error","msg":"boom"}"#).unwrap(), Control::error("boom"));
-        let v = Control::Error { msg: "m".into(), code: Some("version".into()), version: Some(2) };
-        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"t":"error","msg":"m","code":"version","version":2}"#);
+        assert_eq!(
+            serde_json::to_string(&Control::error("boom")).unwrap(),
+            r#"{"t":"error","msg":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Control>(r#"{"t":"error","msg":"boom"}"#).unwrap(),
+            Control::error("boom")
+        );
+        let v = Control::Error {
+            msg: "m".into(),
+            code: Some("version".into()),
+            version: Some(2),
+        };
+        assert_eq!(
+            serde_json::to_string(&v).unwrap(),
+            r#"{"t":"error","msg":"m","code":"version","version":2}"#
+        );
     }
 
     #[test]
     fn control_unit_and_reason_shapes() {
-        assert_eq!(serde_json::to_string(&Control::Focus { activation_token: None }).unwrap(), r#"{"t":"focus"}"#);
-        assert_eq!(serde_json::to_string(&Control::Bye).unwrap(), r#"{"t":"bye"}"#);
-        let c = Control::Closed { reason: CloseReason::AppExited };
+        assert_eq!(
+            serde_json::to_string(&Control::Focus {
+                activation_token: None
+            })
+            .unwrap(),
+            r#"{"t":"focus"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Control::Bye).unwrap(),
+            r#"{"t":"bye"}"#
+        );
+        let c = Control::Closed {
+            reason: CloseReason::AppExited,
+        };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(s, r#"{"t":"closed","reason":"app_exited"}"#);
         assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), c);
         let all = vec![
-            Control::Hello { version: 1, token: "abc".into() },
-            Control::Opened { display: 12, task: -1, codec: "h264".into(), w: 1280, h: 800 },
+            Control::Hello {
+                version: 1,
+                token: "abc".into(),
+            },
+            Control::Opened {
+                display: 12,
+                task: -1,
+                codec: "h264".into(),
+                w: 1280,
+                h: 800,
+            },
             Control::Resize { w: 1, h: 2, dpi: 3 },
             Control::Resized { w: 4, h: 5 },
             Control::Close,
-            Control::Closed { reason: CloseReason::Error },
+            Control::Closed {
+                reason: CloseReason::Error,
+            },
             Control::error("boom"),
-            Control::Error { msg: "old".into(), code: Some("version".into()), version: Some(2) },
+            Control::Error {
+                msg: "old".into(),
+                code: Some("version".into()),
+                version: Some(2),
+            },
         ];
         for c in all {
             let s = serde_json::to_string(&c).unwrap();
@@ -575,9 +744,26 @@ mod tests {
     #[test]
     fn input_roundtrip() {
         let events = vec![
-            InputEvent::Pointer { action: PointerAction::HoverMove, id: u64::MAX - 3, x: 0.25, y: 0.75, buttons: 1, pressure: 0.5 },
-            InputEvent::Scroll { x: 0.5, y: 0.125, h: -1.0, v: 2.5 },
-            InputEvent::Key { action: KeyAction::Up, keycode: 66, meta: 0x1000, repeat: 3 },
+            InputEvent::Pointer {
+                action: PointerAction::HoverMove,
+                id: u64::MAX - 3,
+                x: 0.25,
+                y: 0.75,
+                buttons: 1,
+                pressure: 0.5,
+            },
+            InputEvent::Scroll {
+                x: 0.5,
+                y: 0.125,
+                h: -1.0,
+                v: 2.5,
+            },
+            InputEvent::Key {
+                action: KeyAction::Up,
+                keycode: 66,
+                meta: 0x1000,
+                repeat: 3,
+            },
         ];
         for e in events {
             assert_eq!(InputEvent::decode(&e.encode()).unwrap(), e);
@@ -586,24 +772,65 @@ mod tests {
 
     #[test]
     fn input_layout_and_errors() {
-        let k = InputEvent::Key { action: KeyAction::Down, keycode: 29, meta: 1, repeat: 0 };
+        let k = InputEvent::Key {
+            action: KeyAction::Down,
+            keycode: 29,
+            meta: 1,
+            repeat: 0,
+        };
         assert_eq!(k.encode(), [3, 0, 0, 0, 0, 29, 0, 0, 0, 1, 0, 0, 0, 0]);
-        assert_eq!(InputEvent::Pointer { action: PointerAction::Down, id: 0, x: 0.0, y: 0.0, buttons: 0, pressure: 0.0 }.encode().len(), 1 + 1 + 8 + 4 + 4 + 4 + 4);
-        assert_eq!(InputEvent::decode(&[9]).unwrap_err().kind(), ErrorKind::InvalidData);
-        assert_eq!(InputEvent::decode(&[3, 0, 0]).unwrap_err().kind(), ErrorKind::InvalidData);
-        assert_eq!(InputEvent::decode(&[]).unwrap_err().kind(), ErrorKind::InvalidData);
-        assert_eq!(InputEvent::decode(&[1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            InputEvent::Pointer {
+                action: PointerAction::Down,
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                buttons: 0,
+                pressure: 0.0
+            }
+            .encode()
+            .len(),
+            1 + 1 + 8 + 4 + 4 + 4 + 4
+        );
+        assert_eq!(
+            InputEvent::decode(&[9]).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            InputEvent::decode(&[3, 0, 0]).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            InputEvent::decode(&[]).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            InputEvent::decode(&[
+                1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ])
+            .unwrap_err()
+            .kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     #[test]
     fn video_flags_roundtrip() {
         for (config, key) in [(false, false), (true, false), (false, true), (true, true)] {
-            let p = VideoPacket { pts_us: 0x0102_0304_0506_0708, config, key, data: vec![0, 0, 0, 1, 0x65] };
+            let p = VideoPacket {
+                pts_us: 0x0102_0304_0506_0708,
+                config,
+                key,
+                data: vec![0, 0, 0, 1, 0x65],
+            };
             let b = p.encode();
             assert_eq!(b[8], (config as u8) | ((key as u8) << 1));
             assert_eq!(VideoPacket::decode(&b).unwrap(), p);
         }
-        assert_eq!(VideoPacket::decode(&[0; 8]).unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(
+            VideoPacket::decode(&[0; 8]).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]
@@ -623,6 +850,9 @@ mod tests {
         }
         assert_eq!(read_frame_async(&mut r).await.unwrap(), None);
         let mut t: &[u8] = &[0, 0, 0, 10, 1, 0, 0];
-        assert_eq!(read_frame_async(&mut t).await.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(
+            read_frame_async(&mut t).await.unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
     }
 }

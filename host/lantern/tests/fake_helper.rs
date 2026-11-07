@@ -128,8 +128,7 @@ async fn handshake_protocol_failures_are_typed() {
         echo.downcast_ref::<HandshakeError>(),
         Some(HandshakeError::TokenEcho)
     ));
-    let rejected = handshake_error(Control::error("bad token"))
-    .await;
+    let rejected = handshake_error(Control::error("bad token")).await;
     assert!(rejected.downcast_ref::<HandshakeError>().is_none());
 }
 

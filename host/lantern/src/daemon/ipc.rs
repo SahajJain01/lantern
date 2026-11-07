@@ -522,13 +522,7 @@ impl Hub {
             return Ok(());
         }
         let Some(helper) = helper else {
-            self.reply_and_finish(
-                cid,
-                control(
-                    0,
-                    Control::error(NOT_CONNECTED),
-                ),
-            );
+            self.reply_and_finish(cid, control(0, Control::error(NOT_CONNECTED)));
             return Ok(());
         };
         let key = format!("{pkg}:{user}");

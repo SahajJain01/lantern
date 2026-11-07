@@ -95,7 +95,15 @@ where
     F: Future<Output = Result<SessionConn>>,
     D: Future<Output = &'static str>,
 {
-    drive(Hub::new(None), configured, events, starter, shutdown, policy).await
+    drive(
+        Hub::new(None),
+        configured,
+        events,
+        starter,
+        shutdown,
+        policy,
+    )
+    .await
 }
 
 /// The daemon: phone session management plus window clients on `listener`. Generic over its
@@ -255,8 +263,14 @@ where
             }
         }
         if let Some(why) = ended {
-            let lived = active.as_ref().map(|(_, since)| since.elapsed()).unwrap_or_default();
-            let serial = active.as_ref().map(|(s, _)| s.serial().to_owned()).unwrap_or_default();
+            let lived = active
+                .as_ref()
+                .map(|(_, since)| since.elapsed())
+                .unwrap_or_default();
+            let serial = active
+                .as_ref()
+                .map(|(s, _)| s.serial().to_owned())
+                .unwrap_or_default();
             tracing::warn!(serial, why, ?lived, "helper session ended unexpectedly");
             close_session(&mut active, &mut hub).await;
             if lived >= policy.stable_after {

@@ -67,12 +67,13 @@ exit 0
 fn scripts() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        use std::os::unix::fs::PermissionsExt;
         use std::hash::{Hash, Hasher};
+        use std::os::unix::fs::PermissionsExt;
         // Keyed by content, so runs share one directory and nothing accumulates in $TMPDIR.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (ADB_SCRIPT, FLAP_SCRIPT).hash(&mut hasher);
-        let dir = std::env::temp_dir().join(format!("lantern-fake-adb-bin-{:016x}", hasher.finish()));
+        let dir =
+            std::env::temp_dir().join(format!("lantern-fake-adb-bin-{:016x}", hasher.finish()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, body) in [("adb", ADB_SCRIPT), ("adb-flap", FLAP_SCRIPT)] {
             let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
@@ -351,7 +352,11 @@ async fn start_waits_for_previous_helpers_to_exit() {
         .filter(|(_, c)| c.contains(" shell pgrep"))
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(polls.len(), 4, "3 polls saw helpers, the 4th none: {calls:#?}");
+    assert_eq!(
+        polls.len(),
+        4,
+        "3 polls saw helpers, the 4th none: {calls:#?}"
+    );
     let spawned = position(&calls, helper_spawned).expect("helper never spawned");
     assert!(polls.iter().all(|&p| p < spawned), "{calls:#?}");
     assert!(
@@ -406,7 +411,10 @@ async fn start_prunes_old_helper_jars() {
     let calls = fake.calls();
     let push = position(&calls, |c| c.contains(" push ")).expect("no push");
     let remote = calls[push].split_whitespace().last().unwrap().to_owned();
-    assert!(remote.starts_with("/data/local/tmp/lantern-helper-"), "{remote}");
+    assert!(
+        remote.starts_with("/data/local/tmp/lantern-helper-"),
+        "{remote}"
+    );
     let prune = position(&calls, |c| c.contains("lantern-helper-*.jar"))
         .unwrap_or_else(|| panic!("old jars not pruned: {calls:#?}"));
     assert!(
@@ -421,7 +429,9 @@ async fn start_prunes_old_helper_jars() {
 /// Concurrent starts in one process must not share the host-side temp copy of the jar.
 #[tokio::test]
 async fn concurrent_starts_use_distinct_host_jar_paths() {
-    let fakes: Vec<FakeAdb> = (0..4).map(|i| FakeAdb::new(&format!("jar{i}"), "0")).collect();
+    let fakes: Vec<FakeAdb> = (0..4)
+        .map(|i| FakeAdb::new(&format!("jar{i}"), "0"))
+        .collect();
     let starts = fakes.iter().map(|f| {
         let adb = f.adb();
         async move { start(&adb).await.err().map(|e| format!("{e:#}")) }
@@ -438,8 +448,15 @@ async fn concurrent_starts_use_distinct_host_jar_paths() {
         wait_dead(fake.helper_pid()).await;
     }
     let distinct: std::collections::BTreeSet<_> = locals.iter().collect();
-    assert_eq!(distinct.len(), locals.len(), "shared host jar path: {locals:?}");
+    assert_eq!(
+        distinct.len(),
+        locals.len(),
+        "shared host jar path: {locals:?}"
+    );
     for local in &locals {
-        assert!(!Path::new(local).exists(), "host temp jar left behind: {local}");
+        assert!(
+            !Path::new(local).exists(),
+            "host temp jar left behind: {local}"
+        );
     }
 }

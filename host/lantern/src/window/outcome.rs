@@ -80,7 +80,11 @@ impl OpenState {
     fn failure(&self, fallback: &str) -> Exit {
         Exit {
             code: 1,
-            message: Some(self.error_msg.clone().unwrap_or_else(|| fallback.to_owned())),
+            message: Some(
+                self.error_msg
+                    .clone()
+                    .unwrap_or_else(|| fallback.to_owned()),
+            ),
         }
     }
 }

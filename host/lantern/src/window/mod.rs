@@ -21,9 +21,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use lantern_proto::{
-    read_frame, write_frame, Control, Frame, InputEvent, Kind, VideoPacket,
-};
+use lantern_proto::{read_frame, write_frame, Control, Frame, InputEvent, Kind, VideoPacket};
 use serde::{Deserialize, Serialize};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};

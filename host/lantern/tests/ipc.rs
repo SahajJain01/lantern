@@ -417,10 +417,7 @@ async fn open_without_phone_is_an_error() {
     send(&mut client, &open("com.example", 0, None)).await;
     let reply = recv(&mut client).await.expect("an error reply");
     assert_eq!(reply.stream, 0);
-    assert_eq!(
-        decode(&reply),
-        Control::error("phone not connected")
-    );
+    assert_eq!(decode(&reply), Control::error("phone not connected"));
     assert_eq!(recv(&mut client).await, None);
     daemon.shutdown().await;
 }
@@ -567,7 +564,10 @@ async fn failed_open_error_and_closed_reach_the_client() {
         match timeout(Duration::from_millis(200), read_frame_async(&mut client)).await {
             Err(_) => break client, // forwarded; waiting on the helper
             Ok(_) => {
-                assert!(Instant::now() < deadline, "phone session never became active");
+                assert!(
+                    Instant::now() < deadline,
+                    "phone session never became active"
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
@@ -962,7 +962,10 @@ async fn status_until(sock: &Path, ok: impl Fn(&StatusReport) -> bool) -> Status
         if ok(&report) {
             return report;
         }
-        assert!(Instant::now() < deadline, "status never matched: {report:?}");
+        assert!(
+            Instant::now() < deadline,
+            "status never matched: {report:?}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -997,8 +1000,16 @@ async fn status_reports_ready_session_and_open_windows() {
     assert_eq!(
         report.windows,
         vec![
-            WindowInfo { id: win1, pkg: "com.one".into(), user: 0 },
-            WindowInfo { id: win2, pkg: "com.two".into(), user: 10 },
+            WindowInfo {
+                id: win1,
+                pkg: "com.one".into(),
+                user: 0
+            },
+            WindowInfo {
+                id: win2,
+                pkg: "com.two".into(),
+                user: 10
+            },
         ]
     );
     helper.assert_quiet().await; // status never reaches the phone
@@ -1034,7 +1045,11 @@ async fn status_while_session_starts_is_starting() {
     assert_eq!(report.serial.as_deref(), Some("dev"));
     assert_eq!(report.helper, None);
     let _ = stop.send(());
-    timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
