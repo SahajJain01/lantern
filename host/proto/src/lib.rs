@@ -170,6 +170,39 @@ pub enum Control {
     Closed { reason: CloseReason },
     Error { msg: String },
     Bye,
+    /// Host-only (`lantern status` -> lanternd, stream 0, first frame). Never sent to the helper.
+    Status,
+    /// Host-only: lanternd's answer to [`Control::Status`].
+    StatusReport(StatusReport),
+}
+
+/// The daemon's phone session, as `lantern status` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// No session and none starting (no phone, or waiting to retry).
+    Idle,
+    /// Helper deploy/handshake in flight.
+    Starting,
+    /// A helper session is live; windows can open.
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub id: u32,
+    pub pkg: String,
+    pub user: u32,
+}
+
+/// `serial` is the session's device (`null` when idle); `helper` is the live helper jar's
+/// SHA-256 (`null` unless ready). `windows` are the open windows, by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusReport {
+    pub state: SessionState,
+    pub serial: Option<String>,
+    pub helper: Option<String>,
+    pub windows: Vec<WindowInfo>,
 }
 
 impl Control {
@@ -441,6 +474,34 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&c).unwrap(),
             r#"{"t":"open","pkg":"com.android.settings","user":0,"w":1280,"h":800,"dpi":160}"#
+        );
+    }
+
+    #[test]
+    fn status_request_and_report_json_shape() {
+        assert_eq!(Control::Status.encode(), br#"{"t":"status"}"#);
+        let report = Control::StatusReport(StatusReport {
+            state: SessionState::Ready,
+            serial: Some("20e9318".into()),
+            helper: Some("ab12".into()),
+            windows: vec![WindowInfo { id: 1, pkg: "com.android.settings".into(), user: 0 }],
+        });
+        let json = r#"{"t":"status_report","state":"ready","serial":"20e9318","helper":"ab12","windows":[{"id":1,"pkg":"com.android.settings","user":0}]}"#;
+        assert_eq!(String::from_utf8(report.encode()).unwrap(), json);
+        assert_eq!(Control::decode(json.as_bytes()).unwrap(), report);
+        let idle = Control::StatusReport(StatusReport {
+            state: SessionState::Idle,
+            serial: None,
+            helper: None,
+            windows: vec![],
+        });
+        assert_eq!(
+            String::from_utf8(idle.encode()).unwrap(),
+            r#"{"t":"status_report","state":"idle","serial":null,"helper":null,"windows":[]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionState::Starting).unwrap(),
+            r#""starting""#
         );
     }
 

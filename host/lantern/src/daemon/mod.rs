@@ -11,6 +11,7 @@ use anyhow::{bail, Result};
 use futures_core::Stream;
 use futures_util::StreamExt;
 use ipc::Hub;
+use lantern_proto::SessionState;
 use session::{Inbound, SessionConn};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -150,6 +151,17 @@ where
 
     loop {
         let idle = active.is_none() && starting.is_none();
+        match (&active, &starting) {
+            (Some((session, _)), _) => hub.set_session(
+                SessionState::Ready,
+                Some(session.serial().to_owned()),
+                Some(session.helper_sha().to_owned()),
+            ),
+            (None, Some((serial, _))) => {
+                hub.set_session(SessionState::Starting, Some(serial.clone()), None)
+            }
+            (None, None) => hub.set_session(SessionState::Idle, None, None),
+        }
         let wake = retry_at.unwrap_or_else(Instant::now);
         // Set when the live session must be torn down and restarted.
         let mut ended: Option<&'static str> = None;
@@ -258,6 +270,21 @@ where
     }
 }
 
+/// `lantern daemon` exit status when the helper breaks the protocol handshake. The embedded
+/// helper answers the same way every time, so `lanternd.service` has
+/// `RestartPreventExitStatus=3`: systemd must not respawn it.
+pub const EXIT_PROTOCOL_MISMATCH: u8 = 3;
+
+/// The `lantern daemon` exit status for a failed run: [`EXIT_PROTOCOL_MISMATCH`] for a
+/// handshake protocol error, 1 for any other runtime failure (2 is reserved for usage errors).
+pub fn exit_code(error: &anyhow::Error) -> u8 {
+    if HandshakeError::find(error).is_some() {
+        EXIT_PROTOCOL_MISMATCH
+    } else {
+        1
+    }
+}
+
 pub async fn run() -> Result<()> {
     let configured = std::env::var("LANTERN_SERIAL")
         .ok()
@@ -312,6 +339,20 @@ mod tests {
             select_serial(None, &devices(&["one", "two"])),
             Some("20e9318".into())
         );
+    }
+
+    #[test]
+    fn exit_code_separates_protocol_mismatch_from_runtime_failures() {
+        let mismatch = anyhow::Error::new(HandshakeError::VersionMismatch {
+            helper: 2,
+            expected: 1,
+        })
+        .context("session start on 20e9318 failed");
+        assert_eq!(exit_code(&mismatch), EXIT_PROTOCOL_MISMATCH);
+        assert_eq!(EXIT_PROTOCOL_MISMATCH, 3);
+        let echo = anyhow::Error::new(HandshakeError::TokenEcho);
+        assert_eq!(exit_code(&echo), 3);
+        assert_eq!(exit_code(&anyhow::anyhow!("adb track-devices ended")), 1);
     }
 
     #[test]

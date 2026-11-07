@@ -1,8 +1,10 @@
 use anyhow::{bail, Result};
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = "usage: lantern daemon | lantern open <package>";
+const USAGE: &str = "usage: lantern daemon | lantern open <package> | lantern status";
 
+/// Exit statuses: 0 ok, 1 runtime failure, 2 usage error, 3 (`daemon` only) helper protocol
+/// mismatch, which `lanternd.service` does not restart.
 fn main() -> std::process::ExitCode {
     let filter = EnvFilter::try_from_env("LANTERN_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -19,27 +21,46 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// A subcommand's failure is printed and becomes `code(error)`. Only usage errors reach
+/// `main`'s exit 2.
+fn runtime(result: Result<u8>, code: impl FnOnce(&anyhow::Error) -> u8) -> u8 {
+    match result {
+        Ok(ok) => ok,
+        Err(error) => {
+            eprintln!("lantern: {error:#}");
+            code(&error)
+        }
+    }
+}
+
 fn cli() -> Result<u8> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["daemon"] => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(lantern::daemon::run())?;
-            Ok(0)
+            let run = || -> Result<u8> {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(lantern::daemon::run())?;
+                Ok(0)
+            };
+            Ok(runtime(run(), lantern::daemon::exit_code))
         }
         // The window owns the main thread (winit); it runs no tokio runtime. Its failures
-        // (daemon unreachable, event loop) exit 1 like its runtime errors; 2 is usage only.
+        // (daemon unreachable, event loop) exit 1 like its runtime errors.
         ["open", pkg] if !pkg.is_empty() && !pkg.starts_with('-') => {
-            match lantern::window::run(pkg) {
-                Ok(code) => Ok(code.clamp(0, 255) as u8),
-                Err(error) => {
-                    eprintln!("lantern: {error:#}");
-                    Ok(1)
-                }
-            }
+            let run = lantern::window::run(pkg).map(|code| code.clamp(0, 255) as u8);
+            Ok(runtime(run, |_| 1))
         }
-        ["daemon", ..] | ["open", ..] => bail!("{USAGE}"),
+        ["status"] => {
+            let run = || -> Result<u8> {
+                use lantern::daemon::ipc;
+                let report = ipc::query_status(&ipc::socket_path_in(&ipc::runtime_dir()?))?;
+                println!("{}", serde_json::to_string(&report)?);
+                Ok(0)
+            };
+            Ok(runtime(run(), |_| 1))
+        }
+        ["daemon", ..] | ["open", ..] | ["status", ..] => bail!("{USAGE}"),
         [other, ..] => bail!("unknown subcommand {other:?}; {USAGE}"),
         [] => bail!("{USAGE}"),
     }

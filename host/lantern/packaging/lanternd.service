@@ -4,6 +4,8 @@ Description=Lantern Android application daemon
 [Service]
 ExecStart=%h/.local/bin/lantern daemon
 Restart=on-failure
+# Exit 3 = the phone helper speaks another protocol version; respawning cannot fix that.
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=default.target

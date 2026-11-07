@@ -3,6 +3,11 @@
 
     python3 tools/build.py helper   # host-JVM tests, then build/helper/lantern-helper.jar
     python3 tools/build.py all      # helper, then cargo build --release (host/)
+    python3 tools/build.py install  # all, then ~/.local/bin/lantern + lanternd.service (enabled)
+    python3 tools/build.py uninstall  # disable --now lanternd, remove the unit and the binary
+
+install/uninstall are idempotent. install restarts a running lanternd only when the binary or
+the unit changed.
 
 Toolchain: ~/.local/opt/pd-toolchain (override with PD_TC): jdk/, build-tools/, platform/.
 """
@@ -27,6 +32,11 @@ VENDOR = HELPER / "vendor"
 OUT = ROOT / "build/helper"
 JAR = OUT / "lantern-helper.jar"
 ASSET = ROOT / "host/lantern/assets/helper.jar"
+RELEASE_BIN = ROOT / "host/target/release/lantern"
+UNIT_SRC = ROOT / "host/lantern/packaging/lanternd.service"
+UNIT = "lanternd.service"
+BIN_DIR = Path.home() / ".local/bin"
+UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd/user"
 
 # AIDL interfaces the vendored scrcpy wrappers need (paths relative to vendor/aidl).
 AIDL = ["android/view/IDisplayWindowListener.aidl"]
@@ -40,7 +50,9 @@ public final class BuildConfig {
 }
 """
 
-ENV = dict(os.environ, JAVA_HOME=str(JDK), PATH=f"{JDK}/bin:{os.environ['PATH']}")
+CARGO_BIN = Path.home() / ".cargo/bin"
+ENV = dict(os.environ, JAVA_HOME=str(JDK),
+           PATH=f"{JDK}/bin:{os.environ['PATH']}:{CARGO_BIN}")
 
 
 def run(*args, cwd=None):
@@ -111,14 +123,67 @@ def build_helper():
     dex(classes)
 
 
+def place(src, dst, mode):
+    """Copies src to dst atomically (temp file + rename, so a running binary is never
+    overwritten in place). Returns True if dst changed."""
+    data = src.read_bytes()
+    if dst.exists() and dst.read_bytes() == data and (dst.stat().st_mode & 0o777) == mode:
+        print(f"unchanged {dst}")
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
+    tmp.write_bytes(data)
+    tmp.chmod(mode)
+    os.replace(tmp, dst)
+    print(f"installed {dst}")
+    return True
+
+
+def systemctl(*args, check=True, quiet=False):
+    out = subprocess.DEVNULL if quiet else None
+    return subprocess.run(["systemctl", "--user", *args], check=check, stdout=out, stderr=out)
+
+
+def install():
+    changed = place(RELEASE_BIN, BIN_DIR / "lantern", 0o755)
+    changed |= place(UNIT_SRC, UNIT_DIR / UNIT, 0o644)
+    run("systemctl", "--user", "daemon-reload")
+    active = systemctl("is-active", "--quiet", UNIT, check=False, quiet=True).returncode == 0
+    run("systemctl", "--user", "enable", "--now", UNIT)
+    if active and changed:
+        run("systemctl", "--user", "restart", UNIT)
+    print(f"lanternd: {'restarted' if active and changed else 'running'}; "
+          f"check with `lantern status` or `journalctl --user -u {UNIT}`")
+
+
+def uninstall():
+    unit = UNIT_DIR / UNIT
+    if unit.exists() or systemctl("cat", UNIT, check=False, quiet=True).returncode == 0:
+        # Stopping lanternd restores the phone (setting, panel, displays, forward, helper).
+        systemctl("disable", "--now", UNIT, check=False)
+    for path in (unit, BIN_DIR / "lantern"):
+        if path.exists():
+            path.unlink()
+            print(f"removed {path}")
+    run("systemctl", "--user", "daemon-reload")
+    systemctl("reset-failed", UNIT, check=False, quiet=True)
+    print("The helper jar stays on the phone; remove it with "
+          "`adb shell rm -f /data/local/tmp/lantern-helper-*.jar`.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("target", choices=["helper", "all"])
+    ap.add_argument("target", choices=["helper", "all", "install", "uninstall"])
     target = ap.parse_args().target
     try:
+        if target == "uninstall":
+            uninstall()
+            return
         build_helper()
-        if target == "all":
+        if target in ("all", "install"):
             run("cargo", "build", "--release", cwd=ROOT / "host")
+        if target == "install":
+            install()
     except subprocess.CalledProcessError as e:
         print(f"build failed: {e}", file=sys.stderr)
         sys.exit(1)

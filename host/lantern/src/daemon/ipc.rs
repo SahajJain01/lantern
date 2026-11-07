@@ -17,7 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, InputEvent, Kind};
+use lantern_proto::{
+    read_frame_async, write_frame_async, Control, Frame, InputEvent, Kind, SessionState,
+    StatusReport, WindowInfo,
+};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -135,6 +138,28 @@ pub fn bind(runtime_dir: &Path) -> Result<UnixListener> {
     UnixListener::bind(&sock).with_context(|| format!("listen on {}", sock.display()))
 }
 
+/// `lantern status`: asks the daemon listening on `sock` for its [`StatusReport`]. Blocking.
+pub fn query_status(sock: &Path) -> Result<StatusReport> {
+    let mut stream = std::os::unix::net::UnixStream::connect(sock).with_context(|| {
+        format!(
+            "lanternd is not running (cannot connect to {})",
+            sock.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(OPEN_TIMEOUT))?;
+    stream.set_write_timeout(Some(OPEN_TIMEOUT))?;
+    lantern_proto::write_frame(&mut stream, &control(0, Control::Status))
+        .context("send status request")?;
+    let reply = lantern_proto::read_frame(&mut stream)
+        .context("read status reply")?
+        .context("lanternd closed the connection without a status reply")?;
+    match (reply.kind, Control::decode(&reply.payload)) {
+        (Kind::Control, Ok(Control::StatusReport(report))) => Ok(report),
+        (Kind::Control, Ok(Control::Error { msg })) => bail!("lanternd: {msg}"),
+        (kind, other) => bail!("unexpected status reply: {kind:?} {other:?}"),
+    }
+}
+
 /// The helper stopped draining its queue for [`HELPER_SEND_TIMEOUT`]; the session should end.
 #[derive(Debug)]
 pub struct HelperWedged;
@@ -242,7 +267,11 @@ pub struct Hub {
     listener: Option<UnixListener>,
     clients: HashMap<u64, Client>,
     windows: HashMap<u32, u64>,
+    /// What `lantern status` reports for each open window.
+    info: HashMap<u32, WindowInfo>,
     registry: Registry,
+    /// The session part of `lantern status`, kept current by the run loop.
+    session: (SessionState, Option<String>, Option<String>),
     next_cid: u64,
     events_tx: mpsc::Sender<ClientEvent>,
     events: mpsc::Receiver<ClientEvent>,
@@ -256,11 +285,44 @@ impl Hub {
             listener,
             clients: HashMap::new(),
             windows: HashMap::new(),
+            info: HashMap::new(),
             registry: Registry::default(),
+            session: (SessionState::Idle, None, None),
             next_cid: 0,
             events_tx,
             events,
         }
+    }
+
+    /// Records the session state `lantern status` reports: `serial` is the device being started
+    /// or served, `helper` the live helper's SHA-256.
+    pub fn set_session(
+        &mut self,
+        state: SessionState,
+        serial: Option<String>,
+        helper: Option<String>,
+    ) {
+        self.session = (state, serial, helper);
+    }
+
+    /// The `lantern status` answer: session state plus open windows by id.
+    pub fn status(&self) -> StatusReport {
+        let mut windows: Vec<WindowInfo> = self.info.values().cloned().collect();
+        windows.sort_by_key(|w| w.id);
+        let (state, serial, helper) = self.session.clone();
+        StatusReport {
+            state,
+            serial,
+            helper,
+            windows,
+        }
+    }
+
+    /// Forgets window `win` (registry and status).
+    fn release(&mut self, win: u32) {
+        self.windows.remove(&win);
+        self.info.remove(&win);
+        self.registry.release(win);
     }
 
     /// The listener's socket path, if any.
@@ -372,8 +434,7 @@ impl Hub {
         let win = client.win;
         client.kill();
         if let Some(win) = win {
-            self.windows.remove(&win);
-            self.registry.release(win);
+            self.release(win);
             tracing::info!(cid, win, "window client gone; closing window");
             if let Some(helper) = helper {
                 return to_helper(helper, control(win, Control::Close)).await;
@@ -429,6 +490,12 @@ impl Hub {
         let open = (frame.kind == Kind::Control && frame.stream == 0)
             .then(|| Control::decode(&frame.payload).ok())
             .flatten();
+        if matches!(open, Some(Control::Status)) {
+            tracing::debug!(cid, "status request");
+            let report = Control::StatusReport(self.status());
+            self.reply_and_finish(cid, control(0, report));
+            return Ok(());
+        }
         let Some(Control::Open {
             pkg,
             user,
@@ -492,6 +559,14 @@ impl Hub {
                     client.win = Some(win);
                 }
                 self.windows.insert(win, cid);
+                self.info.insert(
+                    win,
+                    WindowInfo {
+                        id: win,
+                        pkg: pkg.clone(),
+                        user,
+                    },
+                );
                 let open = Control::Open {
                     pkg,
                     user,
@@ -559,8 +634,7 @@ impl Hub {
             && matches!(Control::decode(&frame.payload), Ok(Control::Closed { .. }));
         if closed {
             tracing::info!(cid, win, "window closed by helper");
-            self.windows.remove(&win);
-            self.registry.release(win);
+            self.release(win);
             if let Some(client) = self.clients.get_mut(&cid) {
                 client.win = None;
             }
@@ -580,6 +654,7 @@ impl Hub {
             }
         }
         self.windows.clear();
+        self.info.clear();
         self.registry = Registry::default();
     }
 }

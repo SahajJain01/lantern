@@ -94,6 +94,28 @@ on start, a live one means another daemon is running. The daemon listens even wi
 - Helper session end or restart, daemon shutdown or daemon death: every window client reads EOF
   and exits. Window ids start over with the next session.
 
+### Status (`lantern status`)
+
+Host-only; the helper never sees these, and the daemon never forwards them.
+
+- A client whose first frame is `{"t":"status"}` on stream 0 gets one `status_report` on stream 0
+  and is closed. It works with or without a phone session.
+- `status_report`: `state` (`"idle"`: no session and none starting; `"starting"`: helper deploy
+  and handshake in flight; `"ready"`: live session), `serial` (the device being started or served,
+  else `null`), `helper` (the live helper jar's SHA-256 when `ready`, else `null`) and `windows`:
+  `[{id: u32, pkg: string, user: u32}]`, the open windows sorted by id.
+- `status` after a window's `open` (on any stream) is a protocol error for that client, like any
+  other unexpected control type.
+
+`lantern status` prints the report without `t`, e.g.
+`{"state":"ready","serial":"20e9318","helper":"ae30…","windows":[{"id":1,"pkg":"com.android.settings","user":0}]}`.
+
+### Exit statuses (`lantern`)
+
+`0` ok; `1` runtime failure (daemon unreachable, adb gone, window error); `2` usage error only;
+`3` (`lantern daemon` only) the helper broke the protocol handshake (wrong version or token echo):
+`lanternd.service` has `RestartPreventExitStatus=3`, because a respawn meets the same helper.
+
 ## Golden vectors
 
 `host/proto/golden/*.bin` are complete encoded frames (header + payload) used by both the Rust and

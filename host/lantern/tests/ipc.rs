@@ -11,7 +11,10 @@ use lantern::adb::{Adb, DeviceEvent};
 use lantern::daemon::ipc;
 use lantern::daemon::session::{handshake, SessionConn};
 use lantern::daemon::{serve, RetryPolicy};
-use lantern_proto::{read_frame_async, write_frame_async, CloseReason, Control, Frame, Kind};
+use lantern_proto::{
+    read_frame_async, write_frame_async, CloseReason, Control, Frame, Kind, SessionState,
+    StatusReport, WindowInfo,
+};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -899,5 +902,114 @@ async fn out_of_range_resize_drops_only_that_client() {
         send(&mut good, &resize).await;
         assert_eq!(helper.next().await, resize, "in-range resize is forwarded");
     }
+    daemon.shutdown().await;
+}
+
+// --- lantern status -------------------------------------------------------------------------
+
+/// One `status` request: the daemon answers a `status_report` on stream 0 and closes.
+async fn status(sock: &Path) -> StatusReport {
+    let mut client = UnixStream::connect(sock).await.unwrap();
+    send(&mut client, &control(0, Control::Status)).await;
+    let reply = recv(&mut client).await.expect("a status report");
+    assert_eq!(reply.stream, 0);
+    let Control::StatusReport(report) = decode(&reply) else {
+        panic!("expected status_report, got {:?}", decode(&reply));
+    };
+    assert_eof(&mut client).await;
+    report
+}
+
+/// Polls `status` until `ok` holds (the session comes up asynchronously).
+async fn status_until(sock: &Path, ok: impl Fn(&StatusReport) -> bool) -> StatusReport {
+    let deadline = Instant::now() + STEP;
+    loop {
+        let report = status(sock).await;
+        if ok(&report) {
+            return report;
+        }
+        assert!(Instant::now() < deadline, "status never matched: {report:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn status_without_phone_is_idle() {
+    let daemon = start_daemon(None);
+    assert_eq!(
+        status(&daemon.sock).await,
+        StatusReport {
+            state: SessionState::Idle,
+            serial: None,
+            helper: None,
+            windows: vec![],
+        }
+    );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn status_reports_ready_session_and_open_windows() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let ready = status_until(&daemon.sock, |r| r.state == SessionState::Ready).await;
+    assert_eq!(ready.serial.as_deref(), Some("dev"));
+    assert_eq!(ready.helper.as_deref(), Some("sha"));
+    assert!(ready.windows.is_empty());
+
+    let (first, win1) = open_window(&daemon.sock, &mut helper, "com.one", 0).await;
+    let (_second, win2) = open_window(&daemon.sock, &mut helper, "com.two", 10).await;
+    let report = status(&daemon.sock).await;
+    assert_eq!(
+        report.windows,
+        vec![
+            WindowInfo { id: win1, pkg: "com.one".into(), user: 0 },
+            WindowInfo { id: win2, pkg: "com.two".into(), user: 10 },
+        ]
+    );
+    helper.assert_quiet().await; // status never reaches the phone
+
+    drop(first);
+    assert_eq!(decode(&helper.next().await), Control::Close);
+    let report = status_until(&daemon.sock, |r| r.windows.len() == 1).await;
+    assert_eq!(report.windows[0].id, win2);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn status_while_session_starts_is_starting() {
+    let rt = runtime_dir();
+    let listener = ipc::bind(&rt).unwrap();
+    let sock = ipc::socket_path_in(&rt);
+    let events = stream::iter([DeviceEvent::Online("dev".into())]).chain(stream::pending());
+    // A start that never finishes (helper deploy stuck).
+    let starter = |_serial: String| std::future::pending::<anyhow::Result<SessionConn>>();
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(serve(
+        listener,
+        None,
+        events,
+        starter,
+        async move {
+            let _ = stop_rx.await;
+            "test-stop"
+        },
+        fast_policy(),
+    ));
+    let report = status_until(&sock, |r| r.state == SessionState::Starting).await;
+    assert_eq!(report.serial.as_deref(), Some("dev"));
+    assert_eq!(report.helper, None);
+    let _ = stop.send(());
+    timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn status_after_open_is_a_protocol_error() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (mut client, win) = open_window(&daemon.sock, &mut helper, "com.example", 0).await;
+    send(&mut client, &control(win, Control::Status)).await;
+    assert_eof(&mut client).await;
+    assert_eq!(decode(&helper.next().await), Control::Close);
     daemon.shutdown().await;
 }
