@@ -1,0 +1,8 @@
+.superpowers/
+.worktrees/
+__pycache__/
+*.pyc
+spikes/.local/
+spikes/out/
+spikes/baseline/
+spikes/raw/

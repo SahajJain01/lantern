@@ -1,0 +1,27 @@
+[server] INFO: Device: [Xiaomi] Xiaomi 2107113SG (Android 17)
+[server] INFO: List of video encoders:
+    --video-codec=h264 --video-encoder=c2.qti.avc.encoder             (hw) [vendor]
+    --video-codec=h264 --video-encoder=OMX.qcom.video.encoder.avc     (hw) [vendor] (alias for c2.qti.avc.encoder)
+    --video-codec=h264 --video-encoder=c2.android.avc.encoder         (sw)
+    --video-codec=h264 --video-encoder=OMX.google.h264.encoder        (sw) (alias for c2.android.avc.encoder)
+    --video-codec=h265 --video-encoder=c2.qti.hevc.encoder            (hw) [vendor]
+    --video-codec=h265 --video-encoder=OMX.qcom.video.encoder.hevc    (hw) [vendor] (alias for c2.qti.hevc.encoder)
+    --video-codec=h265 --video-encoder=c2.qti.hevc.encoder.cq         (hw) [vendor]
+    --video-codec=h265 --video-encoder=OMX.qcom.video.encoder.hevc.cq (hw) [vendor] (alias for c2.qti.hevc.encoder.cq)
+    --video-codec=h265 --video-encoder=c2.android.hevc.encoder        (sw)
+    --video-codec=av1 --video-encoder=c2.android.av1.encoder          (sw)
+    --video-codec=vp8 --video-encoder=c2.android.vp8.encoder          (sw)
+    --video-codec=vp8 --video-encoder=OMX.google.vp8.encoder          (sw) (alias for c2.android.vp8.encoder)
+    --video-codec=vp9 --video-encoder=c2.android.vp9.encoder          (sw)
+    --video-codec=vp9 --video-encoder=OMX.google.vp9.encoder          (sw) (alias for c2.android.vp9.encoder)
+[server] INFO: List of audio encoders:
+    --audio-codec=opus --audio-encoder=c2.android.opus.encoder        (sw)
+    --audio-codec=aac --audio-encoder=c2.android.aac.encoder          (sw)
+    --audio-codec=aac --audio-encoder=OMX.google.aac.encoder          (sw) (alias for c2.android.aac.encoder)
+    --audio-codec=aac --audio-encoder=c2.android.xheaac.encoder       (sw)
+    --audio-codec=flac --audio-encoder=c2.android.flac.encoder        (sw)
+    --audio-codec=flac --audio-encoder=OMX.google.flac.encoder        (sw) (alias for c2.android.flac.encoder)
+scrcpy 5.0.1 <https://github.com/Genymobile/scrcpy>
+INFO: ADB device found:
+INFO:     -->   (usb)  20e9318                         device  2107113SG
+/home/acer/.local/opt/scrcpy-linux-x86_64-v5.0.1/scrcpy-server: 1 file pushed, 0 skipped. 347.8 MB/s (733930 bytes in 0.002s)

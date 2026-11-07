@@ -1,6 +1,6 @@
 # Lantern — design
 
-Date: 2026-11-07 · Status: draft for approval · Owner: Sahaj
+Date: 2026-11-07 · Status: approved by Sahaj; actual test phone updated to Android 17 / LineageOS 24 during preflight · Owner: Sahaj
 
 ## 1. Intent
 
