@@ -168,7 +168,16 @@ pub enum Control {
     },
     Close,
     Closed { reason: CloseReason },
-    Error { msg: String },
+    /// `code`/`version` are optional and absent on the wire when `None`, so `{"t":"error","msg":..}`
+    /// is unchanged. The helper sets `code:"version"` plus its own `version` on a handshake
+    /// version mismatch (docs/protocol.md).
+    Error {
+        msg: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u32>,
+    },
     Bye,
     /// Host-only (`lantern status` -> lanternd, stream 0, first frame). Never sent to the helper.
     Status,
@@ -206,6 +215,15 @@ pub struct StatusReport {
 }
 
 impl Control {
+    /// A plain `error{msg}` (no `code`).
+    pub fn error(msg: impl Into<String>) -> Self {
+        Self::Error {
+            msg: msg.into(),
+            code: None,
+            version: None,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Control serializes")
     }
@@ -522,6 +540,15 @@ mod tests {
     }
 
     #[test]
+    fn error_code_fields_are_optional_and_absent_by_default() {
+        // v1 bytes unchanged when there is no code.
+        assert_eq!(serde_json::to_string(&Control::error("boom")).unwrap(), r#"{"t":"error","msg":"boom"}"#);
+        assert_eq!(serde_json::from_str::<Control>(r#"{"t":"error","msg":"boom"}"#).unwrap(), Control::error("boom"));
+        let v = Control::Error { msg: "m".into(), code: Some("version".into()), version: Some(2) };
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"t":"error","msg":"m","code":"version","version":2}"#);
+    }
+
+    #[test]
     fn control_unit_and_reason_shapes() {
         assert_eq!(serde_json::to_string(&Control::Focus { activation_token: None }).unwrap(), r#"{"t":"focus"}"#);
         assert_eq!(serde_json::to_string(&Control::Bye).unwrap(), r#"{"t":"bye"}"#);
@@ -536,7 +563,8 @@ mod tests {
             Control::Resized { w: 4, h: 5 },
             Control::Close,
             Control::Closed { reason: CloseReason::Error },
-            Control::Error { msg: "boom".into() },
+            Control::error("boom"),
+            Control::Error { msg: "old".into(), code: Some("version".into()), version: Some(2) },
         ];
         for c in all {
             let s = serde_json::to_string(&c).unwrap();

@@ -155,7 +155,7 @@ pub fn query_status(sock: &Path) -> Result<StatusReport> {
         .context("lanternd closed the connection without a status reply")?;
     match (reply.kind, Control::decode(&reply.payload)) {
         (Kind::Control, Ok(Control::StatusReport(report))) => Ok(report),
-        (Kind::Control, Ok(Control::Error { msg })) => bail!("lanternd: {msg}"),
+        (Kind::Control, Ok(Control::Error { msg, .. })) => bail!("lanternd: {msg}"),
         (kind, other) => bail!("unexpected status reply: {kind:?} {other:?}"),
     }
 }
@@ -507,7 +507,7 @@ impl Hub {
         else {
             tracing::warn!(cid, "first client frame was not open on stream 0");
             let msg = "first frame must be open on stream 0".to_owned();
-            self.reply_and_finish(cid, control(0, Control::Error { msg }));
+            self.reply_and_finish(cid, control(0, Control::error(msg)));
             return Ok(());
         };
         if !limits::USER.contains(&user) || !limits::geometry_ok(w, h, dpi) {
@@ -518,7 +518,7 @@ impl Hub {
                 limits::SIZE.end(),
                 limits::DPI.end()
             );
-            self.reply_and_finish(cid, control(0, Control::Error { msg }));
+            self.reply_and_finish(cid, control(0, Control::error(msg)));
             return Ok(());
         }
         let Some(helper) = helper else {
@@ -526,9 +526,7 @@ impl Hub {
                 cid,
                 control(
                     0,
-                    Control::Error {
-                        msg: NOT_CONNECTED.into(),
-                    },
+                    Control::error(NOT_CONNECTED),
                 ),
             );
             return Ok(());
@@ -620,7 +618,7 @@ impl Hub {
     ) -> Result<(), HelperWedged> {
         if frame.stream == 0 {
             match Control::decode(&frame.payload) {
-                Ok(Control::Error { msg }) => tracing::error!(msg, "helper session error"),
+                Ok(Control::Error { msg, .. }) => tracing::error!(msg, "helper session error"),
                 other => tracing::debug!(?other, "helper stream-0 frame"),
             }
             return Ok(());

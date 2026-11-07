@@ -16,6 +16,12 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 /// Reads the daemon's Hello (asserting it speaks v1 with `token`) and answers with `reply`.
 async fn answer_hello(socket: &mut TcpStream, token: &str, reply: Control) {
+    answer_hello_raw(socket, token, reply.encode()).await;
+}
+
+/// As [`answer_hello`], but the reply is raw control-payload bytes (e.g. exactly what the Java
+/// helper's org.json encoder produces).
+async fn answer_hello_raw(socket: &mut TcpStream, token: &str, payload: Vec<u8>) {
     let hello = read_frame_async(socket).await.unwrap().unwrap();
     assert_eq!(hello.kind, Kind::Control);
     assert_eq!(hello.stream, 0);
@@ -34,7 +40,7 @@ async fn answer_hello(socket: &mut TcpStream, token: &str, reply: Control) {
         &Frame {
             kind: Kind::Control,
             stream: 0,
-            payload: reply.encode(),
+            payload,
         },
     )
     .await
@@ -49,11 +55,15 @@ fn hello(version: u32, token: &str) -> Control {
 }
 
 async fn fake_helper(reply: Control) -> (u16, tokio::task::JoinHandle<()>) {
+    fake_helper_raw(reply.encode()).await
+}
+
+async fn fake_helper_raw(payload: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        answer_hello(&mut socket, TOKEN, reply).await;
+        answer_hello_raw(&mut socket, TOKEN, payload).await;
     });
     (port, task)
 }
@@ -118,9 +128,7 @@ async fn handshake_protocol_failures_are_typed() {
         echo.downcast_ref::<HandshakeError>(),
         Some(HandshakeError::TokenEcho)
     ));
-    let rejected = handshake_error(Control::Error {
-        msg: "bad token".into(),
-    })
+    let rejected = handshake_error(Control::error("bad token"))
     .await;
     assert!(rejected.downcast_ref::<HandshakeError>().is_none());
 }
@@ -128,12 +136,16 @@ async fn handshake_protocol_failures_are_typed() {
 /// Runs `run_loop` with a starter whose every helper answers `reply`; returns the loop's result
 /// and how many starts it made. Shutdown never fires, so only a fatal error ends the loop.
 async fn run_loop_against(reply: Control) -> (anyhow::Result<()>, usize) {
+    run_loop_against_raw(reply.encode()).await
+}
+
+async fn run_loop_against_raw(reply: Vec<u8>) -> (anyhow::Result<()>, usize) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
-            answer_hello(&mut socket, TOKEN, reply.clone()).await;
+            answer_hello_raw(&mut socket, TOKEN, reply.clone()).await;
         }
     });
     let starts = Arc::new(AtomicUsize::new(0));
@@ -192,10 +204,7 @@ async fn daemon_exits_on_token_echo_without_retry() {
 
 #[tokio::test]
 async fn session_handshake_reports_helper_error() {
-    let error = fake_handshake_error(Control::Error {
-        msg: "bad token".into(),
-    })
-    .await;
+    let error = fake_handshake_error(Control::error("bad token")).await;
     assert_eq!(error, "helper rejected handshake: bad token");
 }
 
@@ -508,4 +517,53 @@ async fn offline_during_start_cancels_it() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+/// Byte-for-byte what a v2 Java helper (Router.handshake, org.json encoder) sends when this v1
+/// daemon says hello: the real shape of a version mismatch is an `error`, never a `hello{v2}`.
+const JAVA_V2_MISMATCH: &str = r#"{"t":"error","msg":"protocol version mismatch: helper speaks 2, host sent 1; update lantern so both sides match","code":"version","version":2}"#;
+/// What a helper from before the structured `code` field sends: only the message.
+const JAVA_LEGACY_MISMATCH: &str = r#"{"t":"error","msg":"protocol version mismatch: helper speaks 2, host sent 1; update lantern so both sides match"}"#;
+
+#[tokio::test]
+async fn java_helper_version_error_is_a_version_mismatch() {
+    for reply in [JAVA_V2_MISMATCH, JAVA_LEGACY_MISMATCH] {
+        let (port, helper) = fake_helper_raw(reply.as_bytes().to_vec()).await;
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let error = handshake(stream, TOKEN).await.unwrap_err();
+        helper.await.unwrap();
+        assert_eq!(
+            HandshakeError::find(&error),
+            Some(&HandshakeError::VersionMismatch {
+                helper: 2,
+                expected: 1
+            }),
+            "reply {reply} gave {error:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn daemon_exits_3_on_java_helper_version_error_without_retry() {
+    for reply in [JAVA_V2_MISMATCH, JAVA_LEGACY_MISMATCH] {
+        let (result, starts) = run_loop_against_raw(reply.as_bytes().to_vec()).await;
+        let error = result.expect_err("a real version mismatch must be fatal");
+        assert_eq!(lantern::daemon::exit_code(&error), 3, "{error:#}");
+        assert!(
+            format!("{error:#}").contains("helper speaks protocol v2, lantern expects v1"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(starts, 1, "version mismatch was retried");
+    }
+}
+
+#[tokio::test]
+async fn other_helper_errors_stay_retryable() {
+    let error = handshake_error(Control::Error {
+        msg: "session start failed: boom".into(),
+        code: None,
+        version: None,
+    })
+    .await;
+    assert!(HandshakeError::find(&error).is_none(), "{error:#}");
 }

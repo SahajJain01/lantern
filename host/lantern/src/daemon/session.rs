@@ -390,9 +390,36 @@ pub async fn handshake(mut stream: TcpStream, token: &str) -> Result<TcpStream> 
             expected: PROTOCOL_VERSION,
         }
         .into()),
-        Control::Error { msg } => bail!("helper rejected handshake: {msg}"),
+        Control::Error { msg, code, version } => match helper_version_error(&msg, code, version) {
+            Some(helper) => Err(HandshakeError::VersionMismatch {
+                helper,
+                expected: PROTOCOL_VERSION,
+            }
+            .into()),
+            None => bail!("helper rejected handshake: {msg}"),
+        },
         other => bail!("expected hello reply, got {other:?}"),
     }
+}
+
+/// The helper's protocol version if its handshake `error` is a version mismatch. The helper
+/// replies `error{code:"version", version:N}`; a helper from before the structured `code` only
+/// has the message (`"protocol version mismatch: helper speaks N, ..."`). 0 means unknown.
+fn helper_version_error(msg: &str, code: Option<String>, version: Option<u32>) -> Option<u32> {
+    const PREFIX: &str = "protocol version mismatch";
+    if code.as_deref() == Some("version") {
+        return Some(version.unwrap_or(0));
+    }
+    if !msg.starts_with(PREFIX) {
+        return None;
+    }
+    let parsed = msg
+        .split_once("helper speaks ")
+        .and_then(|(_, rest)| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        });
+    Some(parsed.unwrap_or(0))
 }
 
 #[cfg(test)]

@@ -45,8 +45,16 @@ public final class Router {
     static final long FINAL_WRITE_MS = 1000;
 
     private static final class ProtocolError extends Exception {
+        /** Optional machine-readable {@code code} for the final {@code error} (docs/protocol.md). */
+        final String code;
+
         ProtocolError(String msg) {
+            this(msg, null);
+        }
+
+        ProtocolError(String msg, String code) {
             super(msg);
+            this.code = code;
         }
     }
 
@@ -145,12 +153,17 @@ public final class Router {
             }
         } catch (ProtocolError e) {
             log.accept("router: " + e.getMessage());
-            sendFinal(e.getMessage());
+            Msg err = Msg.of("error").put("msg", e.getMessage());
+            if (e.code != null) {
+                // code "version": lanternd fails hard instead of retrying the same helper.
+                err.put("code", e.code).put("version", Proto.VERSION);
+            }
+            sendFinal(err);
         } catch (IOException e) {
             log.accept("router: connection ended: " + e);
         } catch (RuntimeException e) {
             log.accept("router: internal error: " + e);
-            sendFinal("internal error: " + e);
+            sendFinal(Msg.of("error").put("msg", "internal error: " + e));
         } finally {
             teardown();
         }
@@ -172,7 +185,7 @@ public final class Router {
         long version = field(m, "version");
         if (version != Proto.VERSION) {
             throw new ProtocolError("protocol version mismatch: helper speaks " + Proto.VERSION
-                + ", host sent " + version + "; update lantern so both sides match");
+                + ", host sent " + version + "; update lantern so both sides match", "version");
         }
         String got = text(m, "token");
         if (!MessageDigest.isEqual(got.getBytes(StandardCharsets.UTF_8), token.getBytes(StandardCharsets.UTF_8))) {
@@ -422,8 +435,8 @@ public final class Router {
     }
 
     /** The session-ending error, written by a helper thread so a jammed socket can't stall teardown. */
-    private void sendFinal(String msg) {
-        Thread t = new Thread(() -> send(0, Msg.of("error").put("msg", msg)), "lantern-final-error");
+    private void sendFinal(Msg error) {
+        Thread t = new Thread(() -> send(0, error), "lantern-final-error");
         t.setDaemon(true);
         t.start();
         try {

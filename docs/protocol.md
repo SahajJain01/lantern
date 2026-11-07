@@ -41,15 +41,20 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `focus` | optional `activation_token: string` |
 | `close` | none |
 | `closed` | `reason`: one of `"closed"`, `"app_exited"`, `"error"` |
-| `error` | `msg: string` |
+| `error` | `msg: string`, optional `code: string`, optional `version: u32` |
 | `bye` | none |
 
 ## Session rules (phone helper)
 
 - The first frame must be `hello` on stream 0 with `version: 1` and the helper's token. The helper
-  replies `hello{version:1, token:""}`; on a wrong version or token (or anything else first) it sends
-  one `error{msg}` on stream 0 and closes the connection. Phone state (stay-awake, panel) only
-  changes after a valid hello.
+  replies `hello{version:1, token:""}`; on a wrong token (or anything else first) it sends one
+  `error{msg}` on stream 0 and closes the connection. On a wrong version it sends
+  `error{msg, code:"version", version:<the helper's own version>}` instead (the helper never
+  answers `hello` with another version). Phone state (stay-awake, panel) only changes after a
+  valid hello.
+- `lanternd` treats a handshake `error` with `code:"version"` (or, from a helper predating
+  `code`, a `msg` starting `protocol version mismatch`) as a version mismatch and exits 3 (see
+  Exit statuses); any other handshake `error` is retried with backoff.
 - `opened` is sent before any video for that window. `codec` is `"h265"` or `"h264"`.
 - `resized{w,h}` answers `resize`, and is also sent unprompted when the app rotates its display.
 - A per-window failure (open, resize or the video stream) is `error{msg}` followed by
@@ -57,6 +62,12 @@ JSON objects tagged by `"t"` (snake_case). Example:
 - Frames for an unknown or already-closed window are ignored. A protocol error (bad JSON, unknown
   `t`, bad input payload, video from the host) ends the session with `error{msg}` on stream 0.
 - `bye` (or EOF) ends the session: the helper closes every window without sending `closed`.
+
+`code` and `version` on `error` are omitted when absent, so a plain error is still
+`{"t":"error","msg":"..."}`. The only `code` defined in v1 is `"version"`.
+
+Pause/resume (Plan 3) will be added within protocol v1, without a version bump: the helper jar is
+embedded in and deployed by `lanternd`, so both sides always ship together.
 
 `activation_token` is an XDG activation token used only between `lanternd` and window clients.
 It is omitted from the JSON when absent (so `{"t":"focus"}` is the plain focus), the daemon never
@@ -113,7 +124,8 @@ Host-only; the helper never sees these, and the daemon never forwards them.
 ### Exit statuses (`lantern`)
 
 `0` ok; `1` runtime failure (daemon unreachable, adb gone, window error); `2` usage error only;
-`3` (`lantern daemon` only) the helper broke the protocol handshake (wrong version or token echo):
+`3` (`lantern daemon` only) the helper broke the protocol handshake: a version mismatch (the
+helper's `error{code:"version"}`, or a `hello` echo with another version) or a token echo:
 `lanternd.service` has `RestartPreventExitStatus=3`, because a respawn meets the same helper.
 
 ## Golden vectors

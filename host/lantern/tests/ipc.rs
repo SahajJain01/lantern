@@ -259,7 +259,7 @@ async fn connect_open(sock: &Path, frame: Frame) -> (UnixStream, Option<Frame>) 
         let reply = recv(&mut client).await;
         let not_connected = matches!(
             reply.as_ref().map(decode),
-            Some(Control::Error { ref msg }) if msg == "phone not connected"
+            Some(Control::Error { ref msg, .. }) if msg == "phone not connected"
         );
         if !not_connected {
             return (client, reply);
@@ -288,7 +288,7 @@ async fn open_window(
             send(&mut client, &open(pkg, user, Some("tok-first"))).await;
             match timeout(Duration::from_millis(200), read_frame_async(&mut client)).await {
                 Err(_) => break client, // waiting on the helper: the open was accepted
-                Ok(Ok(Some(f))) if matches!(decode(&f), Control::Error { ref msg } if msg == "phone not connected") =>
+                Ok(Ok(Some(f))) if matches!(decode(&f), Control::Error { ref msg, .. } if msg == "phone not connected") =>
                 {
                     assert!(
                         Instant::now() < deadline,
@@ -419,9 +419,7 @@ async fn open_without_phone_is_an_error() {
     assert_eq!(reply.stream, 0);
     assert_eq!(
         decode(&reply),
-        Control::Error {
-            msg: "phone not connected".into()
-        }
+        Control::error("phone not connected")
     );
     assert_eq!(recv(&mut client).await, None);
     daemon.shutdown().await;

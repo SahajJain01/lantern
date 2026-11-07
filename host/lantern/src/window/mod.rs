@@ -437,11 +437,11 @@ impl App {
 
     fn on_control(&mut self, el: &ActiveEventLoop, stream: u32, c: Control) {
         match c {
-            Control::Error { msg } if stream == 0 && self.win.is_none() => {
+            Control::Error { msg, .. } if stream == 0 && self.win.is_none() => {
                 eprintln!("lantern: {msg}");
                 self.exit(el, 1);
             }
-            Control::Error { msg } => {
+            Control::Error { msg, .. } => {
                 tracing::error!(stream, msg, "error from phone");
                 self.error_msg = Some(msg);
             }

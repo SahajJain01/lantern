@@ -249,7 +249,12 @@ public final class RouterTest {
             r.send(0, "{\"t\":\"hello\",\"version\":2,\"token\":\"" + TOKEN + "\"}");
             Msg m = r.control(0);
             eq("error", m.t, "reply");
-            check(m.str("msg").contains("version"), "msg explains version: " + m.str("msg"));
+            check(m.str("msg").startsWith("protocol version mismatch: helper speaks 1, host sent 2"),
+                "msg explains version: " + m.str("msg"));
+            // Structured, so lanternd fails hard (exit 3) instead of retrying (I1).
+            eq("version", m.str("code"), "error code");
+            eq(1L, m.num("version"), "helper's own version");
+            eq("[msg, code, version]", m.fields().keySet().toString(), "field order");
             r.awaitExit(2000);
             check(!r.events.contains("session start"), "session must not start: " + r.events);
         }
