@@ -16,6 +16,17 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+winit = "0.30.13"
+wgpu = "30"
+ffmpeg-sys-next = { version = "9", default-features = false, features = ["avcodec"] }
+pollster = "0.4"
+dirs = "6"
+serde_json = "1"
+raw-window-handle = "0.6"
+wayland-client = "0.31"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
