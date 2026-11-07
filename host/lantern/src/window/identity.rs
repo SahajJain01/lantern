@@ -1,0 +1,144 @@
+//! Which phone app a window shows: package + Android user (profile), and the per-window names
+//! derived from it (Wayland app_id, title, remembered-size key, CLI arguments).
+
+/// `lantern open [--user N] <pkg>`. Android user ids are `0..=i32::MAX` (the phone's `int`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub pkg: String,
+    pub user: u32,
+}
+
+pub const MAX_USER: u32 = i32::MAX as u32;
+
+impl Identity {
+    /// Parses the arguments after `open`: `[--user N | --user=N] <pkg>`. `Err` is a usage error.
+    pub fn parse_args(args: &[&str]) -> Result<Self, String> {
+        let mut user: Option<u32> = None;
+        let mut pkg: Option<&str> = None;
+        let mut it = args.iter().copied();
+        while let Some(arg) = it.next() {
+            let value = if arg == "--user" {
+                Some(it.next().ok_or("--user needs a number")?)
+            } else {
+                arg.strip_prefix("--user=")
+            };
+            if let Some(v) = value {
+                if user.is_some() {
+                    return Err("--user given twice".into());
+                }
+                let n: u32 = v.parse().ok().filter(|n| *n <= MAX_USER).ok_or_else(|| {
+                    format!("--user {v:?}: not an Android user id (0..={MAX_USER})")
+                })?;
+                user = Some(n);
+            } else if arg.starts_with('-') {
+                return Err(format!("unknown option {arg:?}"));
+            } else if arg.is_empty() {
+                return Err("empty package name".into());
+            } else if pkg.replace(arg).is_some() {
+                return Err("only one package".into());
+            }
+        }
+        Ok(Self {
+            pkg: pkg.ok_or("missing package")?.to_owned(),
+            user: user.unwrap_or(0),
+        })
+    }
+
+    /// Wayland app_id. User 0 keeps `lantern.<pkg>`; another user gets `lantern.<pkg>-u<N>`.
+    /// `-` never occurs in an Android package name, so no package can produce another user's id.
+    pub fn app_id(&self) -> String {
+        match self.user {
+            0 => format!("lantern.{}", self.pkg),
+            n => format!("lantern.{}-u{n}", self.pkg),
+        }
+    }
+
+    pub fn title(&self) -> String {
+        match self.user {
+            0 => self.pkg.clone(),
+            n => format!("{} (user {n})", self.pkg),
+        }
+    }
+
+    /// Key in `windows.json`. User 0 keeps the bare package (files from before profiles).
+    pub fn size_key(&self) -> String {
+        match self.user {
+            0 => self.pkg.clone(),
+            n => format!("{}:{n}", self.pkg),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(pkg: &str, user: u32) -> Identity {
+        Identity {
+            pkg: pkg.into(),
+            user,
+        }
+    }
+
+    #[test]
+    fn parses_user_forms() {
+        assert_eq!(Identity::parse_args(&["com.a"]), Ok(id("com.a", 0)));
+        assert_eq!(
+            Identity::parse_args(&["--user", "10", "com.a"]),
+            Ok(id("com.a", 10))
+        );
+        assert_eq!(
+            Identity::parse_args(&["--user=10", "com.a"]),
+            Ok(id("com.a", 10))
+        );
+        assert_eq!(
+            Identity::parse_args(&["com.a", "--user", "0"]),
+            Ok(id("com.a", 0))
+        );
+        assert_eq!(
+            Identity::parse_args(&["--user", "2147483647", "com.a"]),
+            Ok(id("com.a", MAX_USER))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_user_and_args() {
+        for bad in [
+            &["--user"][..],
+            &["--user", "com.a"],
+            &["com.a", "--user"],
+            &["--user", "-1", "com.a"],
+            &["--user", "x", "com.a"],
+            &["--user", "2147483648", "com.a"],
+            &["--user", "1", "--user", "2", "com.a"],
+            &["--uesr", "1", "com.a"],
+            &["com.a", "com.b"],
+            &[""],
+            &[],
+        ] {
+            assert!(
+                Identity::parse_args(bad).is_err(),
+                "{bad:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn user_zero_names_are_unchanged() {
+        let i = id("com.android.settings", 0);
+        assert_eq!(i.app_id(), "lantern.com.android.settings");
+        assert_eq!(i.title(), "com.android.settings");
+        assert_eq!(i.size_key(), "com.android.settings");
+    }
+
+    #[test]
+    fn other_users_get_distinct_names() {
+        let i = id("com.android.settings", 10);
+        assert_eq!(i.app_id(), "lantern.com.android.settings-u10");
+        assert_eq!(i.title(), "com.android.settings (user 10)");
+        assert_eq!(i.size_key(), "com.android.settings:10");
+        // No package (letters, digits, `_`, `.`) can make user 0's app_id equal another user's.
+        assert_ne!(id("com.a.u10", 0).app_id(), id("com.a", 10).app_id());
+        assert_ne!(id("com.a", 0).size_key(), i.size_key());
+    }
+}

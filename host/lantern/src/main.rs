@@ -1,7 +1,8 @@
 use anyhow::{bail, Result};
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = "usage: lantern daemon | lantern open <package> | lantern status";
+const USAGE: &str =
+    "usage: lantern daemon | lantern open [--user <android-user>] <package> | lantern status";
 
 /// Exit statuses: 0 ok, 1 runtime failure, 2 usage error, 3 (`daemon` only) helper protocol
 /// mismatch, which `lanternd.service` does not restart.
@@ -47,8 +48,10 @@ fn cli() -> Result<u8> {
         }
         // The window owns the main thread (winit); it runs no tokio runtime. Its failures
         // (daemon unreachable, event loop) exit 1 like its runtime errors.
-        ["open", pkg] if !pkg.is_empty() && !pkg.starts_with('-') => {
-            let run = lantern::window::run(pkg).map(|code| code.clamp(0, 255) as u8);
+        ["open", rest @ ..] => {
+            let id = lantern::window::identity::Identity::parse_args(rest)
+                .map_err(|e| anyhow::anyhow!("lantern open: {e}; {USAGE}"))?;
+            let run = lantern::window::run(&id).map(|code| code.clamp(0, 255) as u8);
             Ok(runtime(run, |_| 1))
         }
         ["status"] => {
@@ -60,7 +63,7 @@ fn cli() -> Result<u8> {
             };
             Ok(runtime(run(), |_| 1))
         }
-        ["daemon", ..] | ["open", ..] | ["status", ..] => bail!("{USAGE}"),
+        ["daemon", ..] | ["status", ..] => bail!("{USAGE}"),
         [other, ..] => bail!("unknown subcommand {other:?}; {USAGE}"),
         [] => bail!("{USAGE}"),
     }

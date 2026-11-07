@@ -93,6 +93,10 @@ public final class AppDisplay implements DisplayHandle {
         try {
             d.start(user);
             return d;
+        } catch (UserLaunch.LaunchError e) {
+            d.close();
+            // Already user-facing ("<pkg> is not installed for Android user 10"): no wrapping.
+            throw new IllegalArgumentException(e.getMessage());
         } catch (Exception e) {
             d.close();
             throw new IllegalStateException("open " + pkg + " win=" + win, e);
@@ -100,6 +104,8 @@ public final class AppDisplay implements DisplayHandle {
     }
 
     private void start(int user) throws Exception {
+        // Resolve first: a missing user or app fails before any display exists.
+        UserLaunch.Target target = UserLaunch.resolve(pkg, user, new DeviceUsers());
         display = ServiceManager.getDisplayManager().createNewVirtualDisplay(
             "lantern-" + win + "-" + pkg, width, height, dpi, encoder.surface(), Policy.FLAGS);
         if (display == null || display.getDisplay() == null) {
@@ -151,7 +157,7 @@ public final class AppDisplay implements DisplayHandle {
         };
         publicDm.registerDisplayListener(listener, new Handler(listenerThread.getLooper()));
 
-        launch(user);
+        launch(target);
         long deadline = SystemClock.elapsedRealtime() + TASK_WAIT_MS;
         while (true) {
             List<Integer> tasks = tasks();
@@ -175,11 +181,11 @@ public final class AppDisplay implements DisplayHandle {
         return ctor.newInstance(FakeContext.get());
     }
 
-    private void launch(int user) throws Exception {
-        Intent intent = FakeContext.get().getPackageManager().getLaunchIntentForPackage(pkg);
-        if (intent == null) {
-            throw new IllegalArgumentException("no launch intent for " + pkg);
-        }
+    /** startActivityAsUser(target.user) with the activity resolved for that user (am start --user N). */
+    private void launch(UserLaunch.Target target) throws Exception {
+        int user = target.user;
+        Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            .setComponent(new android.content.ComponentName(target.pkg, target.cls));
         // MULTIPLE_TASK: never pull an existing task (e.g. one on the phone's own screen) onto our
         // display, because close() removes every task here.
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
@@ -189,9 +195,17 @@ public final class AppDisplay implements DisplayHandle {
             Class.forName("android.app.IApplicationThread"), String.class, Intent.class, String.class,
             android.os.IBinder.class, String.class, int.class, int.class,
             Class.forName("android.app.ProfilerInfo"), Bundle.class, int.class);
-        int result = (int) start.invoke(am, null, FakeContext.PACKAGE_NAME, intent, null, null, null, 0, 0,
-            null, options, user);
-        Droid.log("launch: " + pkg + " user=" + user + " display=" + displayId + " result=" + result);
+        int result;
+        try {
+            result = (int) start.invoke(am, null, FakeContext.PACKAGE_NAME, intent, null, null, null, 0, 0,
+                null, options, user);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            if (e.getCause() instanceof SecurityException) {
+                throw new UserLaunch.LaunchError(UserLaunch.startFailure(pkg, user, e.getCause()));
+            }
+            throw e;
+        }
+        Droid.log("launch: " + target.flatten() + " user=" + user + " display=" + displayId + " result=" + result);
         if (result < 0) {
             throw new IllegalStateException("startActivityAsUser " + pkg + " result=" + result);
         }

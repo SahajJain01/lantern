@@ -1,13 +1,15 @@
-//! `lantern open <pkg>`: one process per app window.
+//! `lantern open [--user N] <pkg>`: one process per app window.
 //!
 //! Connects to lanternd, sends `open`, and on `opened` shows a Wayland window (app_id
-//! `lantern.<pkg>`) that renders the app's video and forwards input. Threads: the winit event
+//! `lantern.<pkg>`, or `lantern.<pkg>-u<N>` for Android user N > 0; see [`identity`]) that
+//! renders the app's video and forwards input. Threads: the winit event
 //! loop (main), a socket reader that also decodes video (latest frame wins), and a socket writer.
 
 pub mod activation;
 pub mod debounce;
 pub mod decode;
 pub mod geometry;
+pub mod identity;
 pub mod input;
 pub mod keymap;
 pub mod outcome;
@@ -58,7 +60,8 @@ enum UserEvent {
 type Slot = Arc<Mutex<Option<Nv12Frame>>>;
 
 // ---------------------------------------------------------------------------------------------
-// Remembered window sizes: ~/.local/state/lantern/windows.json = {"<pkg>": {"w":..,"h":..}}
+// Remembered window sizes: ~/.local/state/lantern/windows.json = {"<key>": {"w":..,"h":..}}
+// where <key> is `Identity::size_key` (`<pkg>` for user 0, `<pkg>:<user>` otherwise).
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Size {
@@ -77,22 +80,22 @@ fn load_sizes(path: &Path) -> BTreeMap<String, Size> {
         .unwrap_or_default()
 }
 
-fn remembered_size(pkg: &str) -> (u32, u32) {
+fn remembered_size(key: &str) -> (u32, u32) {
     let sizes = sizes_path().map(|p| load_sizes(&p)).unwrap_or_default();
-    match sizes.get(pkg) {
+    match sizes.get(key) {
         Some(s) if (200..=16384).contains(&s.w) && (150..=16384).contains(&s.h) => (s.w, s.h),
         _ => DEFAULT_LOGICAL,
     }
 }
 
-fn remember_size(pkg: &str, size: (u32, u32)) {
+fn remember_size(key: &str, size: (u32, u32)) {
     let Some(path) = sizes_path() else { return };
-    if let Err(error) = remember_size_in(&path, pkg, size) {
+    if let Err(error) = remember_size_in(&path, key, size) {
         tracing::warn!(%error, path = %path.display(), "could not remember window size");
     }
 }
 
-fn remember_size_in(path: &Path, pkg: &str, (w, h): (u32, u32)) -> Result<()> {
+fn remember_size_in(path: &Path, key: &str, (w, h): (u32, u32)) -> Result<()> {
     std::fs::create_dir_all(path.parent().expect("has parent"))?;
     // Several windows may exit at once: serialize the read-modify-write with an flock on a
     // side file (released when `lock` closes), and give each writer its own tmp name.
@@ -106,7 +109,7 @@ fn remember_size_in(path: &Path, pkg: &str, (w, h): (u32, u32)) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     let mut sizes = load_sizes(path);
-    sizes.insert(pkg.to_owned(), Size { w, h });
+    sizes.insert(key.to_owned(), Size { w, h });
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&sizes)?)?;
     std::fs::rename(&tmp, path)?;
@@ -246,7 +249,7 @@ fn parse_debug_steps(s: &str) -> Vec<DebugStep> {
 // The window
 
 struct App {
-    pkg: String,
+    id: identity::Identity,
     tx: mpsc::Sender<Frame>,
     slot: Slot,
     /// Our own launch token: sent in `open`, then used to activate our new window.
@@ -271,6 +274,9 @@ struct App {
     closing: Option<Instant>,
     disconnected: Option<Instant>,
     exit_code: i32,
+    /// Set once we asked the loop to exit: later events (e.g. the daemon's EOF right after a
+    /// failed open's `closed`) must not report the outcome a second time.
+    exiting: bool,
     /// Logical window size to remember, captured at exit.
     final_size: Option<(u32, u32)>,
     debug_steps: VecDeque<DebugStep>,
@@ -303,6 +309,7 @@ impl App {
     }
 
     fn exit(&mut self, el: &ActiveEventLoop, code: i32) {
+        self.exiting = true;
         self.exit_code = code;
         el.exit();
     }
@@ -345,8 +352,8 @@ impl App {
     fn create_window(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let (lw, lh) = self.logical;
         let mut attrs = Window::default_attributes()
-            .with_title(self.pkg.clone())
-            .with_name(format!("lantern.{}", self.pkg), "")
+            .with_title(self.id.title())
+            .with_name(self.id.app_id(), "")
             .with_inner_size(LogicalSize::new(lw, lh))
             .with_min_inner_size(LogicalSize::new(200, 150));
         if let Some(token) = self.launch_token.take() {
@@ -585,10 +592,18 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let (w, h, dpi) = display_request(self.logical, self.scale);
         self.requests.push((w, h));
-        tracing::info!(pkg = self.pkg, w, h, dpi, scale = self.scale, "open");
+        tracing::info!(
+            pkg = self.id.pkg,
+            user = self.id.user,
+            w,
+            h,
+            dpi,
+            scale = self.scale,
+            "open"
+        );
         let open = Control::Open {
-            pkg: self.pkg.clone(),
-            user: 0,
+            pkg: self.id.pkg.clone(),
+            user: self.id.user,
             w,
             h,
             dpi,
@@ -598,6 +613,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
+        if self.exiting {
+            return;
+        }
         match event {
             UserEvent::Control(stream, c) => self.on_control(el, stream, c),
             UserEvent::FrameReady => {
@@ -730,8 +748,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-/// Runs `lantern open <pkg>`; returns the process exit code.
-pub fn run(pkg: &str) -> Result<i32> {
+/// Runs `lantern open [--user N] <pkg>`; returns the process exit code.
+pub fn run(id: &identity::Identity) -> Result<i32> {
     // Our launch token goes to the daemon (for an already-open window) and to our own window;
     // children must not inherit it.
     let launch_token = std::env::var("XDG_ACTIVATION_TOKEN")
@@ -768,11 +786,11 @@ pub fn run(pkg: &str) -> Result<i32> {
         .map(|s| parse_debug_steps(&s))
         .unwrap_or_default();
     let mut app = App {
-        pkg: pkg.to_owned(),
+        id: id.clone(),
         tx,
         slot,
         launch_token,
-        logical: remembered_size(pkg),
+        logical: remembered_size(&id.size_key()),
         open_sent: false,
         state: OpenState::default(),
         window: None,
@@ -788,6 +806,7 @@ pub fn run(pkg: &str) -> Result<i32> {
         closing: None,
         disconnected: None,
         exit_code: 0,
+        exiting: false,
         final_size: None,
         debug_steps: debug_steps.into(),
         next_debug: None,
@@ -795,7 +814,7 @@ pub fn run(pkg: &str) -> Result<i32> {
     event_loop.run_app(&mut app).context("event loop")?;
 
     if let Some(size) = app.final_size {
-        remember_size(pkg, size);
+        remember_size(&id.size_key(), size);
     }
     // Let the writer flush (e.g. our `close`), but never hang on a stuck daemon.
     let code = app.exit_code;
@@ -829,5 +848,23 @@ mod tests {
         let sizes = load_sizes(&path);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(sizes.len(), 160, "lost updates: {} of 160", sizes.len());
+    }
+
+    #[test]
+    fn sizes_are_remembered_per_user() {
+        let dir = std::env::temp_dir().join(format!("lantern-sizes-user-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("windows.json");
+        let user = |n| identity::Identity {
+            pkg: "com.a".into(),
+            user: n,
+        };
+        remember_size_in(&path, &user(0).size_key(), (900, 700)).unwrap();
+        remember_size_in(&path, &user(10).size_key(), (500, 400)).unwrap();
+        let sizes = load_sizes(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sizes.len(), 2);
+        assert_eq!((sizes["com.a"].w, sizes["com.a"].h), (900, 700));
+        assert_eq!((sizes["com.a:10"].w, sizes["com.a:10"].h), (500, 400));
     }
 }

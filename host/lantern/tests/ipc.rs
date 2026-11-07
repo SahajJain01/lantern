@@ -1062,3 +1062,41 @@ async fn status_after_open_is_a_protocol_error() {
     assert_eq!(decode(&helper.next().await), Control::Close);
     daemon.shutdown().await;
 }
+
+#[tokio::test]
+async fn single_instance_is_per_pkg_and_user() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (mut owner0, win0) = open_window(&daemon.sock, &mut helper, "com.example", 0).await;
+    let (mut owner10, win10) = open_window(&daemon.sock, &mut helper, "com.example", 10).await;
+    assert_ne!(win0, win10, "user 10 gets its own window");
+
+    // Opening user 10 again focuses user 10's window, never user 0's.
+    let (_c, reply) = connect_open(&daemon.sock, open("com.example", 10, Some("tok-10"))).await;
+    assert_eq!(reply.expect("a focus reply").stream, win10);
+    let focus = recv(&mut owner10)
+        .await
+        .expect("user 10's window is focused");
+    assert_eq!(focus.stream, win10);
+    assert_eq!(
+        decode(&focus),
+        Control::Focus {
+            activation_token: Some("tok-10".into())
+        }
+    );
+    // And user 0 again focuses user 0's.
+    let (_c, reply) = connect_open(&daemon.sock, open("com.example", 0, Some("tok-0"))).await;
+    assert_eq!(reply.expect("a focus reply").stream, win0);
+    let focus = recv(&mut owner0).await.expect("user 0's window is focused");
+    assert_eq!(focus.stream, win0);
+    helper.assert_quiet().await;
+
+    // Closing user 10's window leaves user 0's registered; user 10 can then open anew.
+    drop(owner10);
+    assert_eq!(helper.next().await, control(win10, Control::Close));
+    let report = status_until(&daemon.sock, |r| r.windows.len() == 1).await;
+    assert_eq!((report.windows[0].id, report.windows[0].user), (win0, 0));
+    let (_again, win10b) = open_window(&daemon.sock, &mut helper, "com.example", 10).await;
+    assert!(win10b > win10);
+    daemon.shutdown().await;
+}

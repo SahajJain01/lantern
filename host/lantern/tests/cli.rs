@@ -154,3 +154,50 @@ fn status_prints_the_running_daemons_state_as_json() {
     );
     assert_eq!(exit.code(), Some(0), "SIGTERM is a clean daemon exit");
 }
+
+#[test]
+fn open_user_usage_errors_exit_2() {
+    for args in [
+        &["open", "--user"][..],
+        &["open", "--user", "x", "com.example"],
+        &["open", "--user", "-1", "com.example"],
+        &["open", "--user", "2147483648", "com.example"],
+        &["open", "--user", "10"],
+        &["open", "--bogus", "com.example"],
+    ] {
+        let dir = scratch("open-user-usage");
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} stderr: {stderr}");
+        assert!(stderr.contains("usage:"), "{args:?} stderr: {stderr}");
+    }
+}
+
+#[test]
+fn open_with_user_reaches_the_daemon_step() {
+    // A valid `--user` parses; with no daemon it fails at runtime (1), not as usage (2).
+    for args in [
+        &["open", "--user", "10", "com.example"][..],
+        &["open", "--user=10", "com.example"],
+        &["open", "com.example", "--user", "0"],
+    ] {
+        let dir = scratch("open-user-ok");
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?} stderr: {stderr}");
+        assert!(
+            stderr.contains("lanternd is not running"),
+            "{args:?} stderr: {stderr}"
+        );
+    }
+}
