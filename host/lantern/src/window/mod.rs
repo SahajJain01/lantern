@@ -13,8 +13,9 @@ pub mod keymap;
 pub mod render;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,7 +36,7 @@ use winit::window::{ActivationToken, Window, WindowId};
 use crate::daemon::ipc;
 use debounce::Debouncer;
 use decode::{Decoder, Nv12Frame};
-use geometry::{aspect_differs, display_request, rotation_request};
+use geometry::{display_request, rotation_request, ResizeRequests, ResizedKind};
 use input::InputState;
 use render::Renderer;
 
@@ -69,34 +70,48 @@ fn sizes_path() -> Option<PathBuf> {
     Some(dirs::state_dir()?.join("lantern").join("windows.json"))
 }
 
-fn load_sizes() -> BTreeMap<String, Size> {
-    sizes_path()
-        .and_then(|p| std::fs::read(p).ok())
+fn load_sizes(path: &Path) -> BTreeMap<String, Size> {
+    std::fs::read(path)
+        .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
 fn remembered_size(pkg: &str) -> (u32, u32) {
-    match load_sizes().get(pkg) {
+    let sizes = sizes_path().map(|p| load_sizes(&p)).unwrap_or_default();
+    match sizes.get(pkg) {
         Some(s) if (200..=16384).contains(&s.w) && (150..=16384).contains(&s.h) => (s.w, s.h),
         _ => DEFAULT_LOGICAL,
     }
 }
 
-fn remember_size(pkg: &str, (w, h): (u32, u32)) {
+fn remember_size(pkg: &str, size: (u32, u32)) {
     let Some(path) = sizes_path() else { return };
-    let mut sizes = load_sizes();
-    sizes.insert(pkg.to_owned(), Size { w, h });
-    let write = || -> Result<()> {
-        std::fs::create_dir_all(path.parent().expect("has parent"))?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&sizes)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    };
-    if let Err(error) = write() {
+    if let Err(error) = remember_size_in(&path, pkg, size) {
         tracing::warn!(%error, path = %path.display(), "could not remember window size");
     }
+}
+
+fn remember_size_in(path: &Path, pkg: &str, (w, h): (u32, u32)) -> Result<()> {
+    std::fs::create_dir_all(path.parent().expect("has parent"))?;
+    // Several windows may exit at once: serialize the read-modify-write with an flock on a
+    // side file (released when `lock` closes), and give each writer its own tmp name.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("json.lock"))?;
+    // SAFETY: flock on a file descriptor we own for the duration of the call.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut sizes = load_sizes(path);
+    sizes.insert(pkg.to_owned(), Size { w, h });
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&sizes)?)?;
+    std::fs::rename(&tmp, path)?;
+    drop(lock);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -248,8 +263,8 @@ struct App {
     scale: f64,
     /// The phone display's current size (from `opened`/`resized`).
     display: (u32, u32),
-    /// The last size we asked for (`open`/`resize`).
-    requested: (u32, u32),
+    /// The sizes recently asked for (`open`/`resize`), to tell their echoes from a rotation.
+    requests: ResizeRequests,
     debounce: Debouncer,
     input: InputState,
     last_frame: Option<Nv12Frame>,
@@ -379,20 +394,28 @@ impl App {
             (ph as f64 / self.scale).round() as u32,
         );
         let (w, h, dpi) = display_request(logical, self.scale);
-        if (w, h) == self.requested {
+        if self.requests.latest() == Some((w, h)) {
             return;
         }
         tracing::info!(w, h, dpi, "resize");
-        self.requested = (w, h);
+        self.requests.push((w, h));
         self.send_control(win, Control::Resize { w, h, dpi });
     }
 
     fn on_resized(&mut self, w: u32, h: u32) {
         self.display = (w, h);
-        if !aspect_differs(self.requested, (w, h)) {
-            return; // our own resize (possibly aligned by the encoder)
+        match self.requests.classify((w, h)) {
+            // Our own resize (possibly late during a drag, possibly encoder-aligned).
+            ResizedKind::Requested => return,
+            ResizedKind::Unrequested => {
+                tracing::debug!(w, h, "unrequested resize; letterboxing");
+                return;
+            }
+            ResizedKind::Rotation => {}
         }
-        // The app rotated its display: turn the window, keeping its height.
+        // The app rotated its display: the phone now stands at (w, h). Turn the window,
+        // keeping its height.
+        self.requests.rotated((w, h));
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -408,7 +431,6 @@ impl App {
             );
             // The resize this causes is debounced and sent as usual. If KWin refuses
             // (maximised/tiled), the video stays letterboxed.
-            self.requested = (w, h);
             let _ = window.request_inner_size(LogicalSize::new(lw, lh));
         }
     }
@@ -566,7 +588,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.scale = 1.0;
         }
         let (w, h, dpi) = display_request(self.logical, self.scale);
-        self.requested = (w, h);
+        self.requests.push((w, h));
         tracing::info!(pkg = self.pkg, w, h, dpi, scale = self.scale, "open");
         let open = Control::Open {
             pkg: self.pkg.clone(),
@@ -621,8 +643,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Focused(false) => {
-                let ev = self.input.focus_lost(rect);
-                self.send_input(ev);
+                for ev in self.input.focus_lost(rect) {
+                    self.send_input(Some(ev));
+                }
             }
             WindowEvent::RedrawRequested => {
                 let Some(r) = self.renderer.as_mut() else {
@@ -762,7 +785,7 @@ pub fn run(pkg: &str) -> Result<i32> {
         pending_focus: None,
         scale: 1.0,
         display: (0, 0),
-        requested: (0, 0),
+        requests: ResizeRequests::default(),
         debounce: Debouncer::new(),
         input: InputState::default(),
         last_frame: None,
@@ -784,4 +807,32 @@ pub fn run(pkg: &str) -> Result<i32> {
     drop(app);
     let _ = done_rx.recv_timeout(Duration::from_millis(500));
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_remember_size_keeps_every_window() {
+        let dir = std::env::temp_dir().join(format!("lantern-sizes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("windows.json");
+        for round in 0..20 {
+            let threads: Vec<_> = (0..8)
+                .map(|i| {
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        remember_size_in(&path, &format!("pkg{round}.{i}"), (300 + i, 200))
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap().unwrap();
+            }
+        }
+        let sizes = load_sizes(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sizes.len(), 160, "lost updates: {} of 160", sizes.len());
+    }
 }

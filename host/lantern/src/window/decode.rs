@@ -24,6 +24,57 @@ pub struct Nv12Frame {
     pub uv: Vec<u8>,
     pub y_stride: u32,
     pub uv_stride: u32,
+    pub colour: Colour,
+}
+
+/// The YUV→RGB matrix of a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Matrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// How to turn a frame's YUV into RGB: matrix and quantization range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Colour {
+    pub matrix: Matrix,
+    /// `true` for full (JPEG, 0–255) range, `false` for limited (TV, 16–235/240).
+    pub full_range: bool,
+}
+
+impl Default for Colour {
+    fn default() -> Self {
+        Colour {
+            matrix: Matrix::Bt709,
+            full_range: false,
+        }
+    }
+}
+
+/// Follows the stream's signalled colour. Unspecified matrix: BT.601 below 720 lines, BT.709
+/// otherwise. Unspecified range: limited, unless the pixel format is a full-range (`yuvj`) one.
+pub fn colour_for(
+    space: ff::AVColorSpace,
+    range: ff::AVColorRange,
+    full_range_format: bool,
+    height: u32,
+) -> Colour {
+    use ff::AVColorRange::*;
+    use ff::AVColorSpace::*;
+    let matrix = match space {
+        AVCOL_SPC_BT709 => Matrix::Bt709,
+        AVCOL_SPC_BT470BG | AVCOL_SPC_SMPTE170M | AVCOL_SPC_FCC => Matrix::Bt601,
+        AVCOL_SPC_BT2020_NCL | AVCOL_SPC_BT2020_CL => Matrix::Bt2020,
+        _ if height < 720 => Matrix::Bt601,
+        _ => Matrix::Bt709,
+    };
+    let full_range = match range {
+        AVCOL_RANGE_JPEG => true,
+        AVCOL_RANGE_MPEG => false,
+        _ => full_range_format,
+    };
+    Colour { matrix, full_range }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,19 +109,37 @@ fn codec_id(codec: &str) -> Result<ff::AVCodecID> {
     })
 }
 
-/// Picks VA-API surfaces when ffmpeg offers them, else the first software format.
+/// Picks VA-API surfaces when ffmpeg offers them, else the first software (non-hwaccel)
+/// format; `NONE` if there is none.
 unsafe extern "C" fn get_format_vaapi(
     _ctx: *mut ff::AVCodecContext,
     fmts: *const ff::AVPixelFormat,
 ) -> ff::AVPixelFormat {
+    use ff::AVPixelFormat::{AV_PIX_FMT_NONE, AV_PIX_FMT_VAAPI};
+    let mut software = AV_PIX_FMT_NONE;
     let mut p = fmts;
-    while *p != ff::AVPixelFormat::AV_PIX_FMT_NONE {
-        if *p == ff::AVPixelFormat::AV_PIX_FMT_VAAPI {
+    while *p != AV_PIX_FMT_NONE {
+        if *p == AV_PIX_FMT_VAAPI {
             return *p;
+        }
+        let desc = ff::av_pix_fmt_desc_get(*p);
+        let hw = desc.is_null() || (*desc).flags & ff::AV_PIX_FMT_FLAG_HWACCEL as u64 != 0;
+        if !hw && software == AV_PIX_FMT_NONE {
+            software = *p;
         }
         p = p.add(1);
     }
-    *fmts
+    software
+}
+
+/// Unrefs a packet on every exit path.
+struct PacketRef(*mut ff::AVPacket);
+
+impl Drop for PacketRef {
+    fn drop(&mut self) {
+        // SAFETY: the packet is valid for the guard's lifetime (owned by `Ctx`).
+        unsafe { ff::av_packet_unref(self.0) }
+    }
 }
 
 /// An open `AVCodecContext` plus its scratch packet/frames. Freed on drop.
@@ -145,6 +214,7 @@ impl Ctx {
             if r < 0 {
                 bail!("av_new_packet: {}", av_err(r));
             }
+            let _unref = PacketRef(self.pkt);
             ptr::copy_nonoverlapping(data.as_ptr(), (*self.pkt).data, data.len());
             (*self.pkt).pts = pts;
             let mut sent = false;
@@ -153,7 +223,6 @@ impl Ctx {
                 if r == ff::AVERROR(libc::EAGAIN) {
                     // Output is full: drain, then resend.
                 } else if r < 0 {
-                    ff::av_packet_unref(self.pkt);
                     bail!("avcodec_send_packet: {}", av_err(r));
                 } else {
                     sent = true;
@@ -164,7 +233,6 @@ impl Ctx {
                         break;
                     }
                     if r < 0 {
-                        ff::av_packet_unref(self.pkt);
                         bail!("avcodec_receive_frame: {}", av_err(r));
                     }
                     let res = self.convert();
@@ -174,7 +242,6 @@ impl Ctx {
                     out.push(frame);
                 }
             }
-            ff::av_packet_unref(self.pkt);
         }
         Ok(seen)
     }
@@ -183,6 +250,12 @@ impl Ctx {
     unsafe fn convert(&mut self) -> Result<(Nv12Frame, Backend)> {
         let mut src = self.frame;
         let mut backend = Backend::Software;
+        // From the decoded frame itself: a VA-API transfer copy does not carry it.
+        let colour = {
+            let d = &*self.frame;
+            let yuvj = d.format == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
+            colour_for(d.colorspace, d.color_range, yuvj, d.height.max(0) as u32)
+        };
         if (*src).format == ff::AVPixelFormat::AV_PIX_FMT_VAAPI as i32 {
             ff::av_frame_unref(self.sw);
             let r = ff::av_hwframe_transfer_data(self.sw, src, 0);
@@ -212,6 +285,7 @@ impl Ctx {
                 uv: plane(1, ch)?.to_vec(),
                 y_stride: f.linesize[0] as u32,
                 uv_stride: f.linesize[1] as u32,
+                colour,
             }
         } else if fmt == AV_PIX_FMT_YUV420P as i32 || fmt == AV_PIX_FMT_YUVJ420P as i32 {
             let (u, v) = (plane(1, ch)?, plane(2, ch)?);
@@ -234,6 +308,7 @@ impl Ctx {
                 uv,
                 y_stride: f.linesize[0] as u32,
                 uv_stride: uv_stride as u32,
+                colour,
             }
         } else {
             bail!("unsupported decoded pixel format {fmt}");
@@ -361,3 +436,73 @@ const _: () = {
     const fn is_send<T: Send>() {}
     is_send::<Decoder>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ff::AVColorRange::*;
+    use ff::AVColorSpace::*;
+    use ff::AVPixelFormat::*;
+
+    fn c(matrix: Matrix, full_range: bool) -> Colour {
+        Colour { matrix, full_range }
+    }
+
+    #[test]
+    fn colour_follows_the_stream() {
+        let f = colour_for;
+        // The phone's HEVC: smpte170m / bt470bg, tv range.
+        let bt601_tv = c(Matrix::Bt601, false);
+        assert_eq!(
+            f(AVCOL_SPC_SMPTE170M, AVCOL_RANGE_MPEG, false, 1600),
+            bt601_tv
+        );
+        assert_eq!(f(AVCOL_SPC_BT470BG, AVCOL_RANGE_MPEG, false, 800), bt601_tv);
+        let bt709_pc = c(Matrix::Bt709, true);
+        assert_eq!(f(AVCOL_SPC_BT709, AVCOL_RANGE_JPEG, false, 480), bt709_pc);
+        let bt2020 = c(Matrix::Bt2020, false);
+        assert_eq!(
+            f(AVCOL_SPC_BT2020_NCL, AVCOL_RANGE_MPEG, false, 2160),
+            bt2020
+        );
+        // YUVJ420P is full range when the range is unspecified...
+        assert_eq!(
+            f(AVCOL_SPC_BT709, AVCOL_RANGE_UNSPECIFIED, true, 1080),
+            bt709_pc
+        );
+        // ...but an explicit range wins over the pixel format.
+        let bt709_tv = c(Matrix::Bt709, false);
+        assert_eq!(f(AVCOL_SPC_BT709, AVCOL_RANGE_MPEG, true, 1080), bt709_tv);
+    }
+
+    #[test]
+    fn unspecified_matrix_depends_on_height() {
+        let f = |h| colour_for(AVCOL_SPC_UNSPECIFIED, AVCOL_RANGE_UNSPECIFIED, false, h);
+        assert_eq!(f(576), c(Matrix::Bt601, false));
+        assert_eq!(f(719), c(Matrix::Bt601, false));
+        assert_eq!(f(720), c(Matrix::Bt709, false));
+        let reserved = colour_for(AVCOL_SPC_RESERVED, AVCOL_RANGE_UNSPECIFIED, false, 1600);
+        assert_eq!(reserved, c(Matrix::Bt709, false));
+    }
+
+    #[test]
+    fn get_format_prefers_vaapi_and_never_picks_another_hw_format() {
+        let pick = |fmts: &[ff::AVPixelFormat]| {
+            let mut v = fmts.to_vec();
+            v.push(AV_PIX_FMT_NONE);
+            // SAFETY: a NONE-terminated list, as ffmpeg passes it.
+            unsafe { get_format_vaapi(ptr::null_mut(), v.as_ptr()) }
+        };
+        assert_eq!(
+            pick(&[AV_PIX_FMT_VAAPI, AV_PIX_FMT_YUV420P]),
+            AV_PIX_FMT_VAAPI
+        );
+        assert_eq!(
+            pick(&[AV_PIX_FMT_YUV420P, AV_PIX_FMT_VAAPI]),
+            AV_PIX_FMT_VAAPI
+        );
+        let other_hw = [AV_PIX_FMT_CUDA, AV_PIX_FMT_VDPAU, AV_PIX_FMT_YUV420P];
+        assert_eq!(pick(&other_hw), AV_PIX_FMT_YUV420P);
+        assert_eq!(pick(&[AV_PIX_FMT_VULKAN]), AV_PIX_FMT_NONE);
+    }
+}

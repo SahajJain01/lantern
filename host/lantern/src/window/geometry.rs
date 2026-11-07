@@ -68,6 +68,70 @@ pub fn rotation_request(window: (u32, u32), resized: (u32, u32)) -> Option<(u32,
     Some((w.max(1), h))
 }
 
+/// How a phone `Resized` relates to the sizes this window asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizedKind {
+    /// The echo of one of our outstanding requests (possibly late, possibly encoder-aligned).
+    Requested,
+    /// The app rotated: the phone's aspect is the inverse of a requested one.
+    Rotation,
+    /// Neither: keep the window and letterbox.
+    Unrequested,
+}
+
+/// The display sizes recently asked of the phone (`open`/`resize`), oldest first.
+#[derive(Debug, Default)]
+pub struct ResizeRequests {
+    recent: std::collections::VecDeque<(u32, u32)>,
+}
+
+impl ResizeRequests {
+    pub const CAP: usize = 8;
+
+    /// Records a size just asked for. Only the last [`Self::CAP`] are kept.
+    pub fn push(&mut self, size: (u32, u32)) {
+        if self.recent.len() == Self::CAP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(size);
+    }
+
+    /// The size asked for most recently.
+    pub fn latest(&self) -> Option<(u32, u32)> {
+        self.recent.back().copied()
+    }
+
+    /// Classifies a phone `Resized`. An echo of an outstanding request (within 2% aspect)
+    /// retires that request and every older one: the phone answers in order, so they are
+    /// stale. Only a size whose aspect is the inverse of a request counts as a rotation.
+    pub fn classify(&mut self, resized: (u32, u32)) -> ResizedKind {
+        if let Some(i) = self
+            .recent
+            .iter()
+            .rposition(|&r| !aspect_differs(r, resized))
+        {
+            self.recent.drain(..i);
+            return ResizedKind::Requested;
+        }
+        let rotated = self
+            .recent
+            .iter()
+            .any(|&(w, h)| !aspect_differs((h, w), resized));
+        if rotated {
+            ResizedKind::Rotation
+        } else {
+            ResizedKind::Unrequested
+        }
+    }
+
+    /// The phone rotated to `size`: it is now the only size we stand by, so that rotating
+    /// back is not mistaken for an echo of a pre-rotation request.
+    pub fn rotated(&mut self, size: (u32, u32)) {
+        self.recent.clear();
+        self.recent.push_back(size);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +194,45 @@ mod tests {
         assert_eq!(rotation_request((1280, 800), (1600, 1000)), None);
         // Within 2%: not a rotation.
         assert_eq!(rotation_request((1280, 800), (1296, 800)), None);
+    }
+
+    #[test]
+    fn stale_resized_during_drag_is_not_a_rotation() {
+        let mut r = ResizeRequests::default();
+        r.push((1600, 1000)); // A, 1.6
+        r.push((1000, 1000)); // B, 1.0: sent before the phone answered A
+        assert_eq!(r.latest(), Some((1000, 1000)));
+        // The late echo of A must not look like a rotation against B.
+        assert_eq!(r.classify((1600, 1000)), ResizedKind::Requested);
+        assert_eq!(r.classify((1000, 1000)), ResizedKind::Requested);
+        // Once B is answered, A is no longer outstanding.
+        assert_eq!(r.classify((1600, 1000)), ResizedKind::Unrequested);
+        // Encoder alignment stays within 2%.
+        r.push((1282, 802));
+        assert_eq!(r.classify((1280, 800)), ResizedKind::Requested);
+    }
+
+    #[test]
+    fn rotation_is_the_inverse_aspect_of_a_request() {
+        let mut r = ResizeRequests::default();
+        r.push((1280, 800));
+        assert_eq!(r.classify((800, 1280)), ResizedKind::Rotation);
+        // Some other aspect is neither ours nor a rotation.
+        assert_eq!(r.classify((1000, 1000)), ResizedKind::Unrequested);
+        // After acting on a rotation, rotating back is a rotation again (not a stale echo).
+        r.rotated((800, 1280));
+        assert_eq!(r.latest(), Some((800, 1280)));
+        assert_eq!(r.classify((800, 1280)), ResizedKind::Requested);
+        assert_eq!(r.classify((1280, 800)), ResizedKind::Rotation);
+    }
+
+    #[test]
+    fn resize_requests_are_bounded() {
+        let mut r = ResizeRequests::default();
+        for i in 0..100 {
+            r.push((1000 + i, 1000));
+        }
+        assert!(r.recent.len() <= ResizeRequests::CAP);
+        assert_eq!(r.latest(), Some((1099, 1000)));
     }
 }

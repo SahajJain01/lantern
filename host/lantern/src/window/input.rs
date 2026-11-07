@@ -25,6 +25,8 @@ pub const PIXELS_PER_NOTCH: f64 = 50.0;
 pub struct InputState {
     buttons: u32,
     cursor: Option<(f64, f64)>,
+    /// The last position seen, kept after the cursor leaves the window.
+    last_cursor: Option<(f64, f64)>,
     pub mods: ModifiersState,
     /// Android keycodes currently down, with their repeat count.
     keys_down: Vec<(KeyCode, u32, u32)>,
@@ -54,6 +56,7 @@ fn button_bit(b: MouseButton) -> Option<u32> {
 impl InputState {
     pub fn cursor_moved(&mut self, rect: Rect, px: f64, py: f64) -> Option<InputEvent> {
         self.cursor = Some((px, py));
+        self.last_cursor = self.cursor;
         if self.buttons != 0 {
             return Some(pointer(
                 PointerAction::Move,
@@ -75,9 +78,9 @@ impl InputState {
         state: ElementState,
     ) -> Option<InputEvent> {
         let bit = button_bit(button)?;
-        let (px, py) = self.cursor?;
         match state {
             ElementState::Pressed => {
+                let (px, py) = self.cursor?;
                 if self.buttons & bit != 0 {
                     return None;
                 }
@@ -94,6 +97,8 @@ impl InputState {
                 if self.buttons & bit == 0 {
                     return None;
                 }
+                // The cursor may have left the window mid-drag: release where it was last seen.
+                let (px, py) = self.cursor.or(self.last_cursor).unwrap_or_default();
                 self.buttons &= !bit;
                 Some(pointer(
                     PointerAction::Up,
@@ -104,16 +109,32 @@ impl InputState {
         }
     }
 
-    /// Focus lost mid-gesture: cancel it so the phone does not keep a stuck button.
-    pub fn focus_lost(&mut self, rect: Rect) -> Option<InputEvent> {
-        if self.buttons == 0 {
-            return None;
+    /// Focus lost: cancel a gesture in progress and release every held key, so the phone keeps
+    /// no stuck button, key or modifier (their real ups go to whichever window has focus).
+    pub fn focus_lost(&mut self, rect: Rect) -> Vec<InputEvent> {
+        let mut out = Vec::new();
+        if self.buttons != 0 {
+            self.buttons = 0;
+            let xy = self
+                .cursor
+                .or(self.last_cursor)
+                .map_or((0.0, 0.0), |(x, y)| clamp_normalized(rect, x, y));
+            out.push(pointer(PointerAction::Cancel, xy, 0));
         }
-        self.buttons = 0;
-        let xy = self
-            .cursor
-            .map_or((0.0, 0.0), |(x, y)| clamp_normalized(rect, x, y));
-        Some(pointer(PointerAction::Cancel, xy, 0))
+        // Keys held at blur (Alt of an Alt+Tab, or anything else) never get their up here:
+        // release them now, with no modifiers, so the phone keeps no stuck key or META state.
+        out.extend(
+            self.keys_down
+                .drain(..)
+                .map(|(_, keycode, _)| InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode,
+                    meta: 0,
+                    repeat: 0,
+                }),
+        );
+        self.mods = ModifiersState::empty();
+        out
     }
 
     pub fn wheel(&mut self, rect: Rect, delta: MouseScrollDelta) -> Option<InputEvent> {
@@ -239,6 +260,73 @@ mod tests {
         );
         // Outside the video (letterbox bar): no hover, no press.
         assert_eq!(s.cursor_moved(R, 10.0, 10.0), None);
+        assert_eq!(
+            s.mouse_button(R, MouseButton::Left, ElementState::Pressed),
+            None
+        );
+    }
+
+    #[test]
+    fn focus_lost_releases_held_keys_and_buttons() {
+        let mut s = InputState::default();
+        s.cursor_moved(R, 500.0, 350.0);
+        s.mouse_button(R, MouseButton::Left, ElementState::Pressed)
+            .unwrap();
+        s.mods = ModifiersState::ALT;
+        s.key(KeyCode::AltLeft, ElementState::Pressed, false)
+            .unwrap();
+        s.key(KeyCode::KeyA, ElementState::Pressed, false).unwrap();
+        let evs = s.focus_lost(R);
+        assert_eq!(
+            evs,
+            vec![
+                InputEvent::Pointer {
+                    action: PointerAction::Cancel,
+                    id: 0,
+                    x: 0.5,
+                    y: 0.5,
+                    buttons: 0,
+                    pressure: 0.0
+                },
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode: 57,
+                    meta: 0,
+                    repeat: 0
+                },
+                InputEvent::Key {
+                    action: KeyAction::Up,
+                    keycode: 29,
+                    meta: 0,
+                    repeat: 0
+                },
+            ]
+        );
+        // Already released: a late real up is not sent twice, and nothing is left to release.
+        assert_eq!(s.key(KeyCode::KeyA, ElementState::Released, false), None);
+        assert_eq!(s.focus_lost(R), vec![]);
+    }
+
+    #[test]
+    fn release_after_cursor_left_still_sends_up() {
+        let mut s = InputState::default();
+        s.cursor_moved(R, 500.0, 350.0);
+        s.mouse_button(R, MouseButton::Left, ElementState::Pressed)
+            .unwrap();
+        s.cursor_moved(R, 900.0, 350.0);
+        s.cursor_left();
+        assert_eq!(
+            s.mouse_button(R, MouseButton::Left, ElementState::Released),
+            Some(InputEvent::Pointer {
+                action: PointerAction::Up,
+                id: 0,
+                x: 0.9,
+                y: 0.5,
+                buttons: 0,
+                pressure: 0.0
+            })
+        );
+        // With the cursor outside the window, a new press does nothing.
         assert_eq!(
             s.mouse_button(R, MouseButton::Left, ElementState::Pressed),
             None

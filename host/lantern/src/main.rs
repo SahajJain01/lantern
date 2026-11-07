@@ -28,9 +28,16 @@ fn cli() -> Result<u8> {
             rt.block_on(lantern::daemon::run())?;
             Ok(0)
         }
-        // The window owns the main thread (winit); it runs no tokio runtime.
+        // The window owns the main thread (winit); it runs no tokio runtime. Its failures
+        // (daemon unreachable, event loop) exit 1 like its runtime errors; 2 is usage only.
         ["open", pkg] if !pkg.is_empty() && !pkg.starts_with('-') => {
-            Ok(lantern::window::run(pkg)?.clamp(0, 255) as u8)
+            match lantern::window::run(pkg) {
+                Ok(code) => Ok(code.clamp(0, 255) as u8),
+                Err(error) => {
+                    eprintln!("lantern: {error:#}");
+                    Ok(1)
+                }
+            }
         }
         ["daemon", ..] | ["open", ..] => bail!("{USAGE}"),
         [other, ..] => bail!("unknown subcommand {other:?}; {USAGE}"),

@@ -1,6 +1,6 @@
 //! Decodes the Task 4 capture (`tests/fixtures/settings.h265`, 2 s of Settings at 1280x800).
 
-use lantern::window::decode::{Backend, Decoder, Nv12Frame};
+use lantern::window::decode::{Backend, Colour, Decoder, Matrix, Nv12Frame};
 use lantern_proto::VideoPacket;
 
 /// Splits an H.265 Annex-B stream into helper-style packets: one config packet (VPS/SPS/PPS)
@@ -92,6 +92,13 @@ fn check(frames: &[Nv12Frame]) {
         assert!(f.y_stride >= 1280 && f.uv_stride >= 1280);
         assert_eq!(f.y.len(), (f.y_stride * f.h) as usize);
         assert_eq!(f.uv.len(), (f.uv_stride * f.h / 2) as usize);
+        // The phone signals BT.601 (smpte170m/bt470bg), TV range; the frame must carry it
+        // (VA-API too: the colour comes from the surface frame, not the transfer copy).
+        let bt601_tv = Colour {
+            matrix: Matrix::Bt601,
+            full_range: false,
+        };
+        assert_eq!(f.colour, bt601_tv);
     }
     // Real picture content, not a blank buffer.
     let y = &frames[frames.len() - 1].y;
