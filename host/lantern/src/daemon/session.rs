@@ -235,6 +235,108 @@ fn helper_command(remote: &str, name: &str, token: &str) -> String {
     format!("CLASSPATH={remote} exec app_process / dev.lantern.helper.Main serve {name} {token}")
 }
 
+/// How long a new session waits for a previous session's helper (or its Cleanup) to finish
+/// restoring the phone before killing it.
+pub const PREVIOUS_HELPER_WAIT: Duration = Duration::from_secs(10);
+const PREVIOUS_HELPER_POLL: Duration = Duration::from_millis(200);
+/// Lists every live helper process (Main or Cleanup) on the phone. The bracket keeps the
+/// pattern from matching the shell running it; `true` makes "none" a success.
+const HELPER_PIDS_CMD: &str = "pgrep -f 'dev[.]lantern[.]helper'; true";
+
+async fn helper_pids(adb: &Adb) -> Result<Vec<u32>> {
+    let out = adb
+        .shell(&[HELPER_PIDS_CMD])
+        .await
+        .context("list previous helper processes")?;
+    Ok(out
+        .split_whitespace()
+        .filter_map(|pid| pid.parse().ok())
+        .collect())
+}
+
+/// Waits (up to `bound`) until no helper process of an earlier session is alive on the phone,
+/// then kills any that remain: they are ours, and a helper's `Session.close` or `Cleanup`
+/// restoring the stay-awake setting while the new session starts would corrupt it. A killed
+/// helper restores nothing, so the new session takes the original from the journal persisted
+/// on the phone (`/data/local/tmp/lantern-session.json`).
+pub async fn wait_for_previous_helpers(adb: &Adb, bound: Duration) -> Result<()> {
+    let deadline = Instant::now() + bound;
+    let mut pids = helper_pids(adb).await?;
+    if pids.is_empty() {
+        return Ok(());
+    }
+    tracing::info!(?pids, "waiting for the previous helper to finish");
+    while Instant::now() < deadline {
+        tokio::time::sleep(PREVIOUS_HELPER_POLL.min(deadline - Instant::now())).await;
+        pids = helper_pids(adb).await?;
+        if pids.is_empty() {
+            return Ok(());
+        }
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::warn!(pids = list, ?bound, "previous helper still alive; killing it");
+    if let Err(error) = adb.shell(&[&format!("kill -9 {list}")]).await {
+        tracing::warn!(%error, "kill previous helper");
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = helper_pids(adb).await?;
+        if left.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("previous helper processes {left:?} survived kill -9");
+        }
+        tokio::time::sleep(PREVIOUS_HELPER_POLL).await;
+    }
+}
+
+/// Removes helper jars of other builds from the phone, keeping `remote`. Best effort.
+async fn prune_old_jars(adb: &Adb, remote: &str) {
+    let cmd = format!(
+        "for f in /data/local/tmp/lantern-helper-*.jar; do [ \"$f\" = {remote} ] || rm -f \"$f\"; done"
+    );
+    if let Err(error) = adb.shell(&[&cmd]).await {
+        tracing::warn!(%error, "could not prune old helper jars");
+    }
+}
+
+/// Writes the embedded jar to a fresh, exclusively created host temp file (unique per call,
+/// so concurrent starts never share or clobber one) and returns its path.
+fn write_host_jar(sha: &str) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    let mut nonce = [0u8; 8];
+    OsRng.fill_bytes(&mut nonce);
+    let path = std::env::temp_dir().join(format!(
+        "lantern-helper-{sha}-{}-{}.jar",
+        std::process::id(),
+        hex(&nonce)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    if let Err(error) = file.write_all(HELPER_JAR) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error).context("write embedded helper jar");
+    }
+    Ok(path)
+}
+
+/// Removes the host temp jar when dropped (also when the start future is cancelled mid-push).
+struct HostJar(std::path::PathBuf);
+
+impl Drop for HostJar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Starts a helper session. Every await is bounded, and the future is cancel-safe: dropping it
 /// at any point kills the helper and removes any forward it created.
 pub async fn start(adb: &Adb) -> Result<SessionConn> {
@@ -249,12 +351,12 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
         .map(|output| output.split_whitespace().next() == Some(helper_sha.as_str()))
         .unwrap_or(false);
     if !installed {
-        let host = std::env::temp_dir().join(format!("lantern-helper-{helper_sha}.jar"));
-        std::fs::write(&host, HELPER_JAR).context("write embedded helper jar")?;
-        let pushed = adb.push(&host.to_string_lossy(), &remote).await;
-        let _ = std::fs::remove_file(&host);
-        pushed?;
+        let host = HostJar(write_host_jar(&helper_sha)?);
+        adb.push(&host.0.to_string_lossy(), &remote).await?;
     }
+    prune_old_jars(adb, &remote).await;
+    // Never overlap a previous session's helper: see wait_for_previous_helpers.
+    wait_for_previous_helpers(adb, PREVIOUS_HELPER_WAIT).await?;
 
     let mut token_bytes = [0u8; 16];
     OsRng.fill_bytes(&mut token_bytes);

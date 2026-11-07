@@ -31,6 +31,7 @@ JELLY = "org.lineageos.jelly"
 # with the daemon stopped (or set LANTERN_STAY_ON_RESTORED to skip that).
 STAY_ON_RESTORED = os.environ.get("LANTERN_STAY_ON_RESTORED") or None
 STAY_ON_SESSION = "7"  # Session.STAY_ON in the helper
+JOURNAL = "/data/local/tmp/lantern-session.json"  # JournalStore.PATH in the helper
 RESIZE_LOGICAL = 900
 KILL_SIGNAL = "TERM"  # item 7; --signal=KILL
 LOG_DIR = Path(tempfile.mkdtemp(prefix="lantern-device-test-"))
@@ -184,12 +185,16 @@ def phone_state():
         "displays": display_ids(),
         "forwards": forwards,
         "helper_pids": helpers,
+        # The session journal exists exactly while a session is live (or after one nothing
+        # could restore).
+        "journal": adb("shell", f"ls {JOURNAL} 2>/dev/null || true").strip() == JOURNAL,
     }
 
 
 def restored(st):
     return (st["stay_on"] == stay_on_baseline() and st["panel"] == "On"
-            and st["displays"] == ["0"] and not st["forwards"] and not st["helper_pids"])
+            and st["displays"] == ["0"] and not st["forwards"] and not st["helper_pids"]
+            and not st["journal"])
 
 
 def released(st):
@@ -223,7 +228,7 @@ def stay_on_baseline():
 def armed(st):
     """The phone as a ready session with no windows leaves it."""
     return (st["stay_on"] == STAY_ON_SESSION and st["panel"] == "Off" and st["displays"] == ["0"]
-            and len(st["forwards"]) == 1 and st["helper_pids"])
+            and len(st["forwards"]) == 1 and st["helper_pids"] and st["journal"])
 
 
 # --- KWin scripting ------------------------------------------------------------------------

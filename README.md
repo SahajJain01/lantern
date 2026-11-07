@@ -63,12 +63,19 @@ session), lanternd starts a session on the phone at once, even if no window is o
 - **The "stay awake while charging" setting is changed and later restored.** The setting is
   `settings global stay_on_while_plugged_in`; it is set to `7` during the session. The original
   value is restored when the session ends, including when the helper is killed or the cable
-  is pulled. A separate guard process on the phone does that restore.
+  is pulled. A separate guard process on the phone does that restore. The original value is also
+  journaled to `/data/local/tmp/lantern-session.json` before anything changes, and the file is
+  deleted after a clean restore. If both helper and guard die without restoring (reboot, battery
+  death, `kill -9` of both), the next session takes the original from that file rather than the
+  current value, and restores it when it ends. A new session also waits (up to 10 s) for the
+  previous session's helper processes to exit, killing any still alive after that, so two
+  sessions never overlap on the phone.
 - **One virtual display per open window**, named `lantern-<id>-<package>`. Each is removed when its
   window closes, and closing a window quits its app's task (close = quit).
 - **The helper jar stays in `/data/local/tmp`** as `lantern-helper-<sha256>.jar`, and the helper
-  runs as the `shell` user (`app_process`) only during a session. lanternd also adds one
-  `adb forward` for the session and removes it when the session ends.
+  runs as the `shell` user (`app_process`) only during a session. Every session start deletes
+  the jars of other Lantern builds (`lantern-helper-*.jar` other than the current one). lanternd
+  also adds one `adb forward` for the session and removes it when the session ends.
 - **No keyboard is installed or switched yet.** The hidden Lantern keyboard (input method) arrives
   only in Plan 2. Until then, the on-screen keyboard is just hidden on Lantern displays, and those
   displays are removed with their windows.
@@ -76,11 +83,13 @@ session), lanternd starts a session on the phone at once, even if no window is o
 The phone is restored whenever the session ends: when you stop lanternd
 (`systemctl --user stop lanternd`), unplug the phone, the daemon dies, or you log out. Restored
 means the panel is on, the stay-awake setting has its old value, there are no Lantern displays
-or helper processes, and only the jar file remains on the phone. A daemon that stops cleanly
-also removes its `adb forward`. One that is killed outright (`SIGKILL`, a crash) cannot, so its
-forward stays in the PC's adb server until the next session for that phone starts: every session
-start first removes that phone's leftover `localabstract:lantern-*` forwards. To drop one by
-hand, `adb forward --list` shows it and `adb forward --remove tcp:<port>` removes it.
+or helper processes, and only the current jar file remains on the phone (plus
+`lantern-session.json` while a session is live, or after one that nothing could restore). A
+daemon that stops cleanly also removes its `adb forward`. One that is killed outright
+(`SIGKILL`, a crash) cannot, so its forward stays in the PC's adb server until the next session
+for that phone starts: every session start first removes that phone's leftover
+`localabstract:lantern-*` forwards. To drop one by hand, `adb forward --list` shows it and
+`adb forward --remove tcp:<port>` removes it.
 
 ## Undo / uninstall
 
@@ -93,8 +102,10 @@ adb shell rm -f '/data/local/tmp/lantern-helper-*.jar'   # remove the helper jar
 ```
 
 `uninstall` is idempotent. It does not touch the phone beyond stopping the daemon, which restores
-the phone. If the phone was unplugged when a session died and still shows a changed setting, run
-`adb shell settings put global stay_on_while_plugged_in <old value>` (Android's default is `0`).
+the phone. If the phone still shows a changed setting after uninstalling (a session died and none
+followed), `adb shell cat /data/local/tmp/lantern-session.json` shows the original; restore it with
+`adb shell settings put global stay_on_while_plugged_in <old value>` (Android's default is `0`)
+and delete that file.
 
 ## Acceptance test (real phone + KDE desktop)
 
