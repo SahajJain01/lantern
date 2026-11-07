@@ -156,6 +156,134 @@ public final class SessionTest {
         eq(false, Cleanup.shouldRestore(new java.io.ByteArrayInputStream("done\n".getBytes())), "done skips");
     }
 
+    /** Stand-in for the Cleanup child: stdout is whatever the test feeds it; records stdin. */
+    static final class FakeChild extends Process {
+        final java.io.PipedOutputStream stdoutFeed = new java.io.PipedOutputStream();
+        final java.io.PipedInputStream stdout;
+        final java.io.ByteArrayOutputStream stdin = new java.io.ByteArrayOutputStream();
+        volatile boolean destroyed;
+        final List<String> command = new ArrayList<>();
+
+        FakeChild() throws java.io.IOException {
+            stdout = new java.io.PipedInputStream(stdoutFeed);
+        }
+
+        void say(String s) throws java.io.IOException {
+            stdoutFeed.write(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            stdoutFeed.flush();
+        }
+
+        @Override
+        public java.io.OutputStream getOutputStream() {
+            return stdin;
+        }
+
+        @Override
+        public java.io.InputStream getInputStream() {
+            return stdout;
+        }
+
+        @Override
+        public java.io.InputStream getErrorStream() {
+            return new java.io.ByteArrayInputStream(new byte[0]);
+        }
+
+        @Override
+        public int waitFor() {
+            return 0;
+        }
+
+        @Override
+        public int exitValue() {
+            return 0;
+        }
+
+        @Override
+        public void destroy() {
+            destroyed = true;
+            try {
+                stdoutFeed.close();
+            } catch (java.io.IOException ignored) {
+            }
+        }
+
+        @Override
+        public Process destroyForcibly() {
+            destroy();
+            return this;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return !destroyed;
+        }
+    }
+
+    static Cleanup.ProcessGuard fakeGuard(FakeChild child, long timeoutMs) {
+        return new Cleanup.ProcessGuard((cmd, cp) -> {
+            child.command.addAll(cmd);
+            return child;
+        }, "/data/local/tmp/x.jar", timeoutMs, msg -> { });
+    }
+
+    static void armFailsWithoutReady() throws Exception {
+        FakeSettings s = new FakeSettings();
+        s.values.put(NS + "/" + KEY, "15");
+        FakePower p = new FakePower();
+        FakeChild child = new FakeChild(); // never says ready
+        long t0 = System.nanoTime();
+        Throwable thrown = null;
+        try {
+            Session.start(s, p, fakeGuard(child, 300));
+        } catch (RuntimeException e) {
+            thrown = e;
+        }
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        check(thrown != null, "start must throw when Cleanup never says ready");
+        check(ms >= 250 && ms < 2000, "threw after the timeout, took " + ms + " ms");
+        check(child.destroyed, "silent child killed");
+        eq("15", s.get(NS, KEY), "value untouched");
+        eq("[]", s.writes.toString(), "no settings writes");
+        eq("[]", p.calls.toString(), "no power calls");
+    }
+
+    static void armFailsWhenChildDiesBeforeReady() throws Exception {
+        FakeSettings s = new FakeSettings();
+        s.values.put(NS + "/" + KEY, "15");
+        FakePower p = new FakePower();
+        FakeChild child = new FakeChild();
+        child.stdoutFeed.close(); // died during startup: EOF, no ready
+        long t0 = System.nanoTime();
+        Throwable thrown = null;
+        try {
+            Session.start(s, p, fakeGuard(child, 3000));
+        } catch (RuntimeException e) {
+            thrown = e;
+        }
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        check(thrown != null, "start must throw when Cleanup exits before ready");
+        check(ms < 1000, "EOF fails fast, took " + ms + " ms");
+        eq("[]", s.writes.toString(), "no settings writes");
+        eq("[]", p.calls.toString(), "no power calls");
+    }
+
+    static void armProceedsAfterReady() throws Exception {
+        FakeSettings s = new FakeSettings();
+        s.values.put(NS + "/" + KEY, "15");
+        FakePower p = new FakePower();
+        FakeChild child = new FakeChild();
+        child.say("ready\n");
+        Session session = Session.start(s, p, fakeGuard(child, 3000));
+        eq("7", s.get(NS, KEY), "value during session");
+        check(!child.destroyed, "ready child left running");
+        eq("app_process", child.command.get(0), "launches app_process");
+        eq(Cleanup.class.getName(), child.command.get(2), "launches Cleanup");
+        eq(session.journal().toJson(), child.command.get(3), "journal passed as arg");
+        session.close();
+        eq("done\n", child.stdin.toString("UTF-8"), "disarm writes done");
+        eq("15", s.get(NS, KEY), "value after close");
+    }
+
     private static void check(boolean ok, String what) {
         if (!ok) {
             throw new AssertionError(what);
@@ -181,6 +309,9 @@ public final class SessionTest {
             {"journalJsonRoundTrip", (Case) SessionTest::journalJsonRoundTrip},
             {"guardArmedBeforeAnyChange", (Case) SessionTest::guardArmedBeforeAnyChange},
             {"cleanupSkipsAfterDone", (Case) SessionTest::cleanupSkipsAfterDone},
+            {"armFailsWithoutReady", (Case) SessionTest::armFailsWithoutReady},
+            {"armFailsWhenChildDiesBeforeReady", (Case) SessionTest::armFailsWhenChildDiesBeforeReady},
+            {"armProceedsAfterReady", (Case) SessionTest::armProceedsAfterReady},
         };
         int failed = 0;
         for (Object[] c : cases) {

@@ -37,6 +37,17 @@ final class Droid {
         }
     }
 
+    /** Points fd 1 at /dev/null so later writes can't SIGPIPE us once the parent is gone. */
+    static void silenceStdout() {
+        try {
+            java.io.FileDescriptor devNull = Os.open("/dev/null", android.system.OsConstants.O_WRONLY, 0);
+            Os.dup2(devNull, 1);
+            Os.close(devNull);
+        } catch (Exception e) {
+            log("silence stdout failed: " + e);
+        }
+    }
+
     static int pid() {
         return android.os.Process.myPid();
     }

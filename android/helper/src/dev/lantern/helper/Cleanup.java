@@ -7,19 +7,28 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
  * Out-of-process restore. {@link Main} spawns {@code app_process / dev.lantern.helper.Cleanup
  * <journal-json>} with a pipe on its stdin. When the pipe hits EOF (the parent died) the journal is
  * applied; if the parent first writes {@code done\n} (clean close) it exits without acting.
+ * Startup handshake: once detached, prepared and holding a parsed journal, Cleanup writes
+ * {@code ready\n} to its stdout pipe exactly once; the parent changes nothing until it reads it.
  *
  * <p>Everything except {@link #main} is plain Java so it runs in host-JVM tests.
  */
 public final class Cleanup {
     static final String DONE = "done";
+    /** Written to stdout exactly once, after setsid, prepare and journal parse. */
+    static final String READY = "ready";
 
     private Cleanup() {
     }
@@ -93,44 +102,113 @@ public final class Cleanup {
 
     /** Spawns the Cleanup process; the returned guard writes {@code done} on disarm. */
     static Session.Guard spawnGuard(Consumer<String> log) {
-        return new Session.Guard() {
-            private Process process;
+        return new ProcessGuard(ProcessGuard::launch, System.getenv("CLASSPATH"), READY_TIMEOUT_MS, log);
+    }
 
-            @Override
-            public void arm(String journalJson) {
-                String cp = System.getenv("CLASSPATH");
-                if (cp == null || cp.isEmpty()) {
-                    throw new IllegalStateException("CLASSPATH not set; cannot spawn Cleanup");
-                }
-                ProcessBuilder b = new ProcessBuilder("app_process", "/", Cleanup.class.getName(), journalJson);
-                b.environment().put("CLASSPATH", cp);
-                // Never inherit our stdout/stderr pipes: after we die, writes there would SIGPIPE Cleanup.
-                File devNull = new File("/dev/null");
-                b.redirectOutput(devNull);
-                b.redirectError(devNull);
-                try {
-                    process = b.start();
-                } catch (IOException e) {
-                    throw new IllegalStateException("spawn Cleanup", e);
-                }
-                log.accept("cleanup armed");
+    static final long READY_TIMEOUT_MS = 3000;
+
+    /** Guard backed by a Cleanup child process. The launcher is injectable for host tests. */
+    static final class ProcessGuard implements Session.Guard {
+        interface Launcher {
+            Process start(List<String> command, String classpath) throws IOException;
+        }
+
+        private final Launcher launcher;
+        private final String classpath;
+        private final long readyTimeoutMs;
+        private final Consumer<String> log;
+        private Process process;
+
+        ProcessGuard(Launcher launcher, String classpath, long readyTimeoutMs, Consumer<String> log) {
+            this.launcher = launcher;
+            this.classpath = classpath;
+            this.readyTimeoutMs = readyTimeoutMs;
+            this.log = log;
+        }
+
+        /** Real launcher: stdin and stdout are pipes to us, stderr goes to /dev/null. */
+        static Process launch(List<String> command, String classpath) throws IOException {
+            ProcessBuilder b = new ProcessBuilder(command);
+            b.environment().put("CLASSPATH", classpath);
+            b.redirectError(new File("/dev/null"));
+            return b.start();
+        }
+
+        @Override
+        public void arm(String journalJson) {
+            if (classpath == null || classpath.isEmpty()) {
+                throw new IllegalStateException("CLASSPATH not set; cannot spawn Cleanup");
             }
-
-            @Override
-            public void disarm() {
-                if (process == null) {
-                    return;
-                }
-                try {
-                    OutputStream out = process.getOutputStream();
-                    out.write((DONE + "\n").getBytes(StandardCharsets.UTF_8));
-                    out.close();
-                } catch (IOException e) {
-                    log.accept("cleanup disarm failed: " + e);
-                }
+            try {
+                process = launcher.start(Arrays.asList("app_process", "/", Cleanup.class.getName(), journalJson), classpath);
+            } catch (IOException e) {
+                throw new IllegalStateException("spawn Cleanup", e);
+            }
+            String why = awaitReady(process.getInputStream(), readyTimeoutMs);
+            if (why != null) {
+                // Not provably alive and detached: refuse to start before anything is changed.
+                process.destroyForcibly();
                 process = null;
+                throw new IllegalStateException("Cleanup not ready: " + why);
             }
-        };
+            try {
+                process.getInputStream().close(); // Cleanup never writes stdout again
+            } catch (IOException ignored) {
+                // Nothing to do.
+            }
+            log.accept("cleanup armed (ready)");
+        }
+
+        /** Reads Cleanup's first stdout line. Null if it is {@code ready}, else the failure reason. */
+        static String awaitReady(InputStream in, long timeoutMs) {
+            BlockingQueue<String> q = new ArrayBlockingQueue<>(1);
+            Thread t = new Thread(() -> {
+                StringBuilder b = new StringBuilder();
+                String result;
+                try {
+                    int c;
+                    while ((c = in.read()) != -1 && c != '\n' && b.length() < 64) {
+                        b.append((char) c);
+                    }
+                    if (c == '\n' && READY.equals(b.toString().trim())) {
+                        result = "";
+                    } else {
+                        result = c == -1 ? "exited before ready" : "unexpected output: " + b;
+                    }
+                } catch (IOException e) {
+                    result = "read failed: " + e;
+                }
+                q.offer(result);
+            }, "cleanup-ready");
+            t.setDaemon(true);
+            t.start();
+            String r;
+            try {
+                r = q.poll(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return "interrupted";
+            }
+            if (r == null) {
+                return "no ready within " + timeoutMs + " ms";
+            }
+            return r.isEmpty() ? null : r;
+        }
+
+        @Override
+        public void disarm() {
+            if (process == null) {
+                return;
+            }
+            try {
+                OutputStream out = process.getOutputStream();
+                out.write((DONE + "\n").getBytes(StandardCharsets.UTF_8));
+                out.close();
+            } catch (IOException e) {
+                log.accept("cleanup disarm failed: " + e);
+            }
+            process = null;
+        }
     }
 
     public static void main(String[] args) {
@@ -148,7 +226,12 @@ public final class Cleanup {
             System.exit(2);
             return;
         }
-        Droid.log("cleanup: waiting, journal=" + args[0]);
+        // Handshake: we are detached, prepared and hold a valid journal. Then fd 1 is pointed at
+        // /dev/null, so nothing can ever SIGPIPE us after the parent dies.
+        System.out.print(READY + "\n");
+        System.out.flush();
+        Droid.silenceStdout();
+        Droid.log("cleanup: ready, waiting, journal=" + args[0]);
         if (!shouldRestore(System.in)) {
             Droid.log("cleanup: parent closed cleanly, nothing to do");
             System.exit(0);
