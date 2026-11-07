@@ -34,7 +34,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `t` | fields |
 |---|---|
 | `hello` | `version: u32`, `token: string` |
-| `open` | `pkg: string`, `user: u32`, `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string` |
+| `open` | `pkg: string`, `user: u32` (Android user/profile id, `0..=i32::MAX`), `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string` |
 | `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32` |
 | `resize` | `w: u32`, `h: u32`, `dpi: u32` |
 | `resized` | `w: u32`, `h: u32` |
@@ -56,6 +56,12 @@ JSON objects tagged by `"t"` (snake_case). Example:
   `code`, a `msg` starting `protocol version mismatch`) as a version mismatch and exits 3 (see
   Exit statuses); any other handshake `error` is retried with backoff.
 - `opened` is sent before any video for that window. `codec` is `"h265"` or `"h264"`.
+- `open.user`: the helper resolves `pkg`'s launcher activity in that user's package manager and
+  starts it as that user (`am start --user N` semantics). Before creating a display it refuses,
+  as a per-window failure, a user that does not exist, is not running, or has the
+  `no_debugging_features` restriction (Android bars the shell uid from such users), and a `pkg`
+  that is not installed for that user or has no launcher activity. The `error.msg` is meant for
+  the person at the PC (e.g. `open com.x failed: com.x is not installed for Android user 10`).
 - `resized{w,h}` answers `resize`, and is also sent unprompted when the app rotates its display.
 - A per-window failure (open, resize or the video stream) is `error{msg}` followed by
   `closed{reason:"error"}` on that window's stream; the session continues.

@@ -46,8 +46,17 @@ Tests: `cd host && cargo test`.
 
 ```sh
 lantern open com.android.settings     # one window per app; opening it again focuses that window
+lantern open --user 10 com.android.settings   # the same app from Android user/profile 10 (e.g. work)
 lantern status                        # daemon state as JSON
 ```
+
+`--user N` (default `0`) picks the Android user or profile the app runs as; `adb shell pm list
+users` lists them. Each user's copy of an app is its own window: Wayland app_id
+`lantern.<pkg>` for user 0 and `lantern.<pkg>-u<N>` otherwise, title `<pkg> (user N)`, and its own
+remembered size. The phone refuses (and the window prints why) when the user does not exist, is
+not running (a paused work profile), does not have the app, or **does not allow adb**: a work
+profile whose admin (Intune and most MDMs) sets `no_debugging_features` bars the adb shell user,
+which Lantern runs as, from that profile entirely. Such work profiles cannot be shown.
 
 `lantern status` prints `{"state":"idle|starting|ready","serial":…,"helper":<jar sha256>,"windows":[{"id","pkg","user"}]}`.
 Logs: `journalctl --user -u lanternd`. Set `LANTERN_LOG=debug` for more detail.

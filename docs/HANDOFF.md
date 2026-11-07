@@ -34,8 +34,10 @@ Acceptance (`tools/device_test.py`) is 8/8 PASS on Sahaj's phone:
 
 ## Environment facts
 - Phone: Xiaomi 11T Pro, serial `20e9318`, Android 17 / SDK 37, LineageOS 24, swipe keyguard, USB only.
+- Also used: Sahaj's daily Motorola edge 50 pro, serial `ZD222LMDFV`, Android 16, users 0 and 10
+  (Intune work profile); its `stay_on_while_plugged_in` original is `0`.
 - Rust is in `~/.cargo/bin`, which is not on the agent tool's PATH. Prefix commands with
-  `export PATH="$HOME/.cargo/bin:$PATH"`. Work in `host/` (`cargo test --workspace`); there are 133
+  `export PATH="$HOME/.cargo/bin:$PATH"`. Work in `host/` (`cargo test --workspace`); there are 141
   tests.
 - The FFmpeg, VA-API, Wayland and clang dev headers are installed. The GPU is Intel (renderD128).
 - Commit as `git -c user.name='Sahaj Jain' -c user.email='jainsahaj@gmail.com'`.
@@ -71,8 +73,30 @@ superpowers:subagent-driven-development, as Plan 1 was.
   - A latency harness, and the target from spec §9a/§11: no more than 5 ms worse than scrcpy.
 
 Still unverified: PIN keyguard, third-party notification clicks, IME text in real apps, rotation
-started by the app on a real device, users other than user 0, long runs with 5–6 encoders, and
-interactive play in games.
+started by the app on a real device, long runs with 5–6 encoders, and interactive play in games.
+
+## Android users / work profiles (`lantern open --user N <pkg>`, 2026-11-08)
+- CLI `--user N` (default 0; usage errors exit 2). The window sends `open.user`; app_id is
+  `lantern.<pkg>` for user 0 (unchanged) and `lantern.<pkg>-u<N>` otherwise (`-` cannot occur in a
+  package name, so no collision); title `<pkg> (user N)`; `windows.json` key `<pkg>` / `<pkg>:<N>`.
+  Single-instance focus keys on pkg+user (test `single_instance_is_per_pkg_and_user`).
+- Helper: `UserLaunch` (pure policy, host-tested with a fake) over `DeviceUsers` (IUserManager,
+  IActivityManager, IPackageManager for that user). Resolves the launcher activity for that user
+  and `startActivityAsUser(…, user)` with an explicit component, before any display is created.
+  Task lookup/close are by display (`getTasks(…, displayId)` / `removeTask`), user-independent.
+- **Device result, Motorola edge 50 pro (`ZD222LMDFV`, Android 16), users 0 and 10 (Intune work
+  profile):** user 10 has `no_debugging_features` (set by its profile owner), so Android throws
+  `SecurityException: Shell does not have permission to access user 10` for *any* shell-uid call
+  into it (`am start --user 10`, `pm list packages --user 10`). Lantern detects this first and
+  prints a clear error. **A real user-10 window could not be shown on this phone**, and nothing on
+  the phone may be changed to allow it. Verified on device: the user-10 error, `--user 11` → "does
+  not exist (users: 0, 10)", a missing package → "not installed for Android user 0", and user 0
+  Settings still opens through the new resolve path (task `userId=0` on the Lantern display) and
+  closes cleanly. Verified on KDE with a fake daemon: user 0 and user 10 windows of one package
+  get distinct app_ids/titles/taskbar entries and sizes, and closing one leaves the other.
+- Still unverified: an actual non-zero user's app on a Lantern display (needs a profile without
+  `no_debugging_features`, e.g. a secondary user or private space on the Xiaomi or a test work
+  profile from Test DPC), and whether `getTasks` sees that user's task from the shell uid.
 
 ## Decisions made during Plan 1 (Sahaj may override)
 - **Helper (phone side)**
