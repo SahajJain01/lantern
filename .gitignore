@@ -7,3 +7,5 @@ spikes/out/
 spikes/baseline/
 spikes/raw/
 host/target/
+/build/
+host/lantern/assets/helper.jar

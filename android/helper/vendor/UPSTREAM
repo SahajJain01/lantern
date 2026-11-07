@@ -1,0 +1,47 @@
+Upstream: scrcpy https://github.com/Genymobile/scrcpy
+Tag:      v5.0.1
+Commit:   a60891aea193d92e7e5c3942700eca63f9d19a5f
+License:  Apache-2.0 (see /LICENSE)
+
+NOTICE: Portions of this directory are from scrcpy, Copyright (C) 2018 Genymobile and
+Copyright (C) 2018-2026 Romain Vimont, licensed under the Apache License, Version 2.0.
+
+Files are copied byte-for-byte (unmodified; package names kept). Upstream path -> vendored path:
+  server/src/main/java/<P>  ->  java/<P>
+  server/src/main/aidl/<P>  ->  aidl/<P>
+
+Copied paths (relative to server/src/main/):
+  java/com/genymobile/scrcpy/AndroidVersions.java
+  java/com/genymobile/scrcpy/FakeContext.java
+  java/com/genymobile/scrcpy/Workarounds.java
+  java/com/genymobile/scrcpy/wrappers/ActivityManager.java
+  java/com/genymobile/scrcpy/wrappers/ClipboardManager.java
+  java/com/genymobile/scrcpy/wrappers/ContentProvider.java
+  java/com/genymobile/scrcpy/wrappers/DisplayControl.java
+  java/com/genymobile/scrcpy/wrappers/DisplayManager.java
+  java/com/genymobile/scrcpy/wrappers/DisplayWindowListener.java
+  java/com/genymobile/scrcpy/wrappers/InputManager.java
+  java/com/genymobile/scrcpy/wrappers/PowerManager.java
+  java/com/genymobile/scrcpy/wrappers/ServiceManager.java
+  java/com/genymobile/scrcpy/wrappers/StatusBarManager.java
+  java/com/genymobile/scrcpy/wrappers/SurfaceControl.java
+  java/com/genymobile/scrcpy/wrappers/WindowManager.java
+  java/com/genymobile/scrcpy/util/Ln.java
+  java/com/genymobile/scrcpy/display/DisplayInfo.java
+  java/android/content/IContentProvider.java          (fake hidden-API stub)
+  aidl/android/view/IDisplayWindowListener.aidl
+  -- added because javac reported them missing:
+  java/com/genymobile/scrcpy/audio/AudioCaptureException.java   (Workarounds)
+  java/com/genymobile/scrcpy/model/Size.java                    (DisplayInfo, DisplayManager)
+  java/com/genymobile/scrcpy/video/VideoConstraints.java        (Size)
+  java/com/genymobile/scrcpy/util/BinarySearch.java             (Size)
+  java/com/genymobile/scrcpy/util/Command.java                  (DisplayManager)
+  java/com/genymobile/scrcpy/util/IO.java                       (Command)
+  java/com/genymobile/scrcpy/util/SettingsException.java        (ContentProvider)
+
+Not copied: util/LogUtils.java (not referenced), aidl/android/content/IOnPrimaryClipChangedListener.aidl
+(not referenced by the copied code).
+
+Generated at build time by tools/build.py (as scrcpy's build_without_gradle.sh does):
+  com/genymobile/scrcpy/BuildConfig.java  (DEBUG=false, VERSION_NAME="5.0.1"; referenced by util/IO.java)
+  java from aidl/android/view/IDisplayWindowListener.aidl (aidl -p platform/framework.aidl)
