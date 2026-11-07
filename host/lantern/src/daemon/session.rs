@@ -134,14 +134,9 @@ impl SessionConn {
         tokio::select! {
             frame = self.rx.recv() => match frame {
                 Some(frame) => Inbound::Frame(frame),
-                // The reader reports why on `done` before it exits.
-                None => Inbound::Ended(
-                    timeout(Duration::from_secs(1), self.done.recv())
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or("helper connection ended"),
-                ),
+                // The reader queues why on `done` before it exits (and so before `rx` closes),
+                // so the reason is already there if it is coming at all: never wait for it.
+                None => Inbound::Ended(self.done.try_recv().unwrap_or("helper connection ended")),
             },
             why = self.done.recv() => Inbound::Ended(why.unwrap_or("session tasks ended")),
         }

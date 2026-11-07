@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, Kind};
+use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, InputEvent, Kind};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -33,6 +33,8 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the daemon waits for room in the helper's outbound queue before declaring the
 /// helper wedged (the session is then restarted).
 const HELPER_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+/// A client must send its `open` within this long of connecting, or it is closed.
+pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const NOT_CONNECTED: &str = "phone not connected";
 
@@ -52,20 +54,31 @@ pub fn runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Restores the previous umask on drop.
-struct Umask(libc::mode_t);
+/// umask is process-wide: concurrent binds must not interleave their set/restore, or one
+/// could restore the old mask while another is still creating its socket.
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Restores the previous umask on drop. Holds [`UMASK_LOCK`] meanwhile.
+struct Umask {
+    old: libc::mode_t,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 impl Umask {
     fn set(mask: libc::mode_t) -> Self {
+        let lock = UMASK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: umask has no memory-safety preconditions.
-        Self(unsafe { libc::umask(mask) })
+        let old = unsafe { libc::umask(mask) };
+        Self { old, _lock: lock }
     }
 }
 
 impl Drop for Umask {
     fn drop(&mut self) {
         // SAFETY: as above.
-        unsafe { libc::umask(self.0) };
+        unsafe { libc::umask(self.old) };
     }
 }
 
@@ -165,15 +178,24 @@ fn control(stream: u32, c: Control) -> Frame {
     }
 }
 
-/// Client frames allowed on a window's own stream.
-fn client_frame_ok(frame: &Frame) -> bool {
+/// Checks a client frame on its window's own stream and returns what to forward to the
+/// helper, or `None` for a protocol error. A malformed input payload would end the whole
+/// helper session (every window), so it is caught here and costs only this client. The
+/// activation token is daemon↔window only and is stripped from a client's `focus`.
+fn client_frame_for_helper(frame: Frame) -> Option<Frame> {
     match frame.kind {
-        Kind::Input => true,
-        Kind::Video => false,
-        Kind::Control => matches!(
-            Control::decode(&frame.payload),
-            Ok(Control::Resize { .. } | Control::Focus { .. } | Control::Close)
-        ),
+        Kind::Input => InputEvent::decode(&frame.payload).is_ok().then_some(frame),
+        Kind::Video => None,
+        Kind::Control => match Control::decode(&frame.payload).ok()? {
+            Control::Focus { .. } => Some(control(
+                frame.stream,
+                Control::Focus {
+                    activation_token: None,
+                },
+            )),
+            Control::Resize { .. } | Control::Close => Some(frame),
+            _ => None,
+        },
     }
 }
 
@@ -249,8 +271,22 @@ impl Hub {
         let (out, mut queue) = mpsc::channel::<Frame>(CLIENT_QUEUE);
         let events = self.events_tx.clone();
         let reader = tokio::spawn(async move {
+            let mut first = true;
             loop {
-                match read_frame_async(&mut rd).await {
+                let read = read_frame_async(&mut rd);
+                let read = if first {
+                    first = false;
+                    match timeout(OPEN_TIMEOUT, read).await {
+                        Ok(read) => read,
+                        Err(_) => {
+                            tracing::warn!(cid, "client sent no open in time; closing it");
+                            break;
+                        }
+                    }
+                } else {
+                    read.await
+                };
+                match read {
                     Ok(Some(frame)) => {
                         if events.send(ClientEvent::Frame(cid, frame)).await.is_err() {
                             return;
@@ -336,14 +372,26 @@ impl Hub {
         let Some(client) = self.clients.get(&cid) else {
             return Ok(());
         };
-        match client.win {
-            None => self.on_open(cid, frame, helper).await,
-            Some(win) if frame.stream == win && client_frame_ok(&frame) => match helper {
+        let Some(win) = client.win else {
+            return self.on_open(cid, frame, helper).await;
+        };
+        let (stream, kind) = (frame.stream, frame.kind);
+        match (stream == win)
+            .then(|| client_frame_for_helper(frame))
+            .flatten()
+        {
+            Some(frame) => match helper {
                 Some(helper) => to_helper(helper, frame).await,
                 None => Ok(()),
             },
-            Some(win) => {
-                tracing::warn!(cid, win, stream = frame.stream, kind = ?frame.kind, "client protocol error; dropping it");
+            None => {
+                tracing::warn!(
+                    cid,
+                    win,
+                    stream,
+                    ?kind,
+                    "client protocol error; dropping it"
+                );
                 self.drop_client(cid, helper).await
             }
         }
@@ -384,7 +432,26 @@ impl Hub {
             );
             return Ok(());
         };
-        match self.registry.claim(&format!("{pkg}:{user}")) {
+        let key = format!("{pkg}:{user}");
+        let mut claim = self.registry.claim(&key);
+        if let Claim::Existing(win) = claim {
+            tracing::info!(cid, win, pkg, user, "already open; focusing");
+            if let Some(&owner) = self.windows.get(&win) {
+                self.send_to_client(
+                    owner,
+                    control(win, Control::Focus { activation_token }),
+                    Some(helper),
+                )
+                .await?;
+                if !self.clients.contains_key(&owner) {
+                    // The owner could not take the focus and was dropped (its window closed
+                    // and released): this open becomes a new window instead.
+                    tracing::info!(cid, win, "owner gone; opening a new window");
+                    claim = self.registry.claim(&key);
+                }
+            }
+        }
+        match claim {
             Claim::New(win) => {
                 tracing::info!(cid, win, pkg, user, "opening window");
                 if let Some(client) = self.clients.get_mut(&cid) {
@@ -402,15 +469,6 @@ impl Hub {
                 to_helper(helper, control(win, open)).await
             }
             Claim::Existing(win) => {
-                tracing::info!(cid, win, pkg, user, "already open; focusing");
-                if let Some(&owner) = self.windows.get(&win) {
-                    self.send_to_client(
-                        owner,
-                        control(win, Control::Focus { activation_token }),
-                        Some(helper),
-                    )
-                    .await?;
-                }
                 self.reply_and_finish(
                     cid,
                     control(

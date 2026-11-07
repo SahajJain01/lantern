@@ -329,6 +329,33 @@ async fn open_window(
 
 // ---------------------------------------------------------------------------------------------
 
+#[test]
+fn socket_mode_holds_under_parallel_binds() {
+    // umask is process-wide: concurrent binds must not undo each other's 077.
+    let threads: Vec<_> = (0..32)
+        .map(|_| {
+            std::thread::spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let _enter = rt.enter();
+                for _ in 0..300 {
+                    let dir = runtime_dir();
+                    let listener = ipc::bind(&dir).unwrap();
+                    let sock = ipc::socket_path_in(&dir);
+                    assert_eq!(mode(&sock) & 0o077, 0, "socket {} too open", sock.display());
+                    drop(listener);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+}
+
 #[tokio::test]
 async fn socket_dir_is_0700() {
     let rt = runtime_dir();
@@ -631,5 +658,156 @@ async fn slow_client_is_dropped_without_stalling_others() {
         (slow_win, Control::Close),
         "slow client treated as quit"
     );
+    daemon.shutdown().await;
+}
+
+const VALID_KEY: [u8; 14] = [3, 0, 0, 0, 0, 29, 0, 0, 0, 1, 0, 0, 0, 0];
+
+#[tokio::test]
+async fn malformed_input_drops_only_that_client() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (mut bad, bad_win) = open_window(&daemon.sock, &mut helper, "com.bad", 0).await;
+    let (mut good, good_win) = open_window(&daemon.sock, &mut helper, "com.good", 0).await;
+
+    let garbage = Frame {
+        kind: Kind::Input,
+        stream: bad_win,
+        payload: vec![9, 9, 9],
+    };
+    send(&mut bad, &garbage).await;
+    assert_eof(&mut bad).await;
+    let close = helper.next().await;
+    assert_eq!(
+        (close.stream, decode(&close)),
+        (bad_win, Control::Close),
+        "the helper gets only a close for the bad window, never the bad input"
+    );
+    helper.assert_quiet().await;
+
+    // The other window and the session are untouched.
+    let input = Frame {
+        kind: Kind::Input,
+        stream: good_win,
+        payload: VALID_KEY.to_vec(),
+    };
+    send(&mut good, &input).await;
+    assert_eq!(helper.next().await, input);
+    let video = Frame {
+        kind: Kind::Video,
+        stream: good_win,
+        payload: vec![1; 8],
+    };
+    helper.send(video.clone());
+    assert_eq!(recv(&mut good).await, Some(video));
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn truncated_and_trailing_input_are_rejected() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let mut trailing = VALID_KEY.to_vec();
+    trailing.push(7);
+    for (i, payload) in [VALID_KEY[..5].to_vec(), trailing].into_iter().enumerate() {
+        let (mut client, win) =
+            open_window(&daemon.sock, &mut helper, &format!("com.bad{i}"), 0).await;
+        send(
+            &mut client,
+            &Frame {
+                kind: Kind::Input,
+                stream: win,
+                payload,
+            },
+        )
+        .await;
+        assert_eof(&mut client).await;
+        let close = helper.next().await;
+        assert_eq!((close.stream, decode(&close)), (win, Control::Close));
+    }
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn client_focus_token_is_not_forwarded_to_helper() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (mut client, win) = open_window(&daemon.sock, &mut helper, "com.example", 0).await;
+    let focus = |activation_token: Option<&str>| {
+        control(
+            win,
+            Control::Focus {
+                activation_token: activation_token.map(str::to_owned),
+            },
+        )
+    };
+    send(&mut client, &focus(Some("secret-token"))).await;
+    assert_eq!(helper.next().await, focus(None));
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn reopen_when_owner_is_dead_opens_a_new_window() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (owner, win) = open_window(&daemon.sock, &mut helper, "com.example", 0).await;
+
+    // The owner dies in a way the daemon only learns of when it next writes: its read side is
+    // shut, so the daemon's writer fails (EPIPE) and the owner's queue closes, while its write
+    // side, and so the daemon's reader, stays open.
+    // SAFETY: shutdown(2) on a valid fd owned by `owner`.
+    let rc = unsafe { libc::shutdown(std::os::fd::AsRawFd::as_raw_fd(&owner), libc::SHUT_RD) };
+    assert_eq!(rc, 0);
+    helper.send(Frame {
+        kind: Kind::Video,
+        stream: win,
+        payload: vec![0; 64],
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut second = UnixStream::connect(&daemon.sock).await.unwrap();
+    send(&mut second, &open("com.example", 0, Some("tok-second"))).await;
+    let close = helper.next().await;
+    assert_eq!(
+        (close.stream, decode(&close)),
+        (win, Control::Close),
+        "the dead owner is closed"
+    );
+    let fwd = helper.next().await;
+    assert_ne!(fwd.stream, win, "a fresh window id");
+    assert!(
+        matches!(decode(&fwd), Control::Open { ref pkg, activation_token: None, .. } if pkg == "com.example"),
+        "the reopen must become a new window, got {:?}",
+        decode(&fwd)
+    );
+    let opened = control(
+        fwd.stream,
+        Control::Opened {
+            display: 7,
+            task: 9,
+            codec: "h264".into(),
+            w: 1280,
+            h: 800,
+        },
+    );
+    helper.send(opened.clone());
+    assert_eq!(recv(&mut second).await, Some(opened));
+    drop(owner);
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn client_that_never_opens_is_closed() {
+    let daemon = start_daemon(None);
+    let mut idle = UnixStream::connect(&daemon.sock).await.unwrap();
+    let t0 = Instant::now();
+    let got = timeout(
+        ipc::OPEN_TIMEOUT + Duration::from_secs(2),
+        read_frame_async(&mut idle),
+    )
+    .await
+    .expect("an idle client must be closed after the open deadline");
+    assert!(matches!(got, Ok(None)), "expected EOF, got {got:?}");
+    assert!(t0.elapsed() >= ipc::OPEN_TIMEOUT - Duration::from_millis(100));
     daemon.shutdown().await;
 }

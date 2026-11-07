@@ -78,9 +78,14 @@ on start, a live one means another daemon is running. The daemon listens even wi
 - Already open as window `M`: the existing window's client gets `focus{activation_token}` on
   stream `M` (it activates its window with that token); the new client gets `focus` with stream
   `M` and is closed. It should exit 0.
+- A client that sends no frame within 5 s of connecting is closed.
+- If the existing window's client cannot take the `focus` (it is dropped, as below), its window
+  is closed and released and the new `open` is handled as a new window instead.
 - After `opened`, the client sends `resize`, `focus`, `close` and input on stream `N`, forwarded
-  unchanged. A frame on any other stream, video, or another control type is a protocol error:
-  the client is dropped.
+  unchanged, except that `focus` reaches the helper without `activation_token`. A frame on any
+  other stream, video, another control type, or an input payload that does not decode is a
+  protocol error: only that client is dropped (as a disconnect), and the bad frame never reaches
+  the helper, where it would end the whole session.
 - `closed` from the helper is forwarded, then the client is closed and `N` released.
 - Client disconnect (or drop) without `closed`: the daemon sends `close` on `N` (close = quit)
   and releases `N`.
