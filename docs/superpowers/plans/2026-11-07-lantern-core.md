@@ -537,3 +537,10 @@ Wire format (copy verbatim into `docs/protocol.md`):
 - [ ] **Step 3:** Write `README.md` covering build, install, `lantern open <pkg>`, what it changes on
   the phone, and how to undo.
 - [ ] **Step 4:** Commit with `feat: install target, device acceptance suite, README`.
+
+## Deferred to Plan 3
+
+- **Latency harness and target.** The spec §11 latency measurement harness (on-screen timestamp
+  app vs PC capture, compared against scrcpy 5.0.1) and the spec §9a target, glass-to-glass no
+  more than 5 ms worse than scrcpy on the same phone, cable and settings, are Plan 3 work. Plan 1
+  does not measure latency, so the target is unverified until then.
