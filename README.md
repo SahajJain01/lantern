@@ -1,5 +1,7 @@
 # Lantern
 
+> New session? Start with [docs/HANDOFF.md](docs/HANDOFF.md).
+
 Run Android apps from a phone plugged into your PC as ordinary KDE Plasma (Wayland) windows.
 Each app gets its own window, taskbar entry and size. It runs on its own virtual display on the
 phone, so the phone's own screen is not mirrored.
