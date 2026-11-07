@@ -299,6 +299,31 @@ heat.
   target, switch to handing the window process its channel directly (fd passing) — keep the relay behind an
   interface so this is a local change.
 
+## 9b. Spike outcomes (docs/spikes/RESULTS.md) — binding for the build
+
+- **Target is Android 17 / SDK 37 (LineageOS 24)**, not 16. All findings are from that build.
+- **Display flags:** scrcpy 5's set *including* `ALWAYS_UNLOCKED` and `OWN_FOCUS`, and *excluding*
+  `SHOULD_SHOW_SYSTEM_DECORATIONS` (otherwise Android draws its own taskbar on the display).
+- **Session start must wake the phone** (it may be asleep and locked). Unlocking is not needed: with
+  `ALWAYS_UNLOCKED`, apps render behind a swipe keyguard with the panel off (30 s sustained, verified).
+  A PIN keyguard is unverified.
+- **Encoders:** ≥5 concurrent 1280×800 streams at ~60 fps, 6 at ~55 fps (short runs). Light multitasking
+  is safe; the §9 degrade ladder stays as a safety net. No codec preference from the data.
+- **Resize:** ~150 ms per resize, dominated by encoder teardown. The helper must try reusing/reconfiguring
+  the encoder before falling back to recreate; debounce drags regardless. Apps were paused/resumed on each
+  resize.
+- **Focus:** `IActivityTaskManager.setFocusedTask(taskId)` routes keyboard input to the target display.
+- **Gamepads:** UHID pads delivered real Xbox-style events, but scrcpy's UHID path pins a device to one
+  display (`InputManager.addUniqueIdAssociationByPort`). Lantern re-associates each pad's input port to
+  the focused window's display on PC focus change. `lanternd` keeps PC gamepads open for the whole session
+  (the GameSir Tegenaria Lite resets on USB every 2–3 s when nothing has it open).
+- **IME:** hidden companion IME delivers exact Unicode and composing text. The watchdog restored
+  `default_input_method` while USB was unplugged. Which display IME policy works best across rebinds is
+  still open.
+- **Notifications:** the PendingIntent-with-launchDisplayId path is only proven in the easy case; the
+  §8.5 fallback is required.
+- **Apps tested** (two games, browser, Settings, Messaging) all ran on Lantern displays.
+
 ## 10. Carry over from PhoneDesk (knowledge, not structure)
 
 - The shell-UID `app_process` helper pattern and token-protected local socket.
