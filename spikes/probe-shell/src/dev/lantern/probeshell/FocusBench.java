@@ -18,6 +18,8 @@ final class FocusBench {
     }
     static void focus(String method,int task,int display) throws Exception {
         if(display<=0)throw new IllegalArgumentException("positive probe display required");
+        long requested=SystemClock.elapsedRealtime();
+        System.out.println("event=focus_request display="+display+" elapsed_ms="+requested+" method="+method);
         if(method.equals("tap")){
             long t=SystemClock.uptimeMillis();
             MotionEvent e=MotionEvent.obtain(t,t,MotionEvent.ACTION_DOWN,30,30,0);e.setSource(InputDevice.SOURCE_TOUCHSCREEN);

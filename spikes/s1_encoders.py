@@ -19,7 +19,7 @@ def measure(n, size, codec, fps, seconds, directory):
             args = [SCRCPY, '-s', SERIAL, f'--new-display={size}/160',
                     '--start-app=dev.lantern.probe', '--no-window', '--no-audio',
                     '--no-vd-system-decorations', '--display-ime-policy=hide',
-                    '--no-downsize-on-error', f'--video-codec={codec}',
+                    '--no-downsize-on-error', f'--port={28100+i}', f'--video-codec={codec}',
                     f'--video-encoder={encoder}', f'--max-fps={fps}',
                     f'--time-limit={seconds}', f'--record={movie}']
             if i == 0:

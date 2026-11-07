@@ -8,6 +8,7 @@ class Session:
     def __init__(self,*args):
         self.process=shell_probe('vd','create',*args)
         self.lines=[]
+        assert self.process.stdout is not None and self.process.stdin is not None
         self.pending=queue.Queue()
         def read():
             for line in self.process.stdout:

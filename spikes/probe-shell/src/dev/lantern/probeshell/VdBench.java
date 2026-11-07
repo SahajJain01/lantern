@@ -76,7 +76,8 @@ final class VdBench implements AutoCloseable {
     }
     void imePolicy(int policy) throws Exception {
         Hidden.call(Hidden.service("WindowManager"),"setDisplayImePolicy",new Class<?>[]{int.class,int.class},id(),policy);
-        System.out.println("OK ime_policy="+policy+" display="+id());
+        Object actual=Hidden.call(Hidden.service("WindowManager"),"getDisplayImePolicy",new Class<?>[]{int.class},id());
+        System.out.println("OK ime_policy="+policy+" actual="+actual+" display="+id());
     }
     void stopCodec(){
         if(codec!=null){try{codec.stop();}catch(Exception ignored){}codec.release();codec=null;}

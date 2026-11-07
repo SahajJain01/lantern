@@ -58,7 +58,10 @@ public class Main {
             System.out.println("OK sdk="+Build.VERSION.SDK_INT+" model="+Build.MODEL);return;
         }
         if(args.length==0){System.err.println("ERR command required");System.exit(2);}
-        Looper.prepareMainLooper();
+        // app_process has no app-owned main looper. Match scrcpy's quit-allowed setup.
+        Looper.prepare();
+        java.lang.reflect.Field main=Looper.class.getDeclaredField("sMainLooper");
+        main.setAccessible(true);main.set(null,Looper.myLooper());
         Hidden.call(Class.forName("com.genymobile.scrcpy.Workarounds"),"apply",new Class<?>[]{});
         final int[] status={0};
         new Thread(()->{
