@@ -81,6 +81,22 @@ retained logcat window — buffer wrap, not coalescing). All 54 redrew; median 1
 encoded frame. Rep 1 includes a no-op 1280×800→1280×800 resize. Codec: HEVC. The pass bar (median
 ≤150 ms) was met, narrowly.
 
+### S6 follow-up: encoder reuse vs recreate (helper Task 4, 2026-11-07)
+`Main --display-test com.android.settings` with the production `AppDisplay`/`Encoder`
+(HEVC `c2.qti.hevc.encoder`, display flags per spec §9b). Each run resizes 1280×800 → 1000×1000
+(encoder 992×992) → 800×1280 → 1280×800. `resize_ms` = from `Encoder.reconfigure` start to the
+first encoded non-config frame at the new size (the spike's metric also included the
+`setSurface(null)` call, which is negligible).
+
+| Path | Samples | min | median | max (ms) |
+|---|---|---|---|---|
+| Reuse: `stop(); configure(); createInputSurface(); start()` on the same `MediaCodec` | 12 (4 runs) | 102 | 112.5 | 123 |
+| Recreate: `release()` + `createByCodecName` (forced with `--recreate`) | 9 (3 runs) | 128 | 134 | 150 |
+
+Reuse never failed on this phone, so recreate is only the fallback. Reuse saves ~20 ms per resize.
+The synchronous part on the caller's thread (`setup_ms`) was 51–56 ms with reuse; the rest is the
+app redrawing and the first frame encoding. Debounce drags regardless.
+
 ### S2 Locked (`spikes/raw/s2_1794054293385894258`)
 The phone has a **swipe keyguard, not a PIN**. A secure lock was not tested, because Sahaj's lock
 settings were left untouched.
