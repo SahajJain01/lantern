@@ -43,6 +43,32 @@ public final class ProtoTest {
         check(json.contains("\"w\":1280"), "w");
     }
 
+    /** The optional host-only activation_token must not break the helper's Open parsing. */
+    static void goldenControlOpenWithTokenParses() throws Exception {
+        Proto.Frame f = readOnly("control_open_token");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(0, f.stream, "stream");
+        Msg m = new TestCodec().decode(f.payload);
+        eq("open", m.t, "t");
+        eq("com.android.settings", m.str("pkg"), "pkg");
+        eq(0L, m.num("user"), "user");
+        eq(1280L, m.num("w"), "w");
+        eq(800L, m.num("h"), "h");
+        eq(160L, m.num("dpi"), "dpi");
+        eq("lantern-xdg-token-1", m.str("activation_token"), "activation_token");
+    }
+
+    /** {"t":"focus"} stays the v1 bytes now that Focus carries an optional activation_token. */
+    static void goldenControlFocusMatchesRust() throws Exception {
+        Proto.Frame f = readOnly("control_focus");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(1, f.stream, "stream");
+        eq("{\"t\":\"focus\"}", new String(f.payload, StandardCharsets.UTF_8), "json");
+        Msg m = new TestCodec().decode(f.payload);
+        eq("focus", m.t, "t");
+        check(m.fields().isEmpty(), "no fields");
+    }
+
     static void goldenInputPointerMatchesRust() throws IOException {
         Proto.Frame f = readOnly("input_pointer");
         eq(Proto.KIND_INPUT, f.kind, "kind");
@@ -205,6 +231,8 @@ public final class ProtoTest {
     public static void main(String[] args) {
         Object[][] cases = {
             {"goldenControlOpenMatchesRust", (Case) ProtoTest::goldenControlOpenMatchesRust},
+            {"goldenControlOpenWithTokenParses", (Case) ProtoTest::goldenControlOpenWithTokenParses},
+            {"goldenControlFocusMatchesRust", (Case) ProtoTest::goldenControlFocusMatchesRust},
             {"goldenInputPointerMatchesRust", (Case) ProtoTest::goldenInputPointerMatchesRust},
             {"goldenInputKeyMatchesRust", (Case) ProtoTest::goldenInputKeyMatchesRust},
             {"goldenVideoKeyMatchesRust", (Case) ProtoTest::goldenVideoKeyMatchesRust},

@@ -177,6 +177,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "lantern-proto",
+ "libc",
  "rand",
  "sha2",
  "tokio",

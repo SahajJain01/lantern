@@ -1,0 +1,493 @@
+//! Daemon <-> window IPC over `$XDG_RUNTIME_DIR/lantern/daemon.sock`.
+//!
+//! Each `lantern open` process is one client. Its first frame is `Control::Open` on stream 0;
+//! the daemon claims `pkg:user` in the [`Registry`]:
+//! - New window `N`: the Open (minus `activation_token`) goes to the helper on stream `N`, and
+//!   from then on frames on stream `N` pass through unchanged in both directions.
+//! - Already open: the existing window's client gets `focus{activation_token}` on its stream,
+//!   the new client gets `focus` (stream = existing id) and is closed.
+//!
+//! The helper side is never blocked by a client: each client has a bounded outbound queue, and a
+//! client that overflows it is dropped exactly as if it had disconnected (close = quit).
+
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, Kind};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::task::AbortHandle;
+use tokio::time::timeout;
+
+use super::registry::{Claim, Registry};
+
+/// Frames queued per client before it counts as stuck (~4 s of 60 fps video).
+pub const CLIENT_QUEUE: usize = 240;
+/// A single write to a client that takes longer than this ends that client.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the daemon waits for room in the helper's outbound queue before declaring the
+/// helper wedged (the session is then restarted).
+const HELPER_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
+pub const NOT_CONNECTED: &str = "phone not connected";
+
+pub fn socket_path_in(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join("lantern").join("daemon.sock")
+}
+
+/// `$XDG_RUNTIME_DIR`, which must be set to an absolute path.
+pub fn runtime_dir() -> Result<PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
+        .context("XDG_RUNTIME_DIR is not set")?;
+    let dir = PathBuf::from(dir);
+    if !dir.is_absolute() {
+        bail!("XDG_RUNTIME_DIR {} is not absolute", dir.display());
+    }
+    Ok(dir)
+}
+
+/// Restores the previous umask on drop.
+struct Umask(libc::mode_t);
+
+impl Umask {
+    fn set(mask: libc::mode_t) -> Self {
+        // SAFETY: umask has no memory-safety preconditions.
+        Self(unsafe { libc::umask(mask) })
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe { libc::umask(self.0) };
+    }
+}
+
+/// Creates `<runtime_dir>/lantern` (mode 0700, owned by us) and listens on `daemon.sock` in it.
+/// A leftover socket nobody listens on is replaced; a live one means another daemon is running.
+pub fn bind(runtime_dir: &Path) -> Result<UnixListener> {
+    let dir = runtime_dir.join("lantern");
+    let sock = socket_path_in(runtime_dir);
+    let _umask = Umask::set(0o077);
+
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("create {}", dir.display())),
+    }
+    let meta =
+        std::fs::symlink_metadata(&dir).with_context(|| format!("stat {}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        bail!("{} exists and is not a directory; remove it", dir.display());
+    }
+    // SAFETY: geteuid cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        bail!(
+            "{} is owned by uid {}, not by us (uid {me}); refusing to use it",
+            dir.display(),
+            meta.uid()
+        );
+    }
+    if meta.permissions().mode() & 0o7777 != 0o700 {
+        tracing::warn!(dir = %dir.display(), mode = format!("{:o}", meta.permissions().mode() & 0o7777), "tightening socket dir to 0700");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    }
+
+    match std::fs::symlink_metadata(&sock) {
+        Ok(meta) => {
+            if !meta.file_type().is_socket() {
+                bail!("{} exists and is not a socket; remove it", sock.display());
+            }
+            if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                bail!(
+                    "lanternd is already running (socket {} is live)",
+                    sock.display()
+                );
+            }
+            tracing::info!(sock = %sock.display(), "removing stale socket");
+            std::fs::remove_file(&sock)
+                .with_context(|| format!("remove stale {}", sock.display()))?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("stat {}", sock.display())),
+    }
+    UnixListener::bind(&sock).with_context(|| format!("listen on {}", sock.display()))
+}
+
+/// The helper stopped draining its queue for [`HELPER_SEND_TIMEOUT`]; the session should end.
+#[derive(Debug)]
+pub struct HelperWedged;
+
+pub enum ClientEvent {
+    Frame(u64, Frame),
+    Gone(u64),
+}
+
+struct Client {
+    out: mpsc::Sender<Frame>,
+    /// The window this client owns, once its Open was accepted as new.
+    win: Option<u32>,
+    reader: AbortHandle,
+    writer: AbortHandle,
+}
+
+impl Client {
+    /// Closes the client after its queued frames are flushed (the writer ends when `out` drops).
+    fn finish(self) {
+        drop(self);
+    }
+
+    /// Closes the client now, discarding anything queued.
+    fn kill(self) {
+        self.writer.abort();
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+fn control(stream: u32, c: Control) -> Frame {
+    Frame {
+        kind: Kind::Control,
+        stream,
+        payload: c.encode(),
+    }
+}
+
+/// Client frames allowed on a window's own stream.
+fn client_frame_ok(frame: &Frame) -> bool {
+    match frame.kind {
+        Kind::Input => true,
+        Kind::Video => false,
+        Kind::Control => matches!(
+            Control::decode(&frame.payload),
+            Ok(Control::Resize { .. } | Control::Focus { .. } | Control::Close)
+        ),
+    }
+}
+
+/// Sends to the helper without ever blocking for long: a full queue gets
+/// [`HELPER_SEND_TIMEOUT`] to drain. A closed queue means the session is already ending, which
+/// the run loop notices on its own.
+async fn to_helper(helper: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), HelperWedged> {
+    match helper.try_send(frame) {
+        Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
+        Err(TrySendError::Full(frame)) => {
+            match timeout(HELPER_SEND_TIMEOUT, helper.send(frame)).await {
+                Ok(_) => Ok(()),
+                Err(_) => Err(HelperWedged),
+            }
+        }
+    }
+}
+
+/// Routes frames between window clients and the current helper session.
+pub struct Hub {
+    listener: Option<UnixListener>,
+    clients: HashMap<u64, Client>,
+    windows: HashMap<u32, u64>,
+    registry: Registry,
+    next_cid: u64,
+    events_tx: mpsc::Sender<ClientEvent>,
+    events: mpsc::Receiver<ClientEvent>,
+}
+
+impl Hub {
+    /// A hub without a listener only drains helper frames (used by `run_loop`).
+    pub fn new(listener: Option<UnixListener>) -> Self {
+        let (events_tx, events) = mpsc::channel(256);
+        Self {
+            listener,
+            clients: HashMap::new(),
+            windows: HashMap::new(),
+            registry: Registry::default(),
+            next_cid: 0,
+            events_tx,
+            events,
+        }
+    }
+
+    /// The listener's socket path, if any.
+    pub fn socket_path(&self) -> Option<PathBuf> {
+        let addr = self.listener.as_ref()?.local_addr().ok()?;
+        addr.as_pathname().map(Path::to_path_buf)
+    }
+
+    /// Accepts clients until one of them has something to say. Cancel-safe.
+    pub async fn next_event(&mut self) -> ClientEvent {
+        loop {
+            let accepted = tokio::select! {
+                event = self.events.recv() => return event.expect("hub holds a sender"),
+                accepted = async { self.listener.as_ref().expect("guarded").accept().await },
+                    if self.listener.is_some() => accepted,
+            };
+            match accepted {
+                Ok((stream, _)) => self.add_client(stream),
+                Err(error) => {
+                    tracing::warn!(%error, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn add_client(&mut self, stream: UnixStream) {
+        self.next_cid += 1;
+        let cid = self.next_cid;
+        let (mut rd, mut wr) = stream.into_split();
+        let (out, mut queue) = mpsc::channel::<Frame>(CLIENT_QUEUE);
+        let events = self.events_tx.clone();
+        let reader = tokio::spawn(async move {
+            loop {
+                match read_frame_async(&mut rd).await {
+                    Ok(Some(frame)) => {
+                        if events.send(ClientEvent::Frame(cid, frame)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(cid, %error, "client read failed");
+                        break;
+                    }
+                }
+            }
+            let _ = events.send(ClientEvent::Gone(cid)).await;
+        });
+        let writer = tokio::spawn(async move {
+            while let Some(frame) = queue.recv().await {
+                match timeout(CLIENT_WRITE_TIMEOUT, write_frame_async(&mut wr, &frame)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::debug!(cid, %error, "client write failed");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(cid, "client write timed out");
+                        break;
+                    }
+                }
+            }
+            // Dropping the write half shuts it down: the client reads EOF.
+        });
+        tracing::debug!(cid, "client connected");
+        self.clients.insert(
+            cid,
+            Client {
+                out,
+                win: None,
+                reader: reader.abort_handle(),
+                writer: writer.abort_handle(),
+            },
+        );
+    }
+
+    /// Sends `frame` to `cid` and closes it after the flush.
+    fn reply_and_finish(&mut self, cid: u64, frame: Frame) {
+        if let Some(client) = self.clients.remove(&cid) {
+            let _ = client.out.try_send(frame);
+            client.finish();
+        }
+    }
+
+    /// Drops a client now. A window it owned is closed on the phone (close = quit) and released.
+    async fn drop_client(
+        &mut self,
+        cid: u64,
+        helper: Option<&mpsc::Sender<Frame>>,
+    ) -> Result<(), HelperWedged> {
+        let Some(client) = self.clients.remove(&cid) else {
+            return Ok(());
+        };
+        let win = client.win;
+        client.kill();
+        if let Some(win) = win {
+            self.windows.remove(&win);
+            self.registry.release(win);
+            tracing::info!(cid, win, "window client gone; closing window");
+            if let Some(helper) = helper {
+                return to_helper(helper, control(win, Control::Close)).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles one client event. `helper` is the live session's outbound queue, if any.
+    pub async fn on_client(
+        &mut self,
+        event: ClientEvent,
+        helper: Option<&mpsc::Sender<Frame>>,
+    ) -> Result<(), HelperWedged> {
+        let (cid, frame) = match event {
+            ClientEvent::Gone(cid) => return self.drop_client(cid, helper).await,
+            ClientEvent::Frame(cid, frame) => (cid, frame),
+        };
+        let Some(client) = self.clients.get(&cid) else {
+            return Ok(());
+        };
+        match client.win {
+            None => self.on_open(cid, frame, helper).await,
+            Some(win) if frame.stream == win && client_frame_ok(&frame) => match helper {
+                Some(helper) => to_helper(helper, frame).await,
+                None => Ok(()),
+            },
+            Some(win) => {
+                tracing::warn!(cid, win, stream = frame.stream, kind = ?frame.kind, "client protocol error; dropping it");
+                self.drop_client(cid, helper).await
+            }
+        }
+    }
+
+    async fn on_open(
+        &mut self,
+        cid: u64,
+        frame: Frame,
+        helper: Option<&mpsc::Sender<Frame>>,
+    ) -> Result<(), HelperWedged> {
+        let open = (frame.kind == Kind::Control && frame.stream == 0)
+            .then(|| Control::decode(&frame.payload).ok())
+            .flatten();
+        let Some(Control::Open {
+            pkg,
+            user,
+            w,
+            h,
+            dpi,
+            activation_token,
+        }) = open
+        else {
+            tracing::warn!(cid, "first client frame was not open on stream 0");
+            let msg = "first frame must be open on stream 0".to_owned();
+            self.reply_and_finish(cid, control(0, Control::Error { msg }));
+            return Ok(());
+        };
+        let Some(helper) = helper else {
+            self.reply_and_finish(
+                cid,
+                control(
+                    0,
+                    Control::Error {
+                        msg: NOT_CONNECTED.into(),
+                    },
+                ),
+            );
+            return Ok(());
+        };
+        match self.registry.claim(&format!("{pkg}:{user}")) {
+            Claim::New(win) => {
+                tracing::info!(cid, win, pkg, user, "opening window");
+                if let Some(client) = self.clients.get_mut(&cid) {
+                    client.win = Some(win);
+                }
+                self.windows.insert(win, cid);
+                let open = Control::Open {
+                    pkg,
+                    user,
+                    w,
+                    h,
+                    dpi,
+                    activation_token: None,
+                };
+                to_helper(helper, control(win, open)).await
+            }
+            Claim::Existing(win) => {
+                tracing::info!(cid, win, pkg, user, "already open; focusing");
+                if let Some(&owner) = self.windows.get(&win) {
+                    self.send_to_client(
+                        owner,
+                        control(win, Control::Focus { activation_token }),
+                        Some(helper),
+                    )
+                    .await?;
+                }
+                self.reply_and_finish(
+                    cid,
+                    control(
+                        win,
+                        Control::Focus {
+                            activation_token: None,
+                        },
+                    ),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Queues `frame` for a window client; one that cannot keep up is dropped.
+    async fn send_to_client(
+        &mut self,
+        cid: u64,
+        frame: Frame,
+        helper: Option<&mpsc::Sender<Frame>>,
+    ) -> Result<(), HelperWedged> {
+        let Some(client) = self.clients.get(&cid) else {
+            return Ok(());
+        };
+        match client.out.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(cid, win = ?client.win, "client queue overflowed; dropping it");
+                self.drop_client(cid, helper).await
+            }
+            Err(TrySendError::Closed(_)) => self.drop_client(cid, helper).await,
+        }
+    }
+
+    /// Handles one frame from the helper.
+    pub async fn on_helper(
+        &mut self,
+        frame: Frame,
+        helper: &mpsc::Sender<Frame>,
+    ) -> Result<(), HelperWedged> {
+        if frame.stream == 0 {
+            match Control::decode(&frame.payload) {
+                Ok(Control::Error { msg }) => tracing::error!(msg, "helper session error"),
+                other => tracing::debug!(?other, "helper stream-0 frame"),
+            }
+            return Ok(());
+        }
+        let win = frame.stream;
+        // Unknown or already-released window (e.g. the closed answering our close): ignore.
+        let Some(&cid) = self.windows.get(&win) else {
+            return Ok(());
+        };
+        let closed = frame.kind == Kind::Control
+            && matches!(Control::decode(&frame.payload), Ok(Control::Closed { .. }));
+        if closed {
+            tracing::info!(cid, win, "window closed by helper");
+            self.windows.remove(&win);
+            self.registry.release(win);
+            if let Some(client) = self.clients.get_mut(&cid) {
+                client.win = None;
+            }
+            self.reply_and_finish(cid, frame);
+            return Ok(());
+        }
+        self.send_to_client(cid, frame, Some(helper)).await
+    }
+
+    /// The helper session ended: every window client is closed (it exits) and the registry
+    /// starts over for the next session. Clients still waiting to send Open are kept.
+    pub fn reset(&mut self) {
+        let windowed: Vec<u64> = self.windows.values().copied().collect();
+        for cid in windowed {
+            if let Some(client) = self.clients.remove(&cid) {
+                client.finish();
+            }
+        }
+        self.windows.clear();
+        self.registry = Registry::default();
+    }
+}

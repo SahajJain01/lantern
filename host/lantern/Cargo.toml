@@ -9,6 +9,7 @@ anyhow = "1"
 async-stream = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
+libc = "0.2"
 lantern-proto = { path = "../proto" }
 rand = "0.8"
 sha2 = "0.10"

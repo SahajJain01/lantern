@@ -34,11 +34,11 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `t` | fields |
 |---|---|
 | `hello` | `version: u32`, `token: string` |
-| `open` | `pkg: string`, `user: u32`, `w: u32`, `h: u32`, `dpi: u32` |
+| `open` | `pkg: string`, `user: u32`, `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string` |
 | `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32` |
 | `resize` | `w: u32`, `h: u32`, `dpi: u32` |
 | `resized` | `w: u32`, `h: u32` |
-| `focus` | none |
+| `focus` | optional `activation_token: string` |
 | `close` | none |
 | `closed` | `reason`: one of `"closed"`, `"app_exited"`, `"error"` |
 | `error` | `msg: string` |
@@ -57,6 +57,37 @@ JSON objects tagged by `"t"` (snake_case). Example:
 - Frames for an unknown or already-closed window are ignored. A protocol error (bad JSON, unknown
   `t`, bad input payload, video from the host) ends the session with `error{msg}` on stream 0.
 - `bye` (or EOF) ends the session: the helper closes every window without sending `closed`.
+
+`activation_token` is an XDG activation token used only between `lanternd` and window clients.
+It is omitted from the JSON when absent (so `{"t":"focus"}` is the plain focus), the daemon never
+sends it to the helper, and the helper ignores unknown keys.
+
+## Window IPC (lanternd ↔ `lantern open`)
+
+The same frames, over the Unix socket `$XDG_RUNTIME_DIR/lantern/daemon.sock`. Its directory is
+created mode `0700` (umask `077`) and must be owned by the user; a stale socket file is replaced
+on start, a live one means another daemon is running. The daemon listens even without a phone.
+
+- One client per window. Its first frame must be `open` on stream 0, carrying the client's
+  `XDG_ACTIVATION_TOKEN` as `activation_token` if it has one. Anything else first gets
+  `error{msg}` on stream 0 and the connection is closed.
+- No phone session: `error{msg:"phone not connected"}` on stream 0, then close.
+- New `pkg`/`user`: the daemon assigns window id `N` (from 1, never reused within a helper
+  session) and forwards the `open` to the helper on stream `N` without `activation_token`. The
+  helper's `opened`, `video`, `resized`, `error` and `closed` on `N` reach the client unchanged.
+- Already open as window `M`: the existing window's client gets `focus{activation_token}` on
+  stream `M` (it activates its window with that token); the new client gets `focus` with stream
+  `M` and is closed. It should exit 0.
+- After `opened`, the client sends `resize`, `focus`, `close` and input on stream `N`, forwarded
+  unchanged. A frame on any other stream, video, or another control type is a protocol error:
+  the client is dropped.
+- `closed` from the helper is forwarded, then the client is closed and `N` released.
+- Client disconnect (or drop) without `closed`: the daemon sends `close` on `N` (close = quit)
+  and releases `N`.
+- A client that falls 240 frames behind is dropped, as a disconnect. The helper is never
+  blocked by a slow window.
+- Helper session end or restart, daemon shutdown or daemon death: every window client reads EOF
+  and exits. Window ids start over with the next session.
 
 ## Golden vectors
 

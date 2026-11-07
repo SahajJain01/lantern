@@ -147,11 +147,25 @@ pub enum CloseReason {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Control {
     Hello { version: u32, token: String },
-    Open { pkg: String, user: u32, w: u32, h: u32, dpi: u32 },
+    Open {
+        pkg: String,
+        user: u32,
+        w: u32,
+        h: u32,
+        dpi: u32,
+        /// XDG activation token of the `lantern open` process (host-only; the daemon strips it
+        /// before forwarding to the helper). Absent on the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation_token: Option<String>,
+    },
     Opened { display: i32, task: i32, codec: String, w: u32, h: u32 },
     Resize { w: u32, h: u32, dpi: u32 },
     Resized { w: u32, h: u32 },
-    Focus,
+    /// `{"t":"focus"}` when `activation_token` is `None`, byte-identical to the v1 unit form.
+    Focus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation_token: Option<String>,
+    },
     Close,
     Closed { reason: CloseReason },
     Error { msg: String },
@@ -423,7 +437,7 @@ mod tests {
 
     #[test]
     fn control_json_shape() {
-        let c = Control::Open { pkg: "com.android.settings".into(), user: 0, w: 1280, h: 800, dpi: 160 };
+        let c = Control::Open { pkg: "com.android.settings".into(), user: 0, w: 1280, h: 800, dpi: 160, activation_token: None };
         assert_eq!(
             serde_json::to_string(&c).unwrap(),
             r#"{"t":"open","pkg":"com.android.settings","user":0,"w":1280,"h":800,"dpi":160}"#
@@ -431,8 +445,24 @@ mod tests {
     }
 
     #[test]
+    fn activation_token_is_optional_on_open_and_focus() {
+        let open = Control::Open { pkg: "p".into(), user: 0, w: 1, h: 2, dpi: 3, activation_token: Some("tok".into()) };
+        let s = serde_json::to_string(&open).unwrap();
+        assert_eq!(s, r#"{"t":"open","pkg":"p","user":0,"w":1,"h":2,"dpi":3,"activation_token":"tok"}"#);
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), open);
+        let bare: Control = serde_json::from_str(r#"{"t":"open","pkg":"p","user":0,"w":1,"h":2,"dpi":3}"#).unwrap();
+        assert!(matches!(bare, Control::Open { activation_token: None, .. }));
+
+        let focus = Control::Focus { activation_token: Some("tok".into()) };
+        let s = serde_json::to_string(&focus).unwrap();
+        assert_eq!(s, r#"{"t":"focus","activation_token":"tok"}"#);
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), focus);
+        assert_eq!(serde_json::from_str::<Control>(r#"{"t":"focus"}"#).unwrap(), Control::Focus { activation_token: None });
+    }
+
+    #[test]
     fn control_unit_and_reason_shapes() {
-        assert_eq!(serde_json::to_string(&Control::Focus).unwrap(), r#"{"t":"focus"}"#);
+        assert_eq!(serde_json::to_string(&Control::Focus { activation_token: None }).unwrap(), r#"{"t":"focus"}"#);
         assert_eq!(serde_json::to_string(&Control::Bye).unwrap(), r#"{"t":"bye"}"#);
         let c = Control::Closed { reason: CloseReason::AppExited };
         let s = serde_json::to_string(&c).unwrap();

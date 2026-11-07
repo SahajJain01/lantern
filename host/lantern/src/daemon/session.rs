@@ -21,6 +21,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Why a live session ended on its own (as opposed to being closed by the daemon).
 pub type EndReason = &'static str;
 
+/// What [`SessionConn::next`] yields.
+pub enum Inbound {
+    Frame(Frame),
+    Ended(EndReason),
+}
+
 pub struct SessionConn {
     pub tx: mpsc::Sender<Frame>,
     pub rx: mpsc::Receiver<Frame>,
@@ -119,6 +125,26 @@ impl SessionConn {
     /// Cancel-safe; pending forever while the session is healthy.
     pub async fn closed(&mut self) -> EndReason {
         self.done.recv().await.unwrap_or("session tasks ended")
+    }
+
+    /// The next frame from the helper, or why the session ended. Cancel-safe. Consuming `rx`
+    /// through this keeps the reader task from stalling on a full inbound queue, which would
+    /// otherwise also hide socket EOF.
+    pub async fn next(&mut self) -> Inbound {
+        tokio::select! {
+            frame = self.rx.recv() => match frame {
+                Some(frame) => Inbound::Frame(frame),
+                // The reader reports why on `done` before it exits.
+                None => Inbound::Ended(
+                    timeout(Duration::from_secs(1), self.done.recv())
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or("helper connection ended"),
+                ),
+            },
+            why = self.done.recv() => Inbound::Ended(why.unwrap_or("session tasks ended")),
+        }
     }
 
     /// Closes both socket halves before waiting for the helper. A jammed peer therefore cannot
