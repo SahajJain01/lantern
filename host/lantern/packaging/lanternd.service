@@ -1,0 +1,9 @@
+[Unit]
+Description=Lantern Android application daemon
+
+[Service]
+ExecStart=%h/.local/bin/lantern daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
