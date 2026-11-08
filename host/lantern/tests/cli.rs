@@ -201,3 +201,98 @@ fn open_with_user_reaches_the_daemon_step() {
         );
     }
 }
+
+#[test]
+fn open_rejects_bad_packages_and_user_forms() {
+    for args in [
+        &["open", "com.exa mple"][..],
+        &["open", "com.example;rm"],
+        &["open", "com/example"],
+        &["open", "com.example-u10"],
+        &["open", "--user", "+10", "com.example"],
+        &["open", "--user", "010", "com.example"],
+        &["open", "--user=00", "com.example"],
+    ] {
+        let dir = scratch("open-bad-pkg");
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} stderr: {stderr}");
+        assert!(stderr.contains("usage:"), "{args:?} stderr: {stderr}");
+    }
+}
+
+/// One frame of the window<->daemon wire: len (payload + 5), kind, stream, payload.
+fn control_frame(stream: u32, json: &str) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&(json.len() as u32 + 5).to_be_bytes());
+    f.push(1);
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(json.as_bytes());
+    f
+}
+
+#[test]
+fn failed_open_prints_the_error_once_and_exits_1() {
+    use std::io::{Read, Write};
+    // The window process needs a Wayland connection for its event loop, but never opens a window
+    // here (the open fails before `opened`).
+    let wayland = match (
+        std::env::var("WAYLAND_DISPLAY"),
+        std::env::var("XDG_RUNTIME_DIR"),
+    ) {
+        (Ok(d), _) if d.starts_with('/') => d,
+        (Ok(d), Ok(rt)) if !d.is_empty() => format!("{rt}/{d}"),
+        _ => {
+            eprintln!("skipped: no Wayland session");
+            return;
+        }
+    };
+    // Short: a Unix socket path must fit in sun_path (108 bytes).
+    let dir = std::env::temp_dir().join(format!("lantern-f{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let sock_dir = dir.join("lantern");
+    std::fs::create_dir_all(&sock_dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(sock_dir.join("daemon.sock")).unwrap();
+    let daemon = std::thread::spawn(move || {
+        let (mut c, _) = listener.accept().unwrap();
+        // The window's `open` frame.
+        let mut head = [0u8; 9];
+        c.read_exact(&mut head).unwrap();
+        let len = u32::from_be_bytes(head[0..4].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len - 5];
+        c.read_exact(&mut payload).unwrap();
+        // What lanternd sends for an open the phone refused, then EOF.
+        c.write_all(&control_frame(
+            1,
+            r#"{"t":"error","msg":"no such app on the phone"}"#,
+        ))
+        .unwrap();
+        c.write_all(&control_frame(1, r#"{"t":"closed","reason":"error"}"#))
+            .unwrap();
+        drop(c);
+        String::from_utf8(payload).unwrap()
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .args(["open", "com.example"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("WAYLAND_DISPLAY", &wayland)
+        .output()
+        .unwrap();
+    let open = daemon.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(open.contains("\"open\""), "first frame: {open}");
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    // The user-facing line (tracing log lines may mention the message too).
+    let printed = stderr
+        .lines()
+        .filter(|l| l.starts_with("lantern: ") && l.contains("no such app on the phone"))
+        .count();
+    assert_eq!(printed, 1, "printed once: {stderr}");
+}

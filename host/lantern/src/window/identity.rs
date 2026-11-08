@@ -26,14 +26,28 @@ impl Identity {
                 if user.is_some() {
                     return Err("--user given twice".into());
                 }
-                let n: u32 = v.parse().ok().filter(|n| *n <= MAX_USER).ok_or_else(|| {
-                    format!("--user {v:?}: not an Android user id (0..={MAX_USER})")
-                })?;
+                // Plain decimal only: no sign, no leading zeros (u32::parse accepts "+10", "010").
+                let canonical = !v.is_empty()
+                    && v.bytes().all(|b| b.is_ascii_digit())
+                    && (v == "0" || !v.starts_with('0'));
+                let n: u32 = v
+                    .parse()
+                    .ok()
+                    .filter(|n| canonical && *n <= MAX_USER)
+                    .ok_or_else(|| {
+                        format!("--user {v:?}: not an Android user id (0..={MAX_USER})")
+                    })?;
                 user = Some(n);
             } else if arg.starts_with('-') {
                 return Err(format!("unknown option {arg:?}"));
             } else if arg.is_empty() {
                 return Err("empty package name".into());
+            } else if !arg
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+            {
+                // Android package names use only these; the app_id/size-key schemes rely on it.
+                return Err(format!("{arg:?} is not an Android package name"));
             } else if pkg.replace(arg).is_some() {
                 return Err("only one package".into());
             }
@@ -113,6 +127,14 @@ mod tests {
             &["--user", "1", "--user", "2", "com.a"],
             &["--uesr", "1", "com.a"],
             &["com.a", "com.b"],
+            &["--user", "+10", "com.a"],
+            &["--user", "010", "com.a"],
+            &["--user=00", "com.a"],
+            &["--user", " 1", "com.a"],
+            &["com.a-u10"],
+            &["com a"],
+            &["com/a"],
+            &["com.á"],
             &[""],
             &[],
         ] {
