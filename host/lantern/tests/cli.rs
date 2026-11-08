@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[test]
 fn unknown_subcommand_is_a_clear_error() {
@@ -236,21 +237,37 @@ fn control_frame(stream: u32, json: &str) -> Vec<u8> {
     f
 }
 
+/// Waits for `child` up to `limit`, killing it on timeout; returns its output.
+fn output_within(mut child: std::process::Child, limit: Duration) -> std::process::Output {
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "lantern open did not exit within {limit:?}; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
 #[test]
+#[ignore = "needs a Wayland session: the window process opens its event loop before the daemon answers (run with --ignored in a desktop session)"]
 fn failed_open_prints_the_error_once_and_exits_1() {
     use std::io::{Read, Write};
     // The window process needs a Wayland connection for its event loop, but never opens a window
-    // here (the open fails before `opened`).
+    // here (the open fails before `opened`). Ignored by default; when run, a missing session is a
+    // failure, not a silent pass.
     let wayland = match (
         std::env::var("WAYLAND_DISPLAY"),
         std::env::var("XDG_RUNTIME_DIR"),
     ) {
         (Ok(d), _) if d.starts_with('/') => d,
         (Ok(d), Ok(rt)) if !d.is_empty() => format!("{rt}/{d}"),
-        _ => {
-            eprintln!("skipped: no Wayland session");
-            return;
-        }
+        _ => panic!("no Wayland session (WAYLAND_DISPLAY unset): this test needs one"),
     };
     // Short: a Unix socket path must fit in sun_path (108 bytes).
     let dir = std::env::temp_dir().join(format!("lantern-f{}", std::process::id()));
@@ -258,14 +275,32 @@ fn failed_open_prints_the_error_once_and_exits_1() {
     let sock_dir = dir.join("lantern");
     std::fs::create_dir_all(&sock_dir).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(sock_dir.join("daemon.sock")).unwrap();
-    let daemon = std::thread::spawn(move || {
-        let (mut c, _) = listener.accept().unwrap();
+    // Never block forever: the window may fail before connecting or before sending `open`.
+    listener.set_nonblocking(true).unwrap();
+    let daemon = std::thread::spawn(move || -> Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut c = loop {
+            match listener.accept() {
+                Ok((c, _)) => break c,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() > deadline {
+                        return Err("the window never connected".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(format!("accept: {e}")),
+            }
+        };
+        c.set_nonblocking(false).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         // The window's `open` frame.
         let mut head = [0u8; 9];
-        c.read_exact(&mut head).unwrap();
+        c.read_exact(&mut head)
+            .map_err(|e| format!("no open frame: {e}"))?;
         let len = u32::from_be_bytes(head[0..4].try_into().unwrap()) as usize;
         let mut payload = vec![0u8; len - 5];
-        c.read_exact(&mut payload).unwrap();
+        c.read_exact(&mut payload)
+            .map_err(|e| format!("short open frame: {e}"))?;
         // What lanternd sends for an open the phone refused, then EOF.
         c.write_all(&control_frame(
             1,
@@ -275,18 +310,22 @@ fn failed_open_prints_the_error_once_and_exits_1() {
         c.write_all(&control_frame(1, r#"{"t":"closed","reason":"error"}"#))
             .unwrap();
         drop(c);
-        String::from_utf8(payload).unwrap()
+        Ok(String::from_utf8(payload).unwrap())
     });
-    let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+    let child = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .args(["open", "com.example"])
         .env("XDG_RUNTIME_DIR", &dir)
         .env("XDG_STATE_HOME", dir.join("state"))
         .env("WAYLAND_DISPLAY", &wayland)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    let output = output_within(child, Duration::from_secs(20));
     let open = daemon.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8(output.stderr).unwrap();
+    let open = open.unwrap_or_else(|e| panic!("{e}; stderr: {stderr}"));
     assert!(open.contains("\"open\""), "first frame: {open}");
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     // The user-facing line (tracing log lines may mention the message too).
