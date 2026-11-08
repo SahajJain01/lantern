@@ -55,8 +55,17 @@ Write each plan with superpowers:writing-plans, using the spec as the authority,
 superpowers:subagent-driven-development, as Plan 1 was.
 
 - **Plan 2:**
-  - KDE launcher entries and icons that follow the phone's apps (spec §7.1, §8.3). Window titles and
-    labels currently show the package name.
+  - KDE launcher entries and icons that follow the phone's apps (spec §7.1, §8.3).
+  - **Window titles show the app's name, not its package name.** Today the title is the raw package
+    (e.g. `com.google.android.apps.nbu.files`, or `… (user 10)` for work apps), set in
+    `host/lantern/src/window/mod.rs` (see `window/identity.rs`).
+    - Fix: the helper reads the app's label for that user (`ApplicationInfo.loadLabel`, or the label
+      LauncherApps returns for blocked work profiles) and sends it to the window, e.g. as an optional
+      `label` field in `opened`. The window uses it as the title, with " (work)" for a managed profile
+      instead of "(user N)".
+    - Also use the label and icon for the taskbar entry and the `.desktop` file.
+    - Keep the Wayland app_id unchanged (`lantern.<pkg>[-u<N>]`), because KDE uses it for the
+      window's identity.
   - Hidden-IME text input, including Vietnamese composition. The spike proved this in the probe app.
     Restoring the IME after a USB unplug must stay airtight.
   - Text clipboard, both directions (§8.6).
