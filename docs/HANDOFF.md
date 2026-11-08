@@ -81,6 +81,12 @@ superpowers:subagent-driven-development, as Plan 1 was.
     `docs/protocol.md`).
   - A latency harness, and the target from spec §9a/§11: no more than 5 ms worse than scrcpy.
 
+App note: in Microsoft Windows App (`com.microsoft.rdc.androidx`), when a remote session is
+letterboxed (its resolution differs from the window's aspect), the cursor is offset by the width of
+the black strip. That is Windows App's own mapping bug. Fix: set the connection's display resolution
+to "Match current display". If that ever isn't enough, add an optional per-app `--aspect W:H` to
+Lantern, so the phone display keeps that aspect and the PC window letterboxes instead.
+
 Still unverified: PIN keyguard, third-party notification clicks, IME text in real apps, rotation
 started by the app on a real device, long runs with 5–6 encoders, and interactive play in games.
 
