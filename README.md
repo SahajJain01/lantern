@@ -53,10 +53,18 @@ lantern status                        # daemon state as JSON
 `--user N` (default `0`) picks the Android user or profile the app runs as; `adb shell pm list
 users` lists them. Each user's copy of an app is its own window: Wayland app_id
 `lantern.<pkg>` for user 0 and `lantern.<pkg>-u<N>` otherwise, title `<pkg> (user N)`, and its own
-remembered size. The phone refuses (and the window prints why) when the user does not exist, is
-not running (a paused work profile), does not have the app, or **does not allow adb**: a work
-profile whose admin (Intune and most MDMs) sets `no_debugging_features` bars the adb shell user,
-which Lantern runs as, from that profile entirely. Such work profiles cannot be shown.
+remembered size. `<pkg>` must be a package name (letters, digits, `_`, `.`), and `N` a plain
+decimal number; anything else is a usage error (exit 2).
+
+Work profiles whose admin bars adb (Intune and most MDMs set `no_debugging_features`, so
+`am start --user 10` says "Shell does not have permission to access user 10") still open: for a
+profile of the current user (work profile, private space, clone) Lantern lists and starts the app
+through Android's LauncherApps service, the same cross-profile path the phone's own launcher uses.
+Users that are not profiles of the current user and also bar adb cannot be opened. The phone
+refuses (and the window prints why) when the user does not exist, is not running or not unlocked
+(a paused work profile), or does not have the app. A profile app that already has a task on the
+phone's own screen may be moved onto its Lantern window (LauncherApps cannot ask for a new task),
+and closing that window then quits it.
 
 `lantern status` prints `{"state":"idle|starting|ready","serial":…,"helper":<jar sha256>,"windows":[{"id","pkg","user"}]}`.
 Logs: `journalctl --user -u lanternd`. Set `LANTERN_LOG=debug` for more detail.

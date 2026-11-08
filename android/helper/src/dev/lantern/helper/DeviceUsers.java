@@ -14,6 +14,10 @@ import java.util.List;
 final class DeviceUsers implements UserLaunch.Backend {
     /** UserManager.DISALLOW_DEBUGGING_FEATURES. */
     static final String NO_DEBUGGING = "no_debugging_features";
+    /** ActivityManager.FLAG_AND_UNLOCKED: isUserRunning is false for a RUNNING_LOCKED user. */
+    static final int FLAG_AND_UNLOCKED = 4;
+    /** Process.SHELL_UID. */
+    static final int SHELL_UID = 2000;
 
     private final Object um;
     private final Object am;
@@ -44,7 +48,65 @@ final class DeviceUsers implements UserLaunch.Backend {
 
     @Override
     public boolean running(int user) {
-        return (boolean) call(am, "isUserRunning", user, 0);
+        return (boolean) call(am, "isUserRunning", user, FLAG_AND_UNLOCKED);
+    }
+
+    @Override
+    public boolean isShell() {
+        return android.os.Process.myUid() == SHELL_UID;
+    }
+
+    @Override
+    public int[] profiles() {
+        List<?> handles = (List<?>) call(launcherApps(), "getUserProfiles");
+        int[] ids = new int[handles.size()];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = (int) call(handles.get(i), "getIdentifier");
+        }
+        return ids;
+    }
+
+    @Override
+    public String profileLauncherActivity(String pkg, int user) {
+        // ILauncherApps.getLauncherActivities(callingPackage, packageName, user) -> ParceledListSlice
+        // of LauncherActivityInfoInternal; null when LauncherApps won't serve that user.
+        Object slice = call(launcherApps(), "getLauncherActivities", com.genymobile.scrcpy.FakeContext.PACKAGE_NAME,
+            pkg, handle(user));
+        List<?> list = slice == null ? null : (List<?>) call(slice, "getList");
+        if (list == null || list.isEmpty()) {
+            return null;
+        }
+        return ((android.content.pm.ActivityInfo) call(list.get(0), "getActivityInfo")).name;
+    }
+
+    /**
+     * ILauncherApps.startActivityAsUser(caller, callingPackage, featureId, component, sourceBounds,
+     * opts, user): the launcher's cross-profile start. Checked against the profile group, not
+     * INTERACT_ACROSS_USERS on the target, so it works where the user's admin bars adb. Returns
+     * nothing: the caller polls for the task.
+     */
+    static void startViaLauncherApps(android.content.ComponentName component, int user, android.os.Bundle opts) {
+        call(launcherApps(), "startActivityAsUser", null, com.genymobile.scrcpy.FakeContext.PACKAGE_NAME, null,
+            component, null, opts, handle(user));
+    }
+
+    private static Object launcherApps() {
+        try {
+            IBinder b = (IBinder) Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String.class).invoke(null, "launcherapps");
+            return Class.forName("android.content.pm.ILauncherApps$Stub").getMethod("asInterface", IBinder.class)
+                .invoke(null, b);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("launcherapps", e);
+        }
+    }
+
+    private static android.os.UserHandle handle(int user) {
+        try {
+            return (android.os.UserHandle) android.os.UserHandle.class.getMethod("of", int.class).invoke(null, user);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("UserHandle.of", e);
+        }
     }
 
     @Override

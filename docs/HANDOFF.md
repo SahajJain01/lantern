@@ -37,7 +37,7 @@ Acceptance (`tools/device_test.py`) is 8/8 PASS on Sahaj's phone:
 - Also used: Sahaj's daily Motorola edge 50 pro, serial `ZD222LMDFV`, Android 16, users 0 and 10
   (Intune work profile); its `stay_on_while_plugged_in` original is `0`.
 - Rust is in `~/.cargo/bin`, which is not on the agent tool's PATH. Prefix commands with
-  `export PATH="$HOME/.cargo/bin:$PATH"`. Work in `host/` (`cargo test --workspace`); there are 141
+  `export PATH="$HOME/.cargo/bin:$PATH"`. Work in `host/` (`cargo test --workspace`); there are 143
   tests.
 - The FFmpeg, VA-API, Wayland and clang dev headers are installed. The GPU is Intel (renderD128).
 - Commit as `git -c user.name='Sahaj Jain' -c user.email='jainsahaj@gmail.com'`.
@@ -80,23 +80,39 @@ started by the app on a real device, long runs with 5–6 encoders, and interact
   `lantern.<pkg>` for user 0 (unchanged) and `lantern.<pkg>-u<N>` otherwise (`-` cannot occur in a
   package name, so no collision); title `<pkg> (user N)`; `windows.json` key `<pkg>` / `<pkg>:<N>`.
   Single-instance focus keys on pkg+user (test `single_instance_is_per_pkg_and_user`).
+- CLI rejects package names outside `[A-Za-z0-9_.]` and `--user` values with a sign or leading
+  zeros (exit 2).
 - Helper: `UserLaunch` (pure policy, host-tested with a fake) over `DeviceUsers` (IUserManager,
-  IActivityManager, IPackageManager for that user). Resolves the launcher activity for that user
-  and `startActivityAsUser(…, user)` with an explicit component, before any display is created.
-  Task lookup/close are by display (`getTasks(…, displayId)` / `removeTask`), user-independent.
-- **Device result, Motorola edge 50 pro (`ZD222LMDFV`, Android 16), users 0 and 10 (Intune work
-  profile):** user 10 has `no_debugging_features` (set by its profile owner), so Android throws
-  `SecurityException: Shell does not have permission to access user 10` for *any* shell-uid call
-  into it (`am start --user 10`, `pm list packages --user 10`). Lantern detects this first and
-  prints a clear error. **A real user-10 window could not be shown on this phone**, and nothing on
-  the phone may be changed to allow it. Verified on device: the user-10 error, `--user 11` → "does
-  not exist (users: 0, 10)", a missing package → "not installed for Android user 0", and user 0
-  Settings still opens through the new resolve path (task `userId=0` on the Lantern display) and
-  closes cleanly. Verified on KDE with a fake daemon: user 0 and user 10 windows of one package
-  get distinct app_ids/titles/taskbar entries and sizes, and closing one leaves the other.
-- Still unverified: an actual non-zero user's app on a Lantern display (needs a profile without
-  `no_debugging_features`, e.g. a secondary user or private space on the Xiaomi or a test work
-  profile from Test DPC), and whether `getTasks` sees that user's task from the shell uid.
+  IActivityManager, IPackageManager, ILauncherApps). Resolves before any display is created and
+  picks a route:
+  - `DIRECT`: launcher activity from that user's PM, `IActivityManager.startActivityAsUser(…, user)`
+    with an explicit component and `MULTIPLE_TASK`.
+  - `LAUNCHER_APPS`: when the helper is the shell uid (2000; root skips the check) and the user has
+    `no_debugging_features`. Requires the user in `ILauncherApps.getUserProfiles()` (the current
+    user's profile group: work profile, private space, clone), resolves with
+    `getLauncherActivities("com.android.shell", pkg, user)` and starts with
+    `ILauncherApps.startActivityAsUser(null, "com.android.shell", null, component, null,
+    ActivityOptions.setLaunchDisplayId(id), user)`. LauncherAppsService checks the profile group,
+    not the shell's access to the user, so the MDM restriction does not apply. The intent is built
+    by LauncherApps (`NEW_TASK|RESET_TASK_IF_NEEDED`, no `MULTIPLE_TASK`).
+  - `LEGACY`: user 0 when any hidden user/package check throws (other Android releases):
+    `getLaunchIntentForPackage`, as before user support.
+  - `running` uses `isUserRunning(user, FLAG_AND_UNLOCKED)`, so a RUNNING_LOCKED user is refused.
+  - Task lookup/close/app-exit are by display (`getTasks(…, displayId)` / `removeTask`); the shell
+    uid sees and removes user-10 tasks even under `no_debugging_features`.
+- **Device result, Motorola edge 50 pro (`ZD222LMDFV`, Android 16), user 10 = Intune work profile
+  with `no_debugging_features`:** `am start --user 10` / `pm list packages --user 10` fail ("Shell
+  does not have permission to access user 10"), but `lantern open --user 10
+  com.google.android.apps.nbu.files` opens work Files in its own KDE window
+  (`lantern.com.google.android.apps.nbu.files-u10`, title `… (user 10)`): helper log
+  `route=LAUNCHER_APPS`, `dumpsys activity`: `Display #19` → `Task #18475 … U=10`,
+  `launchedFromPackage=com.android.shell userId=10`. Closing the KWin window → `removeTask 18475 ->
+  true`, 0 user-10 Files tasks and 0 lantern displays left. User 0 Settings still uses `DIRECT`.
+  Spike details: `.superpowers/work-profile-spike.md`.
+- Still unverified: a second open of a profile app that already has a task on the phone's screen
+  (LauncherApps may move that task onto the Lantern display, and closing the window then quits
+  it); a profile with a separate work challenge that is currently locked; private space/clone
+  profiles; the `LEGACY` path on a real device (host-tested only).
 
 ## Decisions made during Plan 1 (Sahaj may override)
 - **Helper (phone side)**

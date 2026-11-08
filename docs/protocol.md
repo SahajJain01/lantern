@@ -57,11 +57,16 @@ JSON objects tagged by `"t"` (snake_case). Example:
   Exit statuses); any other handshake `error` is retried with backoff.
 - `opened` is sent before any video for that window. `codec` is `"h265"` or `"h264"`.
 - `open.user`: the helper resolves `pkg`'s launcher activity in that user's package manager and
-  starts it as that user (`am start --user N` semantics). Before creating a display it refuses,
-  as a per-window failure, a user that does not exist, is not running, or has the
-  `no_debugging_features` restriction (Android bars the shell uid from such users), and a `pkg`
-  that is not installed for that user or has no launcher activity. The `error.msg` is meant for
-  the person at the PC (e.g. `open com.x failed: com.x is not installed for Android user 10`).
+  starts it as that user (`am start --user N` semantics). For a user with the
+  `no_debugging_features` restriction (Android bars the shell uid from such users) that is a profile
+  of the current user (work profile, private space, clone), it resolves and starts the activity
+  through LauncherApps instead (`ILauncherApps.getLauncherActivities` / `startActivityAsUser`, the
+  launcher's profile-group-checked path). Before creating a display it refuses, as a per-window
+  failure, a user that does not exist, is not running or not unlocked, bars adb and is not such a
+  profile (or LauncherApps refuses it), and a `pkg` that is not installed for that user or has no
+  launcher activity. If the helper's hidden user/package checks themselves fail on user 0, it falls
+  back to `getLaunchIntentForPackage`. The `error.msg` is meant for the person at the PC (e.g.
+  `open com.x failed: com.x is not installed for Android user 10`).
 - `resized{w,h}` answers `resize`, and is also sent unprompted when the app rotates its display.
 - A per-window failure (open, resize or the video stream) is `error{msg}` followed by
   `closed{reason:"error"}` on that window's stream; the session continues.

@@ -51,9 +51,155 @@ public final class UserLaunchTest {
         @Override
         public String launcherActivity(String pkg, int user) {
             calls.add("launcher " + pkg + " " + user);
+            if (blocked.contains(user) && shell) {
+                // What Android does: the shell uid may not touch a no_debugging_features user.
+                throw new SecurityException("Shell does not have permission to access user " + user);
+            }
             String cls = launchers.get(pkg + ":" + user);
             return "none".equals(cls) ? null : cls;
         }
+
+        boolean shell = true;
+        final List<Integer> profileGroup = new ArrayList<>(List.of(0, 10));
+        RuntimeException launcherAppsError;
+
+        @Override
+        public boolean isShell() {
+            calls.add("isShell");
+            return shell;
+        }
+
+        @Override
+        public int[] profiles() {
+            calls.add("profiles");
+            if (launcherAppsError != null) {
+                throw launcherAppsError;
+            }
+            return profileGroup.stream().mapToInt(Integer::intValue).toArray();
+        }
+
+        @Override
+        public String profileLauncherActivity(String pkg, int user) {
+            calls.add("la " + pkg + " " + user);
+            if (launcherAppsError != null) {
+                throw launcherAppsError;
+            }
+            String cls = launchers.get(pkg + ":" + user);
+            return "none".equals(cls) ? null : cls;
+        }
+    }
+
+    /** Every call throws, as when the hidden APIs differ on another Android release. */
+    static final class Broken implements UserLaunch.Backend {
+        private static RuntimeException no() {
+            return new IllegalStateException("no android.os.IUserManager$Stub$Proxy.getUsers/3");
+        }
+
+        public int[] users() {
+            throw no();
+        }
+
+        public boolean running(int user) {
+            throw no();
+        }
+
+        public boolean isShell() {
+            throw no();
+        }
+
+        public boolean debuggingBlocked(int user) {
+            throw no();
+        }
+
+        public boolean installed(String pkg, int user) {
+            throw no();
+        }
+
+        public String launcherActivity(String pkg, int user) {
+            throw no();
+        }
+
+        public int[] profiles() {
+            throw no();
+        }
+
+        public String profileLauncherActivity(String pkg, int user) {
+            throw no();
+        }
+    }
+
+    static void user0FallsBackToLegacyWhenHiddenApisFail() throws Exception {
+        UserLaunch.Target t = UserLaunch.resolveOrLegacy("com.a", 0, Broken::new);
+        eq(UserLaunch.Route.LEGACY, t.route, "route");
+        eq(null, t.cls, "cls");
+        eq(0, t.user, "user");
+        // Backend construction failing (reflection) also falls back.
+        t = UserLaunch.resolveOrLegacy("com.a", 0, () -> {
+            throw new ClassNotFoundException("android.os.IUserManager$Stub");
+        });
+        eq(UserLaunch.Route.LEGACY, t.route, "route after ctor failure");
+    }
+
+    static void otherUsersDoNotFallBack() {
+        String msg = fails(() -> UserLaunch.resolveOrLegacy("com.a", 10, Broken::new));
+        contains(msg, "could not check Android user 10");
+    }
+
+    static void user0RealErrorsStillWin() {
+        // A definite answer from the checks is not a hidden-API failure: no fallback.
+        Fake f = new Fake();
+        contains(fails(() -> UserLaunch.resolveOrLegacy("com.a", 0, () -> f)), "com.a is not installed for Android user 0");
+    }
+
+    static void blockedProfileUsesLauncherApps() throws Exception {
+        Fake f = new Fake().app("com.a", 10, "com.a.WorkMain");
+        f.blocked.add(10);
+        UserLaunch.Target t = UserLaunch.resolve("com.a", 10, f);
+        eq(UserLaunch.Route.LAUNCHER_APPS, t.route, "route");
+        eq("com.a/com.a.WorkMain", t.flatten(), "target");
+        // Never touches the package manager for a user it may not access.
+        eq(false, f.calls.stream().anyMatch(c -> c.startsWith("installed") || c.startsWith("launcher")),
+            "no PM calls: " + f.calls);
+    }
+
+    static void unblockedUsersStayDirect() throws Exception {
+        Fake f = new Fake().app("com.a", 10, "com.a.Main");
+        UserLaunch.Target t = UserLaunch.resolve("com.a", 10, f);
+        eq(UserLaunch.Route.DIRECT, t.route, "route");
+        eq(false, f.calls.contains("profiles"), "no LauncherApps: " + f.calls);
+    }
+
+    static void rootIgnoresTheDebuggingRestriction() throws Exception {
+        Fake f = new Fake().app("com.a", 10, "com.a.Main");
+        f.blocked.add(10);
+        f.shell = false;
+        eq(UserLaunch.Route.DIRECT, UserLaunch.resolve("com.a", 10, f).route, "route as root");
+        eq(false, f.calls.contains("blocked 10"), "restriction not even read: " + f.calls);
+    }
+
+    static void blockedNonProfileIsAClearError() {
+        Fake f = new Fake().app("com.a", 10, "com.a.Main");
+        f.blocked.add(10);
+        f.profileGroup.remove(Integer.valueOf(10));
+        String msg = fails(() -> UserLaunch.resolve("com.a", 10, f));
+        contains(msg, "no_debugging_features");
+        contains(msg, "not a profile of the current user");
+    }
+
+    static void launcherAppsRefusalIsExplained() {
+        Fake f = new Fake().app("com.a", 10, "com.a.Main");
+        f.blocked.add(10);
+        f.launcherAppsError = new SecurityException("Caller cannot access profile");
+        String msg = fails(() -> UserLaunch.resolve("com.a", 10, f));
+        contains(msg, "no_debugging_features");
+        contains(msg, "LauncherApps refused too: Caller cannot access profile");
+    }
+
+    static void blockedProfileWithoutTheApp() {
+        Fake f = new Fake().app("com.a", 0, "com.a.Main");
+        f.blocked.add(10);
+        contains(fails(() -> UserLaunch.resolve("com.a", 10, f)),
+            "com.a is not installed (or has no launcher activity) for Android user 10");
     }
 
     static void resolvesTheActivityForThatUser() throws Exception {
@@ -76,17 +222,6 @@ public final class UserLaunchTest {
         Fake f = new Fake().app("com.a", 10, "com.a.Main");
         f.stopped.add(10);
         contains(fails(() -> UserLaunch.resolve("com.a", 10, f)), "Android user 10 is not running");
-    }
-
-    static void debuggingRestrictionIsExplained() {
-        Fake f = new Fake().app("com.a", 10, "com.a.Main");
-        f.blocked.add(10);
-        String msg = fails(() -> UserLaunch.resolve("com.a", 10, f));
-        contains(msg, "user 10");
-        contains(msg, "no_debugging_features");
-        // Never touches the package manager for a user it may not access.
-        eq(false, f.calls.stream().anyMatch(c -> c.startsWith("installed") || c.startsWith("launcher")),
-            "no PM calls: " + f.calls);
     }
 
     static void notInstalledForThatUser() {
@@ -152,7 +287,15 @@ public final class UserLaunchTest {
             {"resolvesTheActivityForThatUser", (Case) UserLaunchTest::resolvesTheActivityForThatUser},
             {"missingUserIsAClearError", (Case) UserLaunchTest::missingUserIsAClearError},
             {"stoppedUserIsAClearError", (Case) UserLaunchTest::stoppedUserIsAClearError},
-            {"debuggingRestrictionIsExplained", (Case) UserLaunchTest::debuggingRestrictionIsExplained},
+            {"user0FallsBackToLegacyWhenHiddenApisFail", (Case) UserLaunchTest::user0FallsBackToLegacyWhenHiddenApisFail},
+            {"otherUsersDoNotFallBack", (Case) UserLaunchTest::otherUsersDoNotFallBack},
+            {"user0RealErrorsStillWin", (Case) UserLaunchTest::user0RealErrorsStillWin},
+            {"blockedProfileUsesLauncherApps", (Case) UserLaunchTest::blockedProfileUsesLauncherApps},
+            {"unblockedUsersStayDirect", (Case) UserLaunchTest::unblockedUsersStayDirect},
+            {"rootIgnoresTheDebuggingRestriction", (Case) UserLaunchTest::rootIgnoresTheDebuggingRestriction},
+            {"blockedNonProfileIsAClearError", (Case) UserLaunchTest::blockedNonProfileIsAClearError},
+            {"launcherAppsRefusalIsExplained", (Case) UserLaunchTest::launcherAppsRefusalIsExplained},
+            {"blockedProfileWithoutTheApp", (Case) UserLaunchTest::blockedProfileWithoutTheApp},
             {"notInstalledForThatUser", (Case) UserLaunchTest::notInstalledForThatUser},
             {"noLauncherActivity", (Case) UserLaunchTest::noLauncherActivity},
             {"userListFailureFallsBackToRunning", (Case) UserLaunchTest::userListFailureFallsBackToRunning},

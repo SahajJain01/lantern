@@ -105,7 +105,8 @@ public final class AppDisplay implements DisplayHandle {
 
     private void start(int user) throws Exception {
         // Resolve first: a missing user or app fails before any display exists.
-        UserLaunch.Target target = UserLaunch.resolve(pkg, user, new DeviceUsers());
+        UserLaunch.Target target = UserLaunch.resolveOrLegacy(pkg, user, DeviceUsers::new);
+        Droid.log("resolve: " + target.flatten() + " user=" + user + " route=" + target.route);
         display = ServiceManager.getDisplayManager().createNewVirtualDisplay(
             "lantern-" + win + "-" + pkg, width, height, dpi, encoder.surface(), Policy.FLAGS);
         if (display == null || display.getDisplay() == null) {
@@ -181,15 +182,40 @@ public final class AppDisplay implements DisplayHandle {
         return ctor.newInstance(FakeContext.get());
     }
 
-    /** startActivityAsUser(target.user) with the activity resolved for that user (am start --user N). */
+    /**
+     * Starts the target on this display by its route: DIRECT/LEGACY via startActivityAsUser (am
+     * start --user N), LAUNCHER_APPS via ILauncherApps.startActivityAsUser (the phone launcher's
+     * cross-profile start, for a profile whose admin bars adb).
+     */
     private void launch(UserLaunch.Target target) throws Exception {
         int user = target.user;
-        Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-            .setComponent(new android.content.ComponentName(target.pkg, target.cls));
+        Bundle options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle();
+        if (target.route == UserLaunch.Route.LAUNCHER_APPS) {
+            // LauncherApps builds the intent itself (NEW_TASK | RESET_TASK_IF_NEEDED, no
+            // MULTIPLE_TASK): if that profile app already has a task, Android may move it here.
+            try {
+                DeviceUsers.startViaLauncherApps(new android.content.ComponentName(target.pkg, target.cls), user,
+                    options);
+            } catch (SecurityException e) {
+                throw new UserLaunch.LaunchError("Android user " + user + " does not allow adb, and LauncherApps"
+                    + " refused to start " + pkg + " too: " + e.getMessage());
+            }
+            Droid.log("launch: " + target.flatten() + " user=" + user + " display=" + displayId + " via LauncherApps");
+            return;
+        }
+        Intent intent;
+        if (target.route == UserLaunch.Route.LEGACY) {
+            intent = FakeContext.get().getPackageManager().getLaunchIntentForPackage(pkg);
+            if (intent == null) {
+                throw new UserLaunch.LaunchError(pkg + " is not installed (no launch intent) for Android user 0");
+            }
+        } else {
+            intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                .setComponent(new android.content.ComponentName(target.pkg, target.cls));
+        }
         // MULTIPLE_TASK: never pull an existing task (e.g. one on the phone's own screen) onto our
         // display, because close() removes every task here.
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
-        Bundle options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle();
         Object am = Class.forName("android.app.ActivityManager").getMethod("getService").invoke(null);
         Method start = am.getClass().getMethod("startActivityAsUser",
             Class.forName("android.app.IApplicationThread"), String.class, Intent.class, String.class,
