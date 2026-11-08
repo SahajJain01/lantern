@@ -6,7 +6,7 @@ import java.util.Map;
 
 /**
  * Host-JVM stand-in for {@link Control}'s org.json codec: flat JSON objects whose values are strings
- * or integers. Test utility only (not a *Test class, so the build does not run it).
+ * integers or booleans. Test utility only (not a *Test class, so the build does not run it).
  */
 final class TestCodec implements ControlCodec {
     @Override
@@ -36,7 +36,8 @@ final class TestCodec implements ControlCodec {
                 if (end < 0) {
                     end = body.length();
                 }
-                value = Long.parseLong(body.substring(v, end).trim());
+                String raw = body.substring(v, end).trim();
+                value = raw.equals("true") || raw.equals("false") ? (Object) Boolean.valueOf(raw) : (Object) Long.parseLong(raw);
             }
             fields.put(key, value);
             int comma = body.indexOf(',', end);

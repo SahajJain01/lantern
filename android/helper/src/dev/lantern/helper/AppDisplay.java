@@ -71,6 +71,7 @@ public final class AppDisplay implements DisplayHandle {
     private String failure;
     private int displayId = -1;
     private int taskId = -1;
+    private boolean moved;
     private int width;
     private int height;
     private int dpi;
@@ -158,20 +159,96 @@ public final class AppDisplay implements DisplayHandle {
         };
         publicDm.registerDisplayListener(listener, new Handler(listenerThread.getLooper()));
 
+        // Every task of this app+user on any display, before launching: LauncherApps (and singleTask
+        // apps on the DIRECT route) can reuse one of them instead of making a new task.
+        LaunchTasks.Tasks phoneTasks = new PhoneTasks();
+        java.util.Set<Integer> before = LaunchTasks.record(phoneTasks, pkg, user);
+        Droid.log("launch: pre-existing tasks of " + pkg + " user=" + user + ": " + before);
         launch(target);
-        long deadline = SystemClock.elapsedRealtime() + TASK_WAIT_MS;
-        while (true) {
-            List<Integer> tasks = tasks();
-            if (!tasks.isEmpty()) {
-                taskId = tasks.get(0);
-                break;
-            }
-            if (SystemClock.elapsedRealtime() > deadline) {
-                throw new IllegalStateException("no task on display " + displayId + " after " + TASK_WAIT_MS + " ms");
-            }
-            Thread.sleep(50);
+        LaunchTasks.Found found;
+        try {
+            found = LaunchTasks.await(phoneTasks, pkg, user, displayId, before, TASK_WAIT_MS, CLOCK);
+        } catch (LaunchTasks.Timeout e) {
+            Droid.log("launch: " + e.getMessage());
+            throw new IllegalStateException(e.getMessage());
         }
-        Droid.log("display: id=" + displayId + " task=" + taskId + " pkg=" + pkg);
+        taskId = found.taskId;
+        moved = found.moved;
+        Droid.log("display: id=" + displayId + " task=" + taskId + " pkg=" + pkg
+            + (moved ? " moved=true (task existed before the launch; Android moved it here, close will quit it)" : ""));
+    }
+
+    private static final LaunchTasks.Clock CLOCK = new LaunchTasks.Clock() {
+        @Override
+        public long now() {
+            return SystemClock.elapsedRealtime();
+        }
+
+        @Override
+        public void sleep(long ms) throws InterruptedException {
+            Thread.sleep(ms);
+        }
+    };
+
+    /** {@link LaunchTasks.Tasks} over IActivityTaskManager.getTasks (the shell uid sees every user). */
+    private static final class PhoneTasks implements LaunchTasks.Tasks {
+        @Override
+        public List<Integer> of(String pkg, int user) {
+            List<Integer> ids = new ArrayList<>();
+            try {
+                Class<?> c = Class.forName("android.app.TaskInfo");
+                for (Object ti : rawTasks(INVALID_DISPLAY)) {
+                    if (c.getField("userId").getInt(ti) == user && pkg.equals(taskPackage(c, ti))) {
+                        ids.add(c.getField("taskId").getInt(ti));
+                    }
+                }
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("TaskInfo", e);
+            }
+            return ids;
+        }
+
+        @Override
+        public List<Integer> onDisplay(int display) {
+            return tasksOn(display);
+        }
+
+        @Override
+        public boolean remove(int id) {
+            boolean ok = removeTask(id);
+            Droid.log("launch: removeTask " + id + " (new task that missed the Lantern display) -> " + ok);
+            return ok;
+        }
+    }
+
+    /** Display.INVALID_DISPLAY: getTasks over every display. */
+    static final int INVALID_DISPLAY = -1;
+
+    private static String taskPackage(Class<?> c, Object ti) throws ReflectiveOperationException {
+        for (String field : new String[] {"baseActivity", "realActivity", "topActivity"}) {
+            try {
+                Object cn = c.getField(field).get(ti);
+                if (cn != null) {
+                    return ((android.content.ComponentName) cn).getPackageName();
+                }
+            } catch (NoSuchFieldException e) {
+                // Not on this release: try the next.
+            }
+        }
+        Intent base = (Intent) c.getField("baseIntent").get(ti);
+        return base != null && base.getComponent() != null ? base.getComponent().getPackageName() : null;
+    }
+
+    private static List<?> rawTasks(int display) throws ReflectiveOperationException {
+        Object atm = atm();
+        return (List<?>) atm.getClass()
+            .getMethod("getTasks", int.class, boolean.class, boolean.class, int.class)
+            .invoke(atm, 1000, false, false, display);
+    }
+
+    @Override
+    public boolean moved() {
+        return moved;
     }
 
     private static android.hardware.display.DisplayManager publicDisplayManager()
@@ -241,18 +318,19 @@ public final class AppDisplay implements DisplayHandle {
         return Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
     }
 
-    /** Task ids on this display: IActivityTaskManager.getTasks(int, boolean, boolean, int). */
+    /** Task ids on this display. */
     private List<Integer> tasks() {
+        return tasksOn(displayId);
+    }
+
+    /** Task ids on {@code displayId}: IActivityTaskManager.getTasks(int, boolean, boolean, int). */
+    private static List<Integer> tasksOn(int displayId) {
         List<Integer> ids = new ArrayList<>();
         if (displayId < 0) {
             return ids;
         }
         try {
-            Object atm = atm();
-            List<?> infos = (List<?>) atm.getClass()
-                .getMethod("getTasks", int.class, boolean.class, boolean.class, int.class)
-                .invoke(atm, 100, false, false, displayId);
-            for (Object ti : infos) {
+            for (Object ti : rawTasks(displayId)) {
                 Class<?> c = Class.forName("android.app.TaskInfo");
                 if (c.getField("displayId").getInt(ti) == displayId) {
                     ids.add(c.getField("taskId").getInt(ti));

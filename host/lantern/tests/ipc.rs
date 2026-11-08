@@ -323,6 +323,7 @@ async fn open_window(
             codec: "h264".into(),
             w: 1280,
             h: 800,
+            moved: false,
         },
     );
     helper.send(opened.clone());
@@ -825,6 +826,8 @@ async fn reopen_when_owner_is_dead_opens_a_new_window() {
             codec: "h264".into(),
             w: 1280,
             h: 800,
+            // The optional flag passes through the daemon unchanged.
+            moved: true,
         },
     );
     helper.send(opened.clone());

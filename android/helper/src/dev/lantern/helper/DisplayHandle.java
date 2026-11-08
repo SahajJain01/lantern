@@ -17,6 +17,14 @@ public interface DisplayHandle extends AutoCloseable {
 
     boolean taskVanished();
 
+    /**
+     * True when the task on the display existed before the launch (Android moved it here from the
+     * phone's screen or recents), so closing the window quits an app the user already had open.
+     */
+    default boolean moved() {
+        return false;
+    }
+
     void requestKeyframe();
 
     void setStreamListener(StreamListener l);

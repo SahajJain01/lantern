@@ -13,6 +13,9 @@
 //! control_open_token.bin : kind=Control(1), stream=0, the same Open with
 //!                     activation_token: Some("lantern-xdg-token-1")
 //!                     payload = {"t":"open","pkg":"com.android.settings","user":0,"w":1280,"h":800,"dpi":160,"activation_token":"lantern-xdg-token-1"}
+//! control_opened_moved.bin : kind=Control(1), stream=2,
+//!                     Control::Opened { display: 19, task: 18475, codec: "h264", w: 1280, h: 800, moved: true }
+//!                     payload = {"t":"opened","display":19,"task":18475,"codec":"h264","w":1280,"h":800,"moved":true}
 //! control_focus.bin : kind=Control(1), stream=1, Control::Focus { activation_token: None }
 //!                     payload = {"t":"focus"}
 //! input_pointer.bin : kind=Input(3), stream=1,
@@ -48,6 +51,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
     let focus = Control::Focus {
         activation_token: None,
     };
+    let opened_moved = opened(true);
     let pointer = InputEvent::Pointer {
         action: PointerAction::Move,
         id: 7,
@@ -78,6 +82,10 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             frame_bytes(Kind::Control, 0, serde_json::to_vec(&open_token).unwrap()),
         ),
         (
+            "control_opened_moved",
+            frame_bytes(Kind::Control, 2, serde_json::to_vec(&opened_moved).unwrap()),
+        ),
+        (
             "control_focus",
             frame_bytes(Kind::Control, 1, serde_json::to_vec(&focus).unwrap()),
         ),
@@ -98,6 +106,17 @@ fn open_settings(activation_token: Option<&str>) -> Control {
         h: 800,
         dpi: 160,
         activation_token: activation_token.map(str::to_owned),
+    }
+}
+
+fn opened(moved: bool) -> Control {
+    Control::Opened {
+        display: 19,
+        task: 18475,
+        codec: "h264".into(),
+        w: 1280,
+        h: 800,
+        moved,
     }
 }
 
@@ -142,6 +161,10 @@ fn golden_files_decode() {
             "control_open_token" => assert_eq!(
                 serde_json::from_slice::<Control>(&f.payload).unwrap(),
                 open_settings(Some("lantern-xdg-token-1"))
+            ),
+            "control_opened_moved" => assert_eq!(
+                serde_json::from_slice::<Control>(&f.payload).unwrap(),
+                opened(true)
             ),
             "control_focus" => {
                 assert_eq!(f.payload, br#"{"t":"focus"}"#);

@@ -58,6 +58,18 @@ public final class ProtoTest {
         eq("lantern-xdg-token-1", m.str("activation_token"), "activation_token");
     }
 
+    /** The helper's opened with the optional moved flag encodes exactly as the Rust side expects. */
+    static void goldenControlOpenedMovedMatchesRust() throws Exception {
+        Proto.Frame f = readOnly("control_opened_moved");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(2, f.stream, "stream");
+        Msg m = Msg.of("opened").put("display", 19).put("task", 18475).put("codec", "h264").put("w", 1280)
+            .put("h", 800).put("moved", Boolean.TRUE);
+        eq(new String(f.payload, StandardCharsets.UTF_8), new String(new TestCodec().encode(m), StandardCharsets.UTF_8),
+            "json");
+        eq(Boolean.TRUE, new TestCodec().decode(f.payload).fields().get("moved"), "moved");
+    }
+
     /** {"t":"focus"} stays the v1 bytes now that Focus carries an optional activation_token. */
     static void goldenControlFocusMatchesRust() throws Exception {
         Proto.Frame f = readOnly("control_focus");
@@ -232,6 +244,7 @@ public final class ProtoTest {
         Object[][] cases = {
             {"goldenControlOpenMatchesRust", (Case) ProtoTest::goldenControlOpenMatchesRust},
             {"goldenControlOpenWithTokenParses", (Case) ProtoTest::goldenControlOpenWithTokenParses},
+            {"goldenControlOpenedMovedMatchesRust", (Case) ProtoTest::goldenControlOpenedMovedMatchesRust},
             {"goldenControlFocusMatchesRust", (Case) ProtoTest::goldenControlFocusMatchesRust},
             {"goldenInputPointerMatchesRust", (Case) ProtoTest::goldenInputPointerMatchesRust},
             {"goldenInputKeyMatchesRust", (Case) ProtoTest::goldenInputKeyMatchesRust},

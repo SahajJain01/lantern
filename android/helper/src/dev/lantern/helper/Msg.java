@@ -10,7 +10,7 @@ import java.util.Set;
 
 /**
  * One control message (docs/protocol.md): the {@code "t"} tag plus flat fields whose values are
- * {@link String} or {@link Long}. Pure Java, so {@link Router} can be tested on the host JVM; the
+ * {@link String}, {@link Long} or {@link Boolean}. Pure Java, so {@link Router} can be tested on the host JVM; the
  * JSON lives in a {@link ControlCodec} ({@link Control} on the device).
  */
 public final class Msg {
@@ -32,7 +32,7 @@ public final class Msg {
         return new Msg(t);
     }
 
-    /** {@code v} must be a String or an integral Number (stored as Long). */
+    /** {@code v} must be a String, a Boolean or an integral Number (stored as Long). */
     public Msg put(String key, Object v) {
         if (key.equals("t")) {
             throw new IllegalArgumentException("t is the tag");
@@ -40,7 +40,7 @@ public final class Msg {
         if (v instanceof Integer || v instanceof Short || v instanceof Byte) {
             v = ((Number) v).longValue();
         }
-        if (!(v instanceof String) && !(v instanceof Long)) {
+        if (!(v instanceof String) && !(v instanceof Long) && !(v instanceof Boolean)) {
             throw new IllegalArgumentException(key + ": unsupported value " + v);
         }
         fields.put(key, v);

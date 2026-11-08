@@ -63,8 +63,9 @@ through Android's LauncherApps service, the same cross-profile path the phone's 
 Users that are not profiles of the current user and also bar adb cannot be opened. The phone
 refuses (and the window prints why) when the user does not exist, is not running or not unlocked
 (a paused work profile), or does not have the app. A profile app that already has a task on the
-phone's own screen may be moved onto its Lantern window (LauncherApps cannot ask for a new task),
-and closing that window then quits it.
+phone (on its screen or in recents) may be moved onto its Lantern window (LauncherApps cannot ask
+for a new task); the window then prints `lantern: <pkg> (user N) was already open on the phone; it
+moved into this window and closing the window will quit it`.
 
 `lantern status` prints `{"state":"idle|starting|ready","serial":…,"helper":<jar sha256>,"windows":[{"id","pkg","user"}]}`.
 Logs: `journalctl --user -u lanternd`. Set `LANTERN_LOG=debug` for more detail.

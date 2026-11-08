@@ -159,6 +159,10 @@ pub enum CloseReason {
     Error,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Control {
@@ -183,6 +187,11 @@ pub enum Control {
         codec: String,
         w: u32,
         h: u32,
+        /// The task existed before the launch (it was open on the phone or in its recents) and
+        /// Android moved it onto the Lantern display, so closing the window quits it. Absent on the
+        /// wire when false, so a v1 `opened` is byte-identical.
+        #[serde(default, skip_serializing_if = "is_false")]
+        moved: bool,
     },
     Resize {
         w: u32,
@@ -704,6 +713,22 @@ mod tests {
             serde_json::to_string(&Control::Bye).unwrap(),
             r#"{"t":"bye"}"#
         );
+        // `moved` is optional: absent when false (v1 bytes), defaulted when missing.
+        let v1 = r#"{"t":"opened","display":12,"task":7,"codec":"h264","w":1280,"h":800}"#;
+        let opened = |moved| Control::Opened {
+            display: 12,
+            task: 7,
+            codec: "h264".into(),
+            w: 1280,
+            h: 800,
+            moved,
+        };
+        assert_eq!(serde_json::to_string(&opened(false)).unwrap(), v1);
+        assert_eq!(serde_json::from_str::<Control>(v1).unwrap(), opened(false));
+        assert_eq!(
+            serde_json::to_string(&opened(true)).unwrap(),
+            r#"{"t":"opened","display":12,"task":7,"codec":"h264","w":1280,"h":800,"moved":true}"#
+        );
         let c = Control::Closed {
             reason: CloseReason::AppExited,
         };
@@ -721,6 +746,15 @@ mod tests {
                 codec: "h264".into(),
                 w: 1280,
                 h: 800,
+                moved: false,
+            },
+            Control::Opened {
+                display: 12,
+                task: 7,
+                codec: "h265".into(),
+                w: 1280,
+                h: 800,
+                moved: true,
             },
             Control::Resize { w: 1, h: 2, dpi: 3 },
             Control::Resized { w: 4, h: 5 },

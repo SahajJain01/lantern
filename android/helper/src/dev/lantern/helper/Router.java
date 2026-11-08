@@ -283,9 +283,16 @@ public final class Router {
         // Opened carries the display's current size: the app may already have rotated it.
         int ow = d.width();
         int oh = d.height();
-        wn.ready(Msg.of("opened").put("display", d.displayId()).put("task", d.taskId()).put("codec", d.codec())
-            .put("w", ow).put("h", oh));
-        log.accept("router: opened win=" + win + " " + pkg + " display=" + d.displayId() + " task=" + d.taskId());
+        Msg opened = Msg.of("opened").put("display", d.displayId()).put("task", d.taskId()).put("codec", d.codec())
+            .put("w", ow).put("h", oh);
+        boolean moved = d.moved();
+        if (moved) {
+            // Optional, only when true: a v1 opened without it is byte-identical to before.
+            opened.put("moved", Boolean.TRUE);
+        }
+        wn.ready(opened);
+        log.accept("router: opened win=" + win + " " + pkg + " display=" + d.displayId() + " task=" + d.taskId()
+            + (moved ? " moved=true (the task existed before the launch; closing the window quits it)" : ""));
         // Listeners after Opened, so nothing they send can precede it. Both hop to the worker: the
         // resize listener runs under the display's lock, the stream listener on its drain thread.
         d.setResizeListener((id, rw, rh) -> submit(() -> {

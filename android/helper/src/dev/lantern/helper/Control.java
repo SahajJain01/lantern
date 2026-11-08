@@ -29,8 +29,8 @@ public final class Control {
     }
 
     /**
-     * Strict on the tag ({@code t} must be a string naming a v1 message), lenient on fields: string
-     * and integral values are kept, anything else (unknown extras such as nested objects) is dropped.
+     * Strict on the tag ({@code t} must be a string naming a v1 message), lenient on fields: string,
+     * boolean and integral values are kept, anything else (unknown extras such as nested objects) is dropped.
      */
     public static Msg decode(byte[] payload) throws IOException {
         JSONObject o;
@@ -53,7 +53,7 @@ public final class Control {
                 continue;
             }
             Object v = o.opt(k);
-            if (v instanceof String) {
+            if (v instanceof String || v instanceof Boolean) {
                 m.put(k, v);
             } else if (v instanceof Integer || v instanceof Long) {
                 m.put(k, ((Number) v).longValue());

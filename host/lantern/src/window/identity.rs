@@ -74,6 +74,14 @@ impl Identity {
         }
     }
 
+    /// One stderr line when the phone moved an already-open task into this window (`opened.moved`).
+    pub fn moved_notice(&self) -> String {
+        format!(
+            "lantern: {} (user {}) was already open on the phone; it moved into this window and closing the window will quit it",
+            self.pkg, self.user
+        )
+    }
+
     /// Key in `windows.json`. User 0 keeps the bare package (files from before profiles).
     pub fn size_key(&self) -> String {
         match self.user {
@@ -92,6 +100,15 @@ mod tests {
             pkg: pkg.into(),
             user,
         }
+    }
+
+    #[test]
+    fn moved_notice_names_pkg_and_user() {
+        assert_eq!(
+            id("com.google.android.apps.nbu.files", 10).moved_notice(),
+            "lantern: com.google.android.apps.nbu.files (user 10) was already open on the phone; \
+             it moved into this window and closing the window will quit it"
+        );
     }
 
     #[test]

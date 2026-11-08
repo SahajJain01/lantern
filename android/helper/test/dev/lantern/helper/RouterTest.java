@@ -34,6 +34,7 @@ public final class RouterTest {
         volatile ResizeListener resizeListener;
         volatile String closeThread;
         volatile int keyframes;
+        volatile boolean moved;
 
         FakeHandle(Rig rig, int win, int w, int h, VideoSink sink) {
             this.rig = rig;
@@ -73,6 +74,11 @@ public final class RouterTest {
             rig.event("resize " + win + " " + nw + "x" + nh + "/" + dpi);
             w = nw;
             h = nh;
+        }
+
+        @Override
+        public boolean moved() {
+            return moved;
         }
 
         @Override
@@ -137,6 +143,7 @@ public final class RouterTest {
                 sink.packet(win, 0, true, false, ByteBuffer.wrap(new byte[] {0, 0, 0, 1, 0x40}));
                 FakeHandle fh = new FakeHandle(this, win, w, h, sink);
                 fh.failOnClose = failOnCloseNext;
+                fh.moved = pkg.equals("moved.pkg");
                 handles.put(win, fh);
                 return fh;
             };
@@ -295,6 +302,7 @@ public final class RouterTest {
             eq("h264", m.str("codec"), "codec");
             eq(1280L, m.num("w"), "w");
             eq(800L, m.num("h"), "h");
+            check(!m.fields().containsKey("moved"), "no moved field for a fresh task: " + m);
             Proto.Frame v = Proto.read(r.in);
             eq(Proto.KIND_VIDEO, v.kind, "buffered config packet follows opened");
             eq(3, v.stream, "video stream");
@@ -308,6 +316,20 @@ public final class RouterTest {
             eq("closed", c.str("reason"), "reason");
             check(r.events.contains("close 3"), "display closed: " + r.events);
             eq(1, r.video.size(), "live video frame relayed before closed");
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+    }
+
+    static void openedSaysMovedForAnExistingTask() throws Exception {
+        try (Rig r = new Rig()) {
+            r.hello();
+            r.send(4, "{\"t\":\"open\",\"pkg\":\"moved.pkg\",\"user\":10,\"w\":1280,\"h\":800,\"dpi\":160}");
+            Msg m = r.control(4);
+            eq("opened", m.t, "opened");
+            eq(Boolean.TRUE, m.fields().get("moved"), "moved: " + m);
+            byte[] wire = CODEC.encode(m);
+            check(new String(wire, java.nio.charset.StandardCharsets.UTF_8).endsWith(",\"moved\":true}"), "wire");
             r.send(0, "{\"t\":\"bye\"}");
             r.awaitExit(2000);
         }
@@ -499,6 +521,7 @@ public final class RouterTest {
             {"requiresHelloFirst", (Case) RouterTest::requiresHelloFirst},
             {"helloStartsSessionAndReplies", (Case) RouterTest::helloStartsSessionAndReplies},
             {"openThenCloseCallsFactoryAndClose", (Case) RouterTest::openThenCloseCallsFactoryAndClose},
+            {"openedSaysMovedForAnExistingTask", (Case) RouterTest::openedSaysMovedForAnExistingTask},
             {"eofClosesAllDisplays", (Case) RouterTest::eofClosesAllDisplays},
             {"appExitSendsClosedAppExited", (Case) RouterTest::appExitSendsClosedAppExited},
             {"streamFailureClosesWithErrorOffDrainThread", (Case) RouterTest::streamFailureClosesWithErrorOffDrainThread},

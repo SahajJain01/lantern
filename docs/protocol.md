@@ -35,7 +35,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 |---|---|
 | `hello` | `version: u32`, `token: string` |
 | `open` | `pkg: string`, `user: u32` (Android user/profile id, `0..=i32::MAX`), `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string` |
-| `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32` |
+| `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32`, optional `moved: bool` (absent = false) |
 | `resize` | `w: u32`, `h: u32`, `dpi: u32` |
 | `resized` | `w: u32`, `h: u32` |
 | `focus` | optional `activation_token: string` |
@@ -56,6 +56,14 @@ JSON objects tagged by `"t"` (snake_case). Example:
   `code`, a `msg` starting `protocol version mismatch`) as a version mismatch and exits 3 (see
   Exit statuses); any other handshake `error` is retried with backoff.
 - `opened` is sent before any video for that window. `codec` is `"h265"` or `"h264"`.
+  `moved:true` means the task on the display existed before the launch (the app was already open
+  on the phone or in its recents, and Android moved that task onto the Lantern display: LauncherApps
+  cannot request a new task, and singleTask apps reuse theirs). Closing the window quits it. The
+  helper only sends `moved` when true, so an ordinary `opened` is the v1 bytes; the client prints
+  one line about it on stderr. Before launching, the helper records the app's tasks for that user
+  on every display; if no task reaches the Lantern display within 3 s, it removes any task of that
+  app and user that was not in the record (wherever it landed, e.g. the phone's own screen), never
+  one that existed before, and fails the open.
 - `open.user`: the helper resolves `pkg`'s launcher activity in that user's package manager and
   starts it as that user (`am start --user N` semantics). For a user with the
   `no_debugging_features` restriction (Android bars the shell uid from such users) that is a profile

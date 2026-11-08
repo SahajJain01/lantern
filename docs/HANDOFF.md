@@ -95,6 +95,11 @@ started by the app on a real device, long runs with 5–6 encoders, and interact
     ActivityOptions.setLaunchDisplayId(id), user)`. LauncherAppsService checks the profile group,
     not the shell's access to the user, so the MDM restriction does not apply. The intent is built
     by LauncherApps (`NEW_TASK|RESET_TASK_IF_NEEDED`, no `MULTIPLE_TASK`).
+    `LaunchTasks` (pure, host-tested) records that app+user's tasks on all displays
+    (`getTasks(…, INVALID_DISPLAY)`) before launching: a pre-existing task that lands on the Lantern
+    display is reported as `opened.moved` (the window prints one stderr line); if none lands within
+    3 s, only tasks NOT in the record are removed (e.g. one that started on display 0). Both routes
+    do this (singleTask apps reuse their task even with `MULTIPLE_TASK`).
   - `LEGACY`: user 0 when any hidden user/package check throws (other Android releases):
     `getLaunchIntentForPackage`, as before user support.
   - `running` uses `isUserRunning(user, FLAG_AND_UNLOCKED)`, so a RUNNING_LOCKED user is refused.

@@ -469,8 +469,12 @@ impl App {
                 codec,
                 w,
                 h,
+                moved,
             } if self.state.win().is_none() => {
-                tracing::info!(win = stream, phone_display, task, %codec, w, h, "opened");
+                tracing::info!(win = stream, phone_display, task, %codec, w, h, moved, "opened");
+                if moved {
+                    eprintln!("{}", self.id.moved_notice());
+                }
                 self.state.opened(stream);
                 self.display = (w, h);
                 if let Err(error) = self.create_window(el) {
