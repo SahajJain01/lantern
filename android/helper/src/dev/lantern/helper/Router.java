@@ -367,7 +367,9 @@ public final class Router {
         }
         DisplayHandle d = wn.handle;
         try {
-            injector.inject(d.displayId(), d.width(), d.height(), ev);
+            // The window normalizes to the video it shows, which is the encoder's top-left crop
+            // of the display: scale by the video size, not the display's.
+            injector.inject(d.displayId(), d.videoWidth(), d.videoHeight(), ev);
         } catch (RuntimeException e) {
             log.accept("router: inject win=" + win + " failed: " + e);
         }

@@ -13,6 +13,19 @@ public interface DisplayHandle extends AutoCloseable {
 
     int height();
 
+    /**
+     * Width of the video the window shows: the encoder captures the top-left
+     * {@code videoWidth()×videoHeight()} of the display (its size aligned down to 16), so
+     * normalized pointer coordinates are fractions of this, not of {@link #width()}.
+     */
+    default int videoWidth() {
+        return Math.min(width(), Encoder.Policy.align(width()));
+    }
+
+    default int videoHeight() {
+        return Math.min(height(), Encoder.Policy.align(height()));
+    }
+
     void resize(int w, int h, int dpi);
 
     boolean taskVanished();

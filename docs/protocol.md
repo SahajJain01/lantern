@@ -23,7 +23,9 @@ server (Java) over a single byte stream.
   is rejected as invalid data before the payload is read.
 - EOF exactly at a frame boundary is a clean end of stream. EOF inside a frame (including inside the
   4-byte `len`) is an error.
-- Pointer and scroll `x`/`y` are normalized to `0..1` of the display. `f32` is IEEE-754 binary32.
+- Pointer and scroll `x`/`y` are normalized to `0..1` of the video, i.e. of the part of the display the
+  encoder captures: its top-left `align16(w)×align16(h)` (sizes aligned down to 16). The helper scales
+  by that size, not the display's. `f32` is IEEE-754 binary32.
 - Input payloads must be exactly the size of their type; trailing bytes are an error.
 
 ## Control messages

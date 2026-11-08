@@ -426,6 +426,28 @@ public final class RouterTest {
         }
     }
 
+    /**
+     * The encoder captures only the top-left 16-aligned part of the display (990x749 -> 976x736),
+     * and the window normalizes the pointer to that video: scale by the video, not the display,
+     * or clicks land right of/below the cursor by up to 15 px.
+     */
+    static void pointerScalesToTheEncodedVideo() throws Exception {
+        try (Rig r = new Rig()) {
+            r.hello();
+            FakeHandle h = r.open(2);
+            r.send(2, "{\"t\":\"resize\",\"w\":990,\"h\":749,\"dpi\":176}");
+            Rig.await("resize", 2000, () -> r.events.contains("resize 2 990x749/176"));
+            ByteBuffer p = ByteBuffer.allocate(1 + 1 + 8 + 4 + 4 + 4 + 4);
+            p.put((byte) Proto.INPUT_POINTER).put((byte) Proto.POINTER_HOVER_MOVE).putLong(1).putFloat(.5f)
+                .putFloat(.5f).putInt(0).putFloat(0f);
+            Proto.write(r.out, Proto.KIND_INPUT, 2, p.array());
+            Rig.await("inject", 2000, () -> r.events.stream().anyMatch(e -> e.startsWith("inject pointer")));
+            List<String> ev = new ArrayList<>(r.events);
+            check(ev.contains("inject pointer display=12 976x736"), "pointer scaled to the video: " + ev);
+            eq(990, h.width(), "display keeps the asked width");
+        }
+    }
+
     static void inputAndFocusRouteToWindow() throws Exception {
         try (Rig r = new Rig()) {
             r.hello();
@@ -528,6 +550,7 @@ public final class RouterTest {
             {"streamFailureDuringCloseIgnored", (Case) RouterTest::streamFailureDuringCloseIgnored},
             {"resizeAndRotationSendResized", (Case) RouterTest::resizeAndRotationSendResized},
             {"inputAndFocusRouteToWindow", (Case) RouterTest::inputAndFocusRouteToWindow},
+            {"pointerScalesToTheEncodedVideo", (Case) RouterTest::pointerScalesToTheEncodedVideo},
             {"openFailureSendsErrorAndClosed", (Case) RouterTest::openFailureSendsErrorAndClosed},
             {"unknownControlTypeIsAnError", (Case) RouterTest::unknownControlTypeIsAnError},
             {"blockedWriterDoesNotHangTeardown", (Case) RouterTest::blockedWriterDoesNotHangTeardown},
