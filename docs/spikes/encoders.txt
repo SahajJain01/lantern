@@ -24,4 +24,4 @@
 scrcpy 5.0.1 <https://github.com/Genymobile/scrcpy>
 INFO: ADB device found:
 INFO:     -->   (usb)  20e9318                         device  2107113SG
-/home/acer/.local/opt/scrcpy-linux-x86_64-v5.0.1/scrcpy-server: 1 file pushed, 0 skipped. 347.8 MB/s (733930 bytes in 0.002s)
+~/.local/opt/scrcpy-linux-x86_64-v5.0.1/scrcpy-server: 1 file pushed, 0 skipped. 347.8 MB/s (733930 bytes in 0.002s)

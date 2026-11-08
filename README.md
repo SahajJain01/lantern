@@ -1,35 +1,75 @@
 # Lantern
 
-> New session? Start with [docs/HANDOFF.md](docs/HANDOFF.md).
-
 Run Android apps from a phone plugged into your PC as ordinary KDE Plasma (Wayland) windows.
-Each app gets its own window, taskbar entry and size. It runs on its own virtual display on the
-phone, so the phone's own screen is not mirrored.
+Each app gets its own window, taskbar entry, Alt-Tab entry and remembered size. Each app also runs
+on its own virtual display on the phone, so Lantern doesn't mirror the phone's screen and the apps
+don't share one canvas. Close the window and the app quits on the phone.
+
+> **Status: pre-release (v0.1.0-alpha).** Lantern is a personal project. It is built and tested on
+> one setup: KDE Plasma 6 Wayland on Ubuntu 26.04 with an Intel GPU, plus a Xiaomi 11T Pro on
+> Android 17 (LineageOS 24) and a Motorola edge 50 pro on Android 16, over USB. Other phones,
+> Android versions, GPUs and desktops may not work. Text typing, clipboard, audio and notifications
+> are not here yet; see the [Roadmap](#roadmap).
+
+## How it works
 
 Two parts, both in the one `lantern` binary:
 
-- `lanternd` (`lantern daemon`, a systemd user service) watches adb for the phone, deploys a small
-  helper to it and keeps one session open while it is plugged in.
-- `lantern open <package>` is one window. Close the window and the app quits on the phone.
+- `lanternd` (`lantern daemon`, a systemd user service) watches adb for the phone and deploys a
+  small helper to it. It keeps one session open while the phone is plugged in.
+- `lantern open <package>` is one window. It decodes that app's H.265/H.264 stream with VA-API and
+  draws it with wgpu. Mouse, scroll and keys go back to the app.
 
-Requirements: KDE Plasma on Wayland, `adb` on `PATH` with the phone authorized for USB debugging
-(Android 15+, API 35), VA-API for hardware decoding (software decoding is the fallback), the
-Rust toolchain, and the JDK and Android build tools for the helper (`~/.local/opt/pd-toolchain`).
-lanternd serves the only connected device. With several devices connected, set
-`LANTERN_SERIAL` to the one it should serve (`systemctl --user edit lanternd`, then
-`[Service]` / `Environment=LANTERN_SERIAL=<serial>`; `adb devices` lists the serials).
+The phone side is a Java helper started over adb as the `shell` user (`app_process`, no root and
+no installed app). It creates one virtual display and hardware encoder per window, and injects
+input. It borrows a few wrappers from [scrcpy](https://github.com/Genymobile/scrcpy) 5.0.1
+(Apache-2.0, vendored under `android/helper/vendor`). The wire protocol is in
+[`docs/protocol.md`](docs/protocol.md).
+
+## Requirements
+
+- KDE Plasma on Wayland. VA-API is used for hardware decoding; software decoding is the fallback.
+- **Runtime libraries:** FFmpeg (`libavcodec`, `libavutil`) and `libva`.
+- **To build:**
+  - the Rust toolchain;
+  - the FFmpeg and libva development packages, plus clang and pkg-config;
+  - a JDK and the Android build tools for the helper.
+- **Helper toolchain:** `tools/build.py` expects the JDK, Android `build-tools` (`d8`) and
+  `platform/android.jar` (API 35+) under `~/.local/opt/pd-toolchain`. Override that path with
+  `PD_TC`.
+- `adb` on `PATH`, with the phone authorized for USB debugging. The phone must run Android 15 or
+  newer (API 35).
+- lanternd serves the only connected device. With several devices connected, set
+  `LANTERN_SERIAL` to the one it should serve: run `systemctl --user edit lanternd` and add
+  `[Service]` / `Environment=LANTERN_SERIAL=<serial>`. `adb devices` lists the serials.
 
 lanternd runs `adb` from the systemd user manager's `PATH`, not your shell's. If `adb` lives
-somewhere else (for example `~/Android/Sdk/platform-tools`), add it to that `PATH`: either in
-`~/.config/environment.d/*.conf` (`PATH=$HOME/Android/Sdk/platform-tools:$PATH`, applies from the
-next login) or with `systemctl --user edit lanternd` and
-`Environment=PATH=<dir with adb>:/usr/local/bin:/usr/bin:/bin`. Check with
-`systemctl --user show-environment | grep ^PATH`.
+somewhere else (for example `~/Android/Sdk/platform-tools`), add it to that `PATH` in one of two
+ways:
+- in `~/.config/environment.d/*.conf`: `PATH=$HOME/Android/Sdk/platform-tools:$PATH`. This applies
+  from the next login.
+- with `systemctl --user edit lanternd`:
+  `Environment=PATH=<dir with adb>:/usr/local/bin:/usr/bin:/bin`.
+
+Check the result with `systemctl --user show-environment | grep ^PATH`.
+
+### Prebuilt binary
+
+The [releases](https://github.com/SahajJain01/lantern/releases) page has a prebuilt x86_64
+`lantern` with the helper embedded. It is built on Ubuntu 26.04 and links FFmpeg 8
+(`libavcodec.so.62`). To install it:
+
+```sh
+tar xf lantern-*-x86_64-linux.tar.gz && cd lantern-*/
+install -Dm755 lantern ~/.local/bin/lantern
+install -Dm644 lanternd.service ~/.config/systemd/user/lanternd.service
+systemctl --user daemon-reload && systemctl --user enable --now lanternd
+```
 
 ## Build and install
 
 ```sh
-source ~/.local/opt/pd-toolchain/env.sh
+export PD_TC=~/.local/opt/pd-toolchain   # jdk/, build-tools/, platform/android.jar
 python3 tools/build.py install
 ```
 
@@ -149,3 +189,52 @@ windows through the KWin scripting D-Bus.
 - `host/proto/`: wire protocol (`docs/protocol.md`).
 - `host/lantern/`: daemon and window (Rust).
 - `tools/`: `build.py` (build, install), `device_test.py` (acceptance).
+
+## Roadmap
+
+Plan 1 (core) is done: per-app windows, video, mouse/scroll/keys, resize with relayout, close = quit,
+the phone restoring itself, work profiles, install, and an on-device acceptance suite. Next:
+
+**Plan 2: feels like a desktop app**
+- KDE launcher entries and icons that follow the phone's installed apps.
+- Window titles show the app's name instead of its package name (`com.foo.bar (user 10)`), with
+  "(work)" for managed profiles.
+- Typing text through a hidden Lantern keyboard (input method), including composed input such as
+  Vietnamese.
+- Text clipboard in both directions.
+- Phone-safety hardening:
+  - trust the persisted settings journal only while the setting still reads Lantern's value;
+  - a tighter match when looking for old helper processes;
+  - uninstall removes the journal.
+
+**Plan 3: integration**
+- Phone notifications in KDE. Clicking one opens that app's window.
+- Drag and drop files from the PC to the phone, through Android share with a Downloads fallback.
+- Phone audio on the PC (one stream).
+- Gamepads, following whichever Lantern window is active.
+- A tray icon, and pausing a window's encoder while it is minimised.
+- A latency harness, with a target of no more than 5 ms glass-to-glass behind scrcpy.
+
+**Later / ideas**
+- Wi-Fi or Tailscale transport (the transport is already replaceable).
+- An optional per-app `--aspect W:H` for apps that letterbox badly. For example, Microsoft Windows
+  App's remote-desktop cursor drifts when its session is letterboxed; until then, use its "Match
+  current display" resolution.
+- Encoding the full display, with nothing cropped to the 16-pixel alignment at the right and
+  bottom edges.
+- Wider phone, GPU and desktop support.
+
+Not yet verified:
+- a PIN keyguard;
+- third-party notification clicks;
+- app-initiated rotation on a real device;
+- long runs with 5–6 windows;
+- interactive play in games.
+
+Design: [`docs/superpowers/specs/2026-11-07-lantern-design.md`](docs/superpowers/specs/2026-11-07-lantern-design.md).
+Contributor and agent notes: [`docs/HANDOFF.md`](docs/HANDOFF.md).
+
+## License
+
+Apache-2.0 ([LICENSE](LICENSE)). The vendored scrcpy sources are © Genymobile and Romain Vimont,
+Apache-2.0; see `android/helper/vendor/UPSTREAM`.

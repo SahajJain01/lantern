@@ -34,13 +34,13 @@ Acceptance (`tools/device_test.py`) is 8/8 PASS on Sahaj's phone:
 
 ## Environment facts
 - Phone: Xiaomi 11T Pro, serial `20e9318`, Android 17 / SDK 37, LineageOS 24, swipe keyguard, USB only.
-- Also used: Sahaj's daily Motorola edge 50 pro, serial `ZD222LMDFV`, Android 16, users 0 and 10
-  (Intune work profile); its `stay_on_while_plugged_in` original is `0`.
+- Also used: a Motorola edge 50 pro, Android 16, users 0 and 10 (a managed work profile with
+  `no_debugging_features`); its `stay_on_while_plugged_in` original is `0`.
 - Rust is in `~/.cargo/bin`, which is not on the agent tool's PATH. Prefix commands with
   `export PATH="$HOME/.cargo/bin:$PATH"`. Work in `host/` (`cargo test --workspace`); there are 143
   tests.
 - The FFmpeg, VA-API, Wayland and clang dev headers are installed. The GPU is Intel (renderD128).
-- Commit as `git -c user.name='Sahaj Jain' -c user.email='jainsahaj@gmail.com'`.
+- Commit with the repo's usual author identity (`git log -1 --format='%an <%ae>'`).
 - What Lantern leaves on the phone:
   - Always: `/data/local/tmp/lantern-helper-<sha256>.jar`.
   - During a session: `/data/local/tmp/lantern-session.json`, a journal of the original
@@ -120,7 +120,7 @@ started by the app on a real device, long runs with 5–6 encoders, and interact
   - `running` uses `isUserRunning(user, FLAG_AND_UNLOCKED)`, so a RUNNING_LOCKED user is refused.
   - Task lookup/close/app-exit are by display (`getTasks(…, displayId)` / `removeTask`); the shell
     uid sees and removes user-10 tasks even under `no_debugging_features`.
-- **Device result, Motorola edge 50 pro (`ZD222LMDFV`, Android 16), user 10 = Intune work profile
+- **Device result, Motorola edge 50 pro (Android 16), user 10 = managed (MDM) work profile
   with `no_debugging_features`:** `am start --user 10` / `pm list packages --user 10` fail ("Shell
   does not have permission to access user 10"), but `lantern open --user 10
   com.google.android.apps.nbu.files` opens work Files in its own KDE window
