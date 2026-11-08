@@ -185,6 +185,10 @@ started by the app on a real device, long runs with 5–6 encoders, and interact
   - ANSI colour codes end up in the journal.
   - A personal fallback serial `20e9318` remains in `select_serial`.
 - **Window**
+  - The phone display is the exact requested size, but the encoder captures only its top-left
+    16-aligned part: up to 15 px at the right and bottom are never shown. Input is scaled to the
+    captured part (fixed 55996ad; see `.superpowers/mouse-offset.md`). To show everything, request
+    16-aligned displays, or encode at the exact size where the codec allows it.
   - On focus loss, keys are released in press order instead of reverse order, and the synthetic key-up
     fires key-up actions.
   - A scale-only change doesn't send the new dpi.
