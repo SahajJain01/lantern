@@ -58,27 +58,27 @@ pub fn decode_text(bytes: Vec<u8>) -> Option<String> {
 /// oversize text. Only changes sync; nothing is pushed when a session starts.
 #[derive(Debug, Default)]
 pub struct ClipSync {
-    /// The text last synced either way (the phone's last `clip`, or the last PC text sent).
-    /// Putting the phone's text on the PC comes back as a selection, and Klipper may re-own the
-    /// selection with the same text: neither goes back. Copying an older text again after the
-    /// phone changed is still a change.
+    /// The phone's last `clip`. Putting it on the PC comes back as a selection (and Klipper may
+    /// re-own it): not sent back. The PC's own sent text is not remembered, and any other PC
+    /// change, synced or not (secret, oversize, no text), clears this, so the phone's text copied
+    /// again later is sent.
     last_from_phone: Option<String>,
 }
 
 impl ClipSync {
     /// The PC selection changed: the text to send to the phone, if any.
     pub fn pc_changed(&mut self, offer: &PcOffer) -> Option<String> {
-        if offer.secret {
-            return None;
-        }
-        let text = offer.text.as_ref()?;
-        if text.is_empty() || text.len() > MAX_CLIP {
-            return None;
-        }
+        let text = match &offer.text {
+            Some(t) if !offer.secret && !t.is_empty() && t.len() <= MAX_CLIP => t,
+            _ => {
+                self.last_from_phone = None;
+                return None;
+            }
+        };
         if self.last_from_phone.as_deref() == Some(text.as_str()) {
             return None;
         }
-        self.last_from_phone = Some(text.clone());
+        self.last_from_phone = None;
         Some(text.clone())
     }
 
@@ -162,14 +162,41 @@ mod tests {
         );
     }
 
-    /// Klipper re-owning the selection repeats the same text: sent once.
+    /// Only the phone's text is suppressed: the PC's own sent text is not remembered, so a
+    /// re-copy of it is sent (the phone may hold something else by then).
     #[test]
-    fn clip_sync_repeated_pc_selection_sent_once() {
+    fn clip_sync_pc_recopy_is_sent() {
         let mut sync = ClipSync::default();
         assert_eq!(sync.pc_changed(&offer(Some("a"), false)), Some("a".into()));
-        assert_eq!(sync.pc_changed(&offer(Some("a"), false)), None);
-        sync.from_phone("b".into());
         assert_eq!(sync.pc_changed(&offer(Some("a"), false)), Some("a".into()));
+    }
+
+    /// Phone X -> PC, then an unsyncable PC change (secret, oversize, no text), then the phone's
+    /// X copied again on the PC: sent, since the phone may now hold something else.
+    #[test]
+    fn clip_sync_unsyncable_pc_change_resets_echo() {
+        let over = "a".repeat(MAX_CLIP + 1);
+        let unsyncable = [
+            offer(Some("hunter2"), true),
+            offer(Some(&over), false),
+            offer(None, false),
+            offer(Some(""), false),
+        ];
+        for (i, bad) in unsyncable.iter().enumerate() {
+            let mut sync = ClipSync::default();
+            sync.from_phone("x".into());
+            assert_eq!(
+                sync.pc_changed(&offer(Some("x"), false)),
+                None,
+                "echo, case {i}"
+            );
+            assert_eq!(sync.pc_changed(bad), None, "unsyncable, case {i}");
+            assert_eq!(
+                sync.pc_changed(&offer(Some("x"), false)),
+                Some("x".into()),
+                "re-copy after unsyncable, case {i}"
+            );
+        }
     }
 
     #[test]

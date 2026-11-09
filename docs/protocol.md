@@ -127,11 +127,13 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
   keyboard failed (the catalogue still syncs; only PC text input is missing). Without the
   companion the session still works, with no catalogue and no PC text input.
 - `clip` carries plain text only, on stream 0, and only changes sync: nothing is pushed when a
-  session starts. Each side remembers the text last synced either way (received, or sent) and
-  does not send a change to that same text: setting a clipboard fires its own change
-  notification, Android may fire its listener more than once per copy, and Klipper may re-own
-  the PC selection with the same text. Copying an older text again after the other side changed
-  is still sent. Neither side sends empty
+  session starts. Each side suppresses only the echo of the text it last received from the
+  other side (setting a clipboard fires its own change notification, and Klipper may re-own the
+  PC selection with the same text); it never remembers its own sent text, so a re-copy is always
+  sent. Any other local change, synced or not (sensitive or secret, over `MAX_CLIP`, no text or
+  empty text), clears the received text, so copying it again later is sent. Android fires its
+  listener twice per copy: the helper skips a change whose `ClipDescription.getTimestamp()`
+  equals the last handled one. Neither side sends empty
   text or text over `MAX_CLIP`; a `clip` from lanternd over `MAX_CLIP` is a protocol error on
   the helper (checked before anything else). `clip` on a window stream is a protocol error.
 - Secrets stay put: the helper never sends a phone clip whose description has the extra

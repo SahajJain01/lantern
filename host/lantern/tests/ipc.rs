@@ -1305,6 +1305,14 @@ async fn clipboard_syncs_both_ways_without_echo() {
 
     offers.send(pc_offer("hunter2", true)).await.unwrap();
     helper.assert_quiet().await;
+    // After the unsyncable secret, the phone's text copied again on the PC is a real change.
+    offers.send(pc_offer("phone-1", false)).await.unwrap();
+    assert_eq!(
+        decode(&helper.next().await),
+        Control::Clip {
+            text: "phone-1".into()
+        }
+    );
 
     offers.send(pc_offer("pc-2", false)).await.unwrap();
     assert_eq!(

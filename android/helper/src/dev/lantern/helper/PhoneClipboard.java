@@ -81,13 +81,14 @@ final class PhoneClipboard implements AutoCloseable {
             String text = cs == null ? null : cs.toString();
             boolean sensitive = false;
             ClipDescription d = clip.getDescription();
+            long stamp = d == null ? 0 : d.getTimestamp();
             PersistableBundle extras = d == null ? null : d.getExtras();
             if (extras != null) {
                 sensitive = extras.getBoolean(EXTRA_IS_SENSITIVE, false);
             }
             log.accept("clip: phone clipboard changed: " + (text == null ? "no text" : text.length() + " chars")
                 + (sensitive ? ", sensitive (not sent)" : ""));
-            sync.phoneChanged(text, sensitive);
+            sync.phoneChanged(text, sensitive, stamp);
         } catch (RuntimeException e) {
             log.accept("clip: reading the phone clipboard failed: " + e);
         }
