@@ -659,7 +659,9 @@ public final class Router {
         try {
             return codec.decode(payload);
         } catch (IOException e) {
-            throw new ProtocolError("bad control message: " + e.getMessage());
+            // Never the parser's message: it may quote the payload (typed or clipboard text), and
+            // this one is logged here and by lanternd.
+            throw new ProtocolError("bad control message (" + payload.length + " bytes)");
         }
     }
 

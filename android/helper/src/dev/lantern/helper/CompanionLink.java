@@ -509,7 +509,8 @@ public final class CompanionLink implements Closeable {
                 try {
                     m = codec.decode(f.payload);
                 } catch (IOException e) {
-                    log.accept("companion: undecodable message dropped: " + e.getMessage());
+                    // Never the parser's message: it may quote the payload.
+                    log.accept("companion: undecodable message of " + f.payload.length + " bytes dropped");
                     continue;
                 }
                 if (RELAYED.contains(m.t)) {

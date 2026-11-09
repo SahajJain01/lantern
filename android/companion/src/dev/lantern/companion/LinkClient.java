@@ -121,7 +121,8 @@ public final class LinkClient {
             try {
                 m = codec.decode(f.payload);
             } catch (IOException e) {
-                log.accept("link: undecodable message dropped: " + e.getMessage());
+                // Never the parser's message: it may quote the payload (typed text).
+                log.accept("link: undecodable message of " + f.payload.length + " bytes dropped");
                 continue;
             }
             try {

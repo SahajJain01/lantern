@@ -61,7 +61,8 @@ public final class Control {
         try {
             o = new JSONObject(new String(payload, StandardCharsets.UTF_8));
         } catch (JSONException e) {
-            throw new IOException("bad control json: " + e.getMessage());
+            // Never e.getMessage(): org.json quotes the input, which may be typed or clipboard text.
+            throw new IOException("bad control json (" + payload.length + " bytes)");
         }
         Object t = o.opt("t");
         if (!(t instanceof String)) {

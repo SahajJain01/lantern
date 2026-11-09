@@ -343,8 +343,18 @@ impl Control {
         serde_json::to_vec(self).expect("Control serializes")
     }
 
+    /// The error names the failure's category, position and the payload's size only: serde_json's
+    /// own message quotes offending values, and a payload may hold typed or clipboard text.
     pub fn decode(b: &[u8]) -> io::Result<Self> {
-        serde_json::from_slice(b).map_err(|e| invalid(format!("bad control json: {e}")))
+        serde_json::from_slice(b).map_err(|e| {
+            invalid(format!(
+                "bad control json ({:?} error at line {} column {}, {} bytes)",
+                e.classify(),
+                e.line(),
+                e.column(),
+                b.len()
+            ))
+        })
     }
 }
 
@@ -591,6 +601,26 @@ mod tests {
                 payload: vec![],
             },
         ]
+    }
+
+    /// serde_json's messages quote offending values (an unknown variant, a string of the wrong
+    /// type), and decode errors are logged, so they must never carry the payload: it may hold typed
+    /// or clipboard text.
+    #[test]
+    fn control_decode_error_never_echoes_the_payload() {
+        for bad in [
+            &br#"{"t":"ime","op":"hunter2 secret","text":""}"#[..],
+            br#"{"t":"open","pkg":"x","user":"hunter2 secret","w":1,"h":1,"dpi":1}"#,
+            br#"{"t":"hunter2 secret"}"#,
+            br#"{"t":"clip","text":"hunter2 secret""#,
+        ] {
+            let error = Control::decode(bad).unwrap_err().to_string();
+            assert!(!error.contains("hunter2"), "{error}");
+            assert!(
+                error.contains(&format!("{} bytes", bad.len())),
+                "names the size: {error}"
+            );
+        }
     }
 
     #[test]

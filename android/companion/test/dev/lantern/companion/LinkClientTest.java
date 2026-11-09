@@ -162,6 +162,44 @@ public final class LinkClientTest {
         }
     }
 
+    /** An undecodable frame is logged by type of failure and size, never with its payload (M1). */
+    static void undecodableFrameNeverLogsThePayload() throws Exception {
+        try (Rig r = new Rig()) {
+            check(r.handshake("{\"t\":\"hello\",\"version\":1,\"token\":\"\"}") == null, "linked");
+            Thread t = new Thread(() -> {
+                try {
+                    r.client.run(new LinkClient.Handler() {
+                        @Override
+                        public void imePrev(String id) {
+                        }
+
+                        @Override
+                        public void ime(int display, String op, String text) {
+                        }
+
+                        @Override
+                        public void sync() {
+                        }
+                    });
+                } catch (IOException e) {
+                    // EOF
+                }
+            });
+            t.start();
+            r.send("{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"hunter2 secret\""); // no closing brace
+            r.helper.shutdownOutput();
+            t.join(3000);
+            boolean logged = false;
+            synchronized (r.logs) {
+                for (String l : r.logs) {
+                    check(!l.contains("hunter2"), "log carries the payload: " + l);
+                    logged |= l.contains("undecodable") && l.contains("bytes");
+                }
+            }
+            check(logged, "dropped frame logged with its size: " + r.logs);
+        }
+    }
+
     static void sendWritesControlFrames() throws Exception {
         try (Rig r = new Rig()) {
             check(r.client.send(Msg.of("apps_end").put("count", 0)), "send ok");
@@ -220,6 +258,7 @@ public final class LinkClientTest {
             {"handshakeFailsWhenClosed", (Case) LinkClientTest::handshakeFailsWhenClosed},
             {"handshakeRejectsWrongReply", (Case) LinkClientTest::handshakeRejectsWrongReply},
             {"runStoresImePrevRoutesImeDropsOthers", (Case) LinkClientTest::runStoresImePrevRoutesImeDropsOthers},
+            {"undecodableFrameNeverLogsThePayload", (Case) LinkClientTest::undecodableFrameNeverLogsThePayload},
             {"sendWritesControlFrames", (Case) LinkClientTest::sendWritesControlFrames},
             {"linkTypesAddImePrevAndSyncOnly", (Case) LinkClientTest::linkTypesAddImePrevAndSyncOnly},
             {"validatesLinkCall", (Case) LinkClientTest::validatesLinkCall},

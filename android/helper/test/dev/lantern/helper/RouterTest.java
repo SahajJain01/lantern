@@ -130,6 +130,8 @@ public final class RouterTest {
         final DataInputStream in;
         final Thread thread;
         final List<Proto.Frame> video = Collections.synchronizedList(new ArrayList<>());
+        /** The router's log lines. */
+        final List<String> logs = Collections.synchronizedList(new ArrayList<>());
         volatile boolean failOnCloseNext;
 
         Rig() throws IOException {
@@ -181,7 +183,7 @@ public final class RouterTest {
                     event("transport close");
                     server.close();
                 },
-                msg -> { });
+                logs::add);
             setup.accept(r);
             thread = new Thread(r::run, "router");
             thread.start();
@@ -467,6 +469,27 @@ public final class RouterTest {
             r.open(1); // the session goes on
             r.send(0, "{\"t\":\"bye\"}");
             r.awaitExit(2000);
+        }
+    }
+
+    /**
+     * A malformed control frame is a protocol error whose message (sent to lanternd, which logs it)
+     * and log line never carry the payload: it may hold typed or clipboard text (M1).
+     */
+    static void malformedControlNeverEchoesThePayload() throws Exception {
+        try (Rig r = new Rig()) {
+            r.hello();
+            r.send(0, "{\"t\":\"clip\",\"text\":\"hunter2 secret\""); // no closing brace
+            Msg e = r.control(0);
+            eq("error", e.t, "error");
+            check(!e.str("msg").contains("hunter2"), "error msg carries the payload: " + e.str("msg"));
+            check(e.str("msg").contains("bytes"), "names the size instead: " + e.str("msg"));
+            r.awaitExit(2000);
+            synchronized (r.logs) {
+                for (String l : r.logs) {
+                    check(!l.contains("hunter2"), "log carries the payload: " + l);
+                }
+            }
         }
     }
 
@@ -798,6 +821,7 @@ public final class RouterTest {
             {"setExtrasAcceptsHandler", (Case) RouterTest::setExtrasAcceptsHandler},
             {"imeOnLiveWindowReachesExtras", (Case) RouterTest::imeOnLiveWindowReachesExtras},
             {"imeCarriesItsWindowsDisplay", (Case) RouterTest::imeCarriesItsWindowsDisplay},
+            {"malformedControlNeverEchoesThePayload", (Case) RouterTest::malformedControlNeverEchoesThePayload},
             {"imeForUnknownWindowIgnored", (Case) RouterTest::imeForUnknownWindowIgnored},
             {"imeUnknownOpIsAnError", (Case) RouterTest::imeUnknownOpIsAnError},
             {"imeTextOverLimitIsAnError", (Case) RouterTest::imeTextOverLimitIsAnError},
