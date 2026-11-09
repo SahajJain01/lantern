@@ -12,8 +12,8 @@ use lantern::daemon::ipc;
 use lantern::daemon::session::{handshake, SessionConn};
 use lantern::daemon::{serve, RetryPolicy};
 use lantern_proto::{
-    read_frame_async, write_frame_async, CloseReason, Control, Frame, Kind, SessionState,
-    StatusReport, WindowInfo,
+    read_frame_async, write_frame_async, CloseReason, CompanionState, Control, Frame, Kind,
+    SessionState, StatusReport, WindowInfo,
 };
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -1106,5 +1106,44 @@ async fn single_instance_is_per_pkg_and_user() {
     assert_eq!((report.windows[0].id, report.windows[0].user), (win0, 0));
     let (_again, win10b) = open_window(&daemon.sock, &mut helper, "com.example", 10).await;
     assert!(win10b > win10);
+    daemon.shutdown().await;
+}
+
+/// `companion` follows the live session's last `companion` message and is absent otherwise
+/// (no message yet, and after the session ends).
+#[tokio::test]
+async fn status_reports_companion_state() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let ready = status_until(&daemon.sock, |r| r.state == SessionState::Ready).await;
+    assert_eq!(ready.companion, None, "no companion message yet");
+
+    let companion = |state, msg: Option<&str>| {
+        control(
+            0,
+            Control::Companion {
+                state,
+                msg: msg.map(str::to_owned),
+            },
+        )
+    };
+    helper.send(companion(
+        CompanionState::Unavailable,
+        Some("not installed"),
+    ));
+    status_until(&daemon.sock, |r| {
+        r.companion == Some(CompanionState::Unavailable)
+    })
+    .await;
+    helper.send(companion(CompanionState::Ready, None));
+    status_until(&daemon.sock, |r| r.companion == Some(CompanionState::Ready)).await;
+    helper.assert_quiet().await; // never echoed to the phone
+
+    // The session dies and a new one starts: the old state does not carry over.
+    helper.die();
+    assert_eq!(helper.next_session().await, 0);
+    assert_eq!(helper.next_session().await, 1);
+    let report = status_until(&daemon.sock, |r| r.state == SessionState::Ready).await;
+    assert_eq!(report.companion, None, "{report:?}");
     daemon.shutdown().await;
 }

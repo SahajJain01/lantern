@@ -1,3 +1,4 @@
+pub mod companion;
 pub mod ipc;
 pub mod registry;
 pub mod session;
@@ -18,7 +19,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::Instant;
 
 use crate::adb::{track_devices, Adb, DeviceEvent};
-use crate::daemon::session::{start, HandshakeError};
+use crate::daemon::session::{start_with_companion, HandshakeError};
 
 fn select_serial(configured: Option<&str>, connected: &HashSet<String>) -> Option<String> {
     if let Some(serial) = configured {
@@ -312,11 +313,16 @@ pub async fn run() -> Result<()> {
             _ = sigterm.recv() => "SIGTERM",
         }
     };
+    // Shared by every session start: the companion-failure notice is once per daemon run.
+    let setup = std::sync::Arc::new(companion::Setup::desktop());
     serve(
         listener,
         configured,
         track_devices(),
-        |serial| async move { start(&Adb::new(serial)).await },
+        move |serial| {
+            let setup = setup.clone();
+            async move { start_with_companion(&Adb::new(serial), &setup).await }
+        },
         shutdown,
         RetryPolicy::default(),
     )

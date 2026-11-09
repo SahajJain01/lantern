@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use lantern_proto::{
-    read_frame_async, write_frame_async, Control, Frame, InputEvent, Kind, SessionState,
-    StatusReport, WindowInfo,
+    read_frame_async, write_frame_async, CompanionState, Control, Frame, InputEvent, Kind,
+    SessionState, StatusReport, WindowInfo,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -272,6 +272,8 @@ pub struct Hub {
     registry: Registry,
     /// The session part of `lantern status`, kept current by the run loop.
     session: (SessionState, Option<String>, Option<String>),
+    /// The live session's last `companion` state; cleared when the session ends.
+    companion: Option<CompanionState>,
     next_cid: u64,
     events_tx: mpsc::Sender<ClientEvent>,
     events: mpsc::Receiver<ClientEvent>,
@@ -288,6 +290,7 @@ impl Hub {
             info: HashMap::new(),
             registry: Registry::default(),
             session: (SessionState::Idle, None, None),
+            companion: None,
             next_cid: 0,
             events_tx,
             events,
@@ -310,12 +313,13 @@ impl Hub {
         let mut windows: Vec<WindowInfo> = self.info.values().cloned().collect();
         windows.sort_by_key(|w| w.id);
         let (state, serial, helper) = self.session.clone();
+        let companion = self.companion.filter(|_| state == SessionState::Ready);
         StatusReport {
             state,
             serial,
             helper,
             windows,
-            companion: None,
+            companion,
         }
     }
 
@@ -614,6 +618,18 @@ impl Hub {
         if frame.stream == 0 {
             match Control::decode(&frame.payload) {
                 Ok(Control::Error { msg, .. }) => tracing::error!(msg, "helper session error"),
+                Ok(Control::Companion { state, msg }) => {
+                    match state {
+                        CompanionState::Ready => tracing::info!("companion linked"),
+                        CompanionState::Unavailable => {
+                            tracing::warn!(
+                                msg = msg.as_deref().unwrap_or(""),
+                                "companion unavailable"
+                            )
+                        }
+                    }
+                    self.companion = Some(state);
+                }
                 other => tracing::debug!(?other, "helper stream-0 frame"),
             }
             return Ok(());
@@ -649,5 +665,6 @@ impl Hub {
         self.windows.clear();
         self.info.clear();
         self.registry = Registry::default();
+        self.companion = None;
     }
 }

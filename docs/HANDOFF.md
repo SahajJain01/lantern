@@ -29,7 +29,7 @@ Acceptance (`tools/device_test.py`) is 8/8 PASS on Sahaj's phone:
 | `host/lantern/` | Rust crate `lantern`. `lantern daemon` is lanternd: device tracking, helper deploy, session, window IPC. `lantern open <pkg>` is one process per window (winit/wgpu, VA-API decode). `lantern status` prints the daemon state. |
 | `docs/protocol.md` | The wire spec. Keep it in step with both sides. |
 | `docs/spikes/RESULTS.md` | Risk-spike measurements. Binding facts are folded into spec §9b. |
-| `tools/build.py` | Targets: `helper`, `install`, `uninstall`. |
+| `tools/build.py` | Targets: `helper`, `companion`, `all`, `install`, `uninstall` (runs `lantern undo-setup` best effort). |
 | `tools/device_test.py` | On-device acceptance suite: `--manual` adds item 8, `--only N…` runs selected items, `--state` prints the state. |
 
 ## Environment facts

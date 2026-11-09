@@ -15,6 +15,16 @@ pub const ADB_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on the synchronous forward removal done from `Drop` (cancelled start / dropped session).
 pub const ADB_DROP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound on `pm install` / `pm uninstall` (package verification can take a while).
+pub const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A shell command's exit status and its stdout and stderr together (`pm` reports failures on
+/// either, depending on the failure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOutput {
+    pub success: bool,
+    pub text: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct Adb {
@@ -71,6 +81,31 @@ impl Adb {
         let mut command = self.command();
         command.arg("shell").args(args);
         self.run(command, ADB_CALL_TIMEOUT).await
+    }
+
+    /// Like [`Adb::shell`], but a failing command is not an error: its status and output are
+    /// returned. Only a failure to run adb at all (spawn, deadline) is an error.
+    pub async fn shell_output(&self, args: &[&str], limit: Duration) -> Result<ShellOutput> {
+        let mut command = self.command();
+        command.arg("shell").args(args);
+        let output = timeout(limit, command.output())
+            .await
+            .map_err(|_| anyhow!("adb -s {} timed out after {limit:?}", self.serial))?
+            .context("run adb")?;
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok(ShellOutput {
+            success: output.status.success(),
+            text,
+        })
+    }
+
+    /// Pushes `bytes` to `remote` through a fresh, exclusively created host temp file named
+    /// `<stem>-<pid>-<nonce>` (unique per call, so concurrent pushes never share one). The temp
+    /// file is removed afterwards, also when the future is dropped mid-push.
+    pub async fn push_bytes(&self, bytes: &[u8], stem: &str, remote: &str) -> Result<()> {
+        let local = TempFile::create(stem, bytes)?;
+        self.push(&local.0.to_string_lossy(), remote).await
     }
 
     pub async fn push(&self, local: &str, remote: &str) -> Result<()> {
@@ -167,6 +202,35 @@ impl Adb {
             .spawn()
             .context("spawn adb shell")?;
         Ok(child)
+    }
+}
+
+/// A host temp file, removed on drop.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn create(stem: &str, bytes: &[u8]) -> Result<Self> {
+        use rand::RngCore;
+        use std::io::Write;
+        let mut nonce = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let path = std::env::temp_dir().join(format!("{stem}-{}-{nonce}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        let temp = Self(path);
+        file.write_all(bytes)
+            .with_context(|| format!("write {}", temp.0.display()))?;
+        Ok(temp)
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

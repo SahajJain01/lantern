@@ -335,3 +335,93 @@ fn failed_open_prints_the_error_once_and_exits_1() {
         .count();
     assert_eq!(printed, 1, "printed once: {stderr}");
 }
+
+/// While lanternd is starting or serving a session on the phone, undo-setup must not touch it
+/// (the helper is restoring/using the settings and the companion).
+#[test]
+fn undo_setup_refuses_live_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("undo-live");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.join("adb.log");
+    // One device online; every other adb call hangs, so the session stays `starting`.
+    let adb = bin.join("adb");
+    std::fs::write(
+        &adb,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$*\" in *track-devices*) printf '000bdev\\tdevice\\n'; exec sleep 30;; esac\nexec sleep 30\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Never reach the desktop's notification daemon from a test.
+    let notify = bin.join("notify-send");
+    std::fs::write(&notify, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&notify, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .arg("daemon")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("PATH", &path)
+        .env_remove("LANTERN_SERIAL")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let starting = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .arg("status")
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.contains("\"starting\"") {
+            break stdout;
+        }
+        assert!(Instant::now() < deadline, "never starting: {stdout}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(starting.contains("\"serial\":\"dev\""), "{starting}");
+    let calls_before = std::fs::read_to_string(&log).unwrap_or_default();
+    let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .args(["undo-setup", "--serial", "dev"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let calls_after = std::fs::read_to_string(&log).unwrap_or_default();
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("stop lanternd first: systemctl --user stop lanternd"),
+        "stderr: {stderr}"
+    );
+    // undo-setup itself made no adb call (the daemon's own calls may continue meanwhile).
+    let new_calls = &calls_after[calls_before.len().min(calls_after.len())..];
+    assert!(
+        !new_calls.contains("--forget") && !new_calls.contains("uninstall"),
+        "undo-setup touched the phone: {new_calls}"
+    );
+}
+
+#[test]
+fn undo_setup_usage_errors_exit_2() {
+    for args in [
+        &["undo-setup", "--serial"][..],
+        &["undo-setup", "extra"],
+        &["undo-setup", "--serial", ""],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}

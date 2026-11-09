@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
 use crate::adb::Adb;
+use crate::daemon::companion;
 
 const HELPER_JAR: &[u8] = include_bytes!("../../assets/helper.jar");
 
@@ -225,7 +226,7 @@ impl Drop for PendingSession {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
@@ -316,36 +317,38 @@ async fn prune_old_jars(adb: &Adb, remote: &str) {
     }
 }
 
-/// Writes the embedded jar to a fresh, exclusively created host temp file (unique per call,
-/// so concurrent starts never share or clobber one) and returns its path.
-fn write_host_jar(sha: &str) -> Result<std::path::PathBuf> {
-    use std::io::Write;
-    let mut nonce = [0u8; 8];
-    OsRng.fill_bytes(&mut nonce);
-    let path = std::env::temp_dir().join(format!(
-        "lantern-helper-{sha}-{}-{}.jar",
-        std::process::id(),
-        hex(&nonce)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("create {}", path.display()))?;
-    if let Err(error) = file.write_all(HELPER_JAR) {
-        let _ = std::fs::remove_file(&path);
-        return Err(error).context("write embedded helper jar");
-    }
-    Ok(path)
+/// The embedded helper jar's SHA-256 (lowercase hex).
+pub fn helper_sha() -> String {
+    hex(&Sha256::digest(HELPER_JAR))
 }
 
-/// Removes the host temp jar when dropped (also when the start future is cancelled mid-push).
-struct HostJar(std::path::PathBuf);
+/// Where the helper jar with SHA-256 `sha` lives on the phone.
+pub fn helper_remote(sha: &str) -> String {
+    format!("/data/local/tmp/lantern-helper-{sha}.jar")
+}
 
-impl Drop for HostJar {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+/// Makes sure the embedded helper jar is on the phone (pushed unless an intact copy is there)
+/// and returns its SHA-256 and phone path.
+pub async fn deploy_helper(adb: &Adb) -> Result<(String, String)> {
+    let helper_sha = helper_sha();
+    let remote = helper_remote(&helper_sha);
+    let installed = adb
+        .shell(&["sha256sum", &remote])
+        .await
+        .map(|output| output.split_whitespace().next() == Some(helper_sha.as_str()))
+        .unwrap_or(false);
+    if !installed {
+        adb.push_bytes(HELPER_JAR, &format!("lantern-helper-{helper_sha}"), &remote)
+            .await?;
     }
+    Ok((helper_sha, remote))
+}
+
+/// Installs or updates the companion (see [`companion::Setup::prepare`]; failures only notify
+/// and log), then starts a helper session. What `lanternd` runs for every session start.
+pub async fn start_with_companion(adb: &Adb, setup: &companion::Setup) -> Result<SessionConn> {
+    setup.prepare(adb).await;
+    start(adb).await
 }
 
 /// Starts a helper session. Every await is bounded, and the future is cancel-safe: dropping it
@@ -354,17 +357,7 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
     // One daemon owns a serial, so every lantern forward of it that exists now is a leftover
     // of a daemon that died without cleaning up.
     adb.remove_stale_lantern_forwards().await;
-    let helper_sha = hex(&Sha256::digest(HELPER_JAR));
-    let remote = format!("/data/local/tmp/lantern-helper-{helper_sha}.jar");
-    let installed = adb
-        .shell(&["sha256sum", &remote])
-        .await
-        .map(|output| output.split_whitespace().next() == Some(helper_sha.as_str()))
-        .unwrap_or(false);
-    if !installed {
-        let host = HostJar(write_host_jar(&helper_sha)?);
-        adb.push(&host.0.to_string_lossy(), &remote).await?;
-    }
+    let (helper_sha, remote) = deploy_helper(adb).await?;
     // Never overlap a previous session's helper: see wait_for_previous_helpers.
     wait_for_previous_helpers(adb, PREVIOUS_HELPER_WAIT).await?;
     // Only now: an earlier helper or its Cleanup may still be running from an old jar.

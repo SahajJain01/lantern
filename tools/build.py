@@ -5,7 +5,8 @@
     python3 tools/build.py companion  # host-JVM tests, then build/companion/lantern-companion.apk
     python3 tools/build.py all        # helper, companion, then cargo build --release (host/)
     python3 tools/build.py install  # all, then ~/.local/bin/lantern + lanternd.service (enabled)
-    python3 tools/build.py uninstall  # disable --now lanternd, remove the unit and the binary
+    python3 tools/build.py uninstall  # disable --now lanternd, `lantern undo-setup` (best
+                                      # effort), remove the unit and the binary
 
 install/uninstall are idempotent. install restarts a running lanternd only when the binary or
 the unit changed.
@@ -260,19 +261,37 @@ def install():
           f"check with `lantern status` or `journalctl --user -u {UNIT}`")
 
 
+def undo_setup():
+    """Best effort: `lantern undo-setup` (restore a leftover journal, delete Lantern's files and
+    the companion from the phone, forget the device). Needs lanternd stopped and the phone
+    connected; a failure is reported, never fatal."""
+    lantern = BIN_DIR / "lantern"
+    if not lantern.exists():
+        print(f"{lantern} not installed; skipping undo-setup")
+        return
+    try:
+        code = subprocess.run([str(lantern), "undo-setup"], timeout=180).returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        code = f"error: {e}"
+    if code != 0:
+        print(f"undo-setup did not finish ({code}); run `lantern undo-setup` again with the phone "
+              "connected, or remove the companion with `adb uninstall dev.lantern.companion`.",
+              file=sys.stderr)
+
+
 def uninstall():
     unit = UNIT_DIR / UNIT
     if unit.exists() or systemctl("cat", UNIT, check=False, quiet=True).returncode == 0:
         # Stopping lanternd restores the phone (setting, panel, displays, forward, helper).
         systemctl("disable", "--now", UNIT, check=False)
+    # undo-setup refuses while lanternd serves the phone, so only after the stop.
+    undo_setup()
     for path in (unit, BIN_DIR / "lantern"):
         if path.exists():
             path.unlink()
             print(f"removed {path}")
     run("systemctl", "--user", "daemon-reload")
     systemctl("reset-failed", UNIT, check=False, quiet=True)
-    print("The helper jar stays on the phone; remove it with "
-          "`adb shell rm -f /data/local/tmp/lantern-helper-*.jar`.")
 
 
 def main():

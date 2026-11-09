@@ -158,15 +158,26 @@ for that phone starts: every session start first removes that phone's leftover
 systemctl --user stop lanternd        # pause: ends the session and restores the phone now
 systemctl --user disable --now lanternd   # stop starting it at login
 
-python3 tools/build.py uninstall      # disable --now, remove the unit and ~/.local/bin/lantern
-adb shell rm -f '/data/local/tmp/lantern-helper-*.jar'   # remove the helper jar from the phone
+lantern undo-setup [--serial <serial>]   # with lanternd stopped: undo what Lantern did to the phone
+python3 tools/build.py uninstall      # disable --now, undo-setup (best effort), remove the unit
+                                      # and ~/.local/bin/lantern
 ```
 
-`uninstall` is idempotent. It does not touch the phone beyond stopping the daemon, which restores
-the phone. If the phone still shows a changed setting after uninstalling (a session died and none
-followed), `adb shell cat /data/local/tmp/lantern-session.json` shows the original; restore it with
-`adb shell settings put global stay_on_while_plugged_in <old value>` (Android's default is `0`)
-and delete that file.
+lanternd installs the Lantern companion app (`dev.lantern.companion`: keyboard and app list) on the
+phone, and keeps it at the build inside `lantern`. The first time it sets up a phone it shows a
+notification "Lantern set up your phone" and records the phone in
+`~/.local/state/lantern/devices/<serial>.json`. If the install fails, the session runs without the
+companion and one notification per daemon run says so (details in `journalctl --user -u lanternd`).
+
+`lantern undo-setup` refuses while lanternd is starting or serving that phone. It restores any
+setting a dead session left changed (only where the setting still holds Lantern's value), deletes
+Lantern's files from `/data/local/tmp`, uninstalls the companion, and forgets the phone. It prints one
+line per step and exits 0 only if every step succeeded. Without `--serial` it uses `$LANTERN_SERIAL`
+or the only connected phone.
+
+`uninstall` is idempotent. It runs `lantern undo-setup` after stopping the daemon; if the phone is not
+connected then, run it again later (`lantern undo-setup` is gone once `lantern` is removed, so
+reinstall or remove the companion with `adb uninstall dev.lantern.companion`).
 
 ## Acceptance test (real phone + KDE desktop)
 
