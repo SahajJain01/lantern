@@ -14,6 +14,8 @@ import java.io.OutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Device side of {@link CompanionLink}: hands a pipe pair to the companion's shell-only provider
@@ -122,17 +124,62 @@ final class DeviceCompanion {
                 if (holder == null) {
                     throw new IOException("companion provider " + AUTHORITY + " not found (companion not installed?)");
                 }
-                Field f = holder.getClass().getDeclaredField("provider");
-                f.setAccessible(true);
-                provider = f.get(holder);
-                if (provider == null) {
-                    throw new IOException("companion provider " + AUTHORITY + " has no binder");
+                // From here on we hold an external reference: release it on every failure.
+                String refused;
+                Object p = null;
+                try {
+                    refused = verify(holder);
+                    if (refused == null) {
+                        Field f = holder.getClass().getDeclaredField("provider");
+                        f.setAccessible(true);
+                        p = f.get(holder);
+                        if (p == null) {
+                            refused = "provider has no binder";
+                        }
+                    }
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    refused = "owner lookup failed: " + cause;
                 }
+                if (refused != null) {
+                    Droid.log("companion link refused: " + refused);
+                    release();
+                    throw new IOException("companion link refused: " + refused);
+                }
+                provider = p;
                 return provider;
             } catch (ReflectiveOperationException e) {
                 Throwable cause = e.getCause() != null ? e.getCause() : e;
                 throw new IOException("acquire " + AUTHORITY + ": " + cause, cause);
             }
+        }
+
+        /**
+         * {@link CompanionTrust#check} on the resolved provider: its package and uid, the uid
+         * PackageManager reports for {@link #PKG} in user 0, and that package's current signers.
+         */
+        private static String verify(Object holder) throws ReflectiveOperationException {
+            android.content.pm.ProviderInfo info =
+                (android.content.pm.ProviderInfo) holder.getClass().getField("info").get(holder);
+            if (info == null || info.applicationInfo == null) {
+                return "provider has no ProviderInfo";
+            }
+            Object pm = Class.forName("android.app.ActivityThread").getMethod("getPackageManager").invoke(null);
+            // IPackageManager.getPackageUid(String, long flags, int userId): -1 when not installed.
+            int expectedUid = (int) pm.getClass().getMethod("getPackageUid", String.class, long.class, int.class)
+                .invoke(pm, PKG, 0L, 0);
+            List<String> signers = new ArrayList<>();
+            android.content.pm.PackageInfo pi = (android.content.pm.PackageInfo) pm.getClass()
+                .getMethod("getPackageInfo", String.class, long.class, int.class)
+                .invoke(pm, PKG, (long) android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES, 0);
+            if (pi != null && pi.signingInfo != null) {
+                // The current signers only (no rotation history); several signers -> refused.
+                for (android.content.pm.Signature s : pi.signingInfo.getApkContentsSigners()) {
+                    signers.add(CompanionTrust.sha256Hex(s.toByteArray()));
+                }
+            }
+            return CompanionTrust.check(info.packageName, info.applicationInfo.uid, expectedUid, signers,
+                CompanionPin.SHA256);
         }
 
         /** Releases the external provider reference (idempotent). */
@@ -142,6 +189,10 @@ final class DeviceCompanion {
                 return;
             }
             provider = null;
+            release();
+        }
+
+        private void release() {
             try {
                 activityManager.getClass().getMethod("removeContentProviderExternal", String.class, IBinder.class)
                     .invoke(activityManager, AUTHORITY, clientToken);

@@ -144,6 +144,12 @@ state). So the helper hands the connection over instead:
    `{ok:true}`, or `{ok:false}` for a malformed token or missing pipes. The helper holds the
    provider until the session ends, which keeps the companion's process un-frozen
    (`ext-provider`). If the provider is missing (companion not installed) the link fails at once.
+   Before the call the helper checks the provider's owner: its package must be
+   `dev.lantern.companion`, its uid must be that package's uid in user 0, and the package must
+   have exactly one current signer whose certificate SHA-256 equals the pin `tools/build.py`
+   generates into the helper from the companion signing key. On any mismatch the helper releases
+   the provider, logs `companion link refused: <reason>` and treats the companion as unavailable,
+   so an app squatting the authority never sees the token or the pipes.
 3. The companion sends `hello{version:1, token}` on its pipe.
 4. The helper answers `hello{version:1, token:""}`.
 5. A connection whose first frame is not a `hello` with the right version and token within 2 s is
