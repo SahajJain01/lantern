@@ -41,14 +41,22 @@ public final class AppDisplay implements DisplayHandle {
         static final int FLAGS = PUBLIC | PRESENTATION | OWN_CONTENT_ONLY | SUPPORTS_TOUCH
             | ROTATES_WITH_CONTENT | DESTROY_CONTENT_ON_REMOVAL | TRUSTED | OWN_DISPLAY_GROUP
             | ALWAYS_UNLOCKED | TOUCH_FEEDBACK_DISABLED | OWN_FOCUS | DEVICE_DISPLAY_GROUP;
-        /**
-         * WindowManager.DISPLAY_IME_POLICY_LOCAL: the keyboard serves the display's own editor.
-         * Under HIDE (2) the server never binds the keyboard to a Lantern display's editor, so
-         * text from the PC goes nowhere. The Lantern keyboard draws nothing, so LOCAL shows none.
-         */
-        static final int IME_POLICY = 0;
+        /** WindowManager.DISPLAY_IME_POLICY_LOCAL: the keyboard serves the display's own editor. */
+        static final int IME_POLICY_LOCAL = 0;
+        /** WindowManager.DISPLAY_IME_POLICY_HIDE: no keyboard is ever bound to the display's editor. */
+        static final int IME_POLICY_HIDE = 2;
 
         private Policy() {
+        }
+
+        /**
+         * LOCAL only while the session selected the Lantern keyboard: under HIDE the server never
+         * binds it to a Lantern display's editor, so PC text goes nowhere, and the Lantern keyboard
+         * draws nothing on the display. Otherwise (the keyboard-less fallback session) HIDE, because
+         * under LOCAL the phone's own keyboard would draw into the display's video.
+         */
+        static int imePolicy(boolean lanternImeSelected) {
+            return lanternImeSelected ? IME_POLICY_LOCAL : IME_POLICY_HIDE;
         }
 
         /** Size after the display goes from rotation {@code from} to {@code to} (Surface.ROTATION_*). */
@@ -94,10 +102,12 @@ public final class AppDisplay implements DisplayHandle {
         this.listenerThread = new HandlerThread("lantern-display-" + win);
     }
 
-    public static AppDisplay open(int win, String pkg, int user, int w, int h, int dpi, VideoSink sink) {
+    /** {@code lanternIme}: this session selected the Lantern keyboard (see {@link Policy#imePolicy}). */
+    public static AppDisplay open(int win, String pkg, int user, int w, int h, int dpi, boolean lanternIme,
+            VideoSink sink) {
         AppDisplay d = new AppDisplay(win, pkg, sink, w, h, dpi);
         try {
-            d.start(user);
+            d.start(user, Policy.imePolicy(lanternIme));
             return d;
         } catch (UserLaunch.LaunchError e) {
             d.close();
@@ -109,7 +119,7 @@ public final class AppDisplay implements DisplayHandle {
         }
     }
 
-    private void start(int user) throws Exception {
+    private void start(int user, int imePolicy) throws Exception {
         // Resolve first: a missing user or app fails before any display exists.
         UserLaunch.Target target = UserLaunch.resolveOrLegacy(pkg, user, DeviceUsers::new);
         work = DeviceUsers.managed(user);
@@ -121,7 +131,7 @@ public final class AppDisplay implements DisplayHandle {
             throw new IllegalStateException("createNewVirtualDisplay returned no display");
         }
         displayId = display.getDisplay().getDisplayId();
-        ServiceManager.getWindowManager().setDisplayImePolicy(displayId, Policy.IME_POLICY);
+        ServiceManager.getWindowManager().setDisplayImePolicy(displayId, imePolicy);
         int ime = ServiceManager.getWindowManager().getDisplayImePolicy(displayId);
         Droid.log("display: id=" + displayId + " " + width + "x" + height + "/" + dpi + " flags=0x"
             + Integer.toHexString(Policy.FLAGS) + " ime_policy=" + ime + " mime=" + encoder.mime() + " win=" + win);

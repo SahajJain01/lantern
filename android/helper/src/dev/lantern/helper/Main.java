@@ -118,7 +118,12 @@ public final class Main {
             final CompanionLink[] companionRef = {null};
             final boolean[] linked = {false};
             final String[] imeFailure = {null};
-            Router router = new Router(in, out, AppDisplay::open, new Input(), Control.CODEC, token,
+            // Set once the session is up: each display's IME policy follows it (AppDisplay.Policy.imePolicy).
+            final java.util.concurrent.atomic.AtomicBoolean lanternIme =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+            Router router = new Router(in, out,
+                (win, pkg, user, w, h, dpi, sink) -> AppDisplay.open(win, pkg, user, w, h, dpi, lanternIme.get(), sink),
+                new Input(), Control.CODEC, token,
                 () -> {
                     // After a valid hello only: an unauthenticated client never reaches the companion.
                     linked[0] = linkCompanion(routerRef, linkRef, companionRef);
@@ -137,6 +142,7 @@ public final class Main {
                     }
                     Session session = started.session;
                     imeFailure[0] = started.imeFailure;
+                    lanternIme.set(started.imeSelected);
                     if (started.imeSelected) {
                         companionRef[0].setPrevIme(ImeSetup.prevIme(session.journal()));
                     }
@@ -312,7 +318,7 @@ public final class Main {
                 packets[0]++;
             };
             long t0 = android.os.SystemClock.elapsedRealtime();
-            try (AppDisplay d = AppDisplay.open(1, pkg, 0, 1280, 800, 160, sink)) {
+            try (AppDisplay d = AppDisplay.open(1, pkg, 0, 1280, 800, 160, false, sink)) {
                 d.setResizeListener((win, w, h) -> Droid.log("listener Resized win=" + win + " " + w + "x" + h));
                 d.setStreamListener((win, reason) -> System.out.println("stream_failed win=" + win + " " + reason));
                 System.out.println("display=" + d.displayId() + " task=" + d.taskId()

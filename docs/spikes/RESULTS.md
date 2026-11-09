@@ -206,9 +206,13 @@ With `LOCAL`, the same run bound `curClient` to the companion on the Lantern dis
 (`mSelfReportedDisplayId=<lantern display>`). `LanternTest` logged `text=Tiếng Việt 👍` after the
 commit, then `text=Tiếng Việt 👍việ` after the compose. Debug keys `a`, `b`, `c` arrived as key
 events. `Ctrl+A` followed by a commit replaced the whole text (`text=ok`). The Lantern keyboard
-draws nothing, so `LOCAL` shows no on-screen keyboard. The IME service is destroyed and recreated
-each time the keyboard moves to a different display (`ime destroyed`/`ime created`). Its watchdog
-state is static (`ImeState`), so that state survives the recreation.
+draws nothing, so with it selected `LOCAL` shows no on-screen keyboard. Any other keyboard would
+draw into the Lantern display's video under `LOCAL`, so the policy is chosen per session
+(`AppDisplay.Policy.imePolicy`): `LOCAL` only when the session selected the Lantern keyboard, and
+`HIDE` in the keyboard-less fallback session (Ruling 15), where the phone's own keyboard stays
+selected. The IME service is destroyed and recreated each time the keyboard moves to a different
+display (`ime destroyed`/`ime created`). Its watchdog state is static (`ImeState`), so that state
+survives the recreation.
 
 Test setup: the PC's Plasma session was locked, so the window got no frame callbacks there. The
 run used a nested `kwin_wayland --virtual` (text-input-v3 present) and the `focus` debug step,
@@ -220,6 +224,8 @@ because that compositor gives the window no keyboard focus.
 - **Third-party app notification** click targeting. No third-party messaging app is installed.
 - **Bound IME** after a physical yank (setting restore is proven; see follow-ups).
 - **Text input into real apps** (browser address bar, messaging). Only the probe EditText was tested.
+- **Another IME bound during a session under `LOCAL`** (e.g. the user or an app switches keyboards
+  while the Lantern keyboard session runs): that keyboard could draw into a Lantern display's video.
 - **Secure (PIN) keyguard** with `ALWAYS_UNLOCKED` (the swipe-keyguard real case passes).
 - **Encoder reconfigure without recreate**, and end-to-end latency versus scrcpy.
 

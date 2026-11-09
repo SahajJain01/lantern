@@ -42,9 +42,14 @@ public final class EncoderTest {
         eq(want, AppDisplay.Policy.FLAGS, "display flags");
         // VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS must never be set.
         eq(0, AppDisplay.Policy.FLAGS & (1 << 9), "no system decorations");
-        // DISPLAY_IME_POLICY_LOCAL: under HIDE the server never binds the keyboard to a Lantern
-        // display's editor (docs/spikes/RESULTS.md, "Plan 2 Task 8: IME display policy").
-        eq(0, AppDisplay.Policy.IME_POLICY, "ime policy local");
+    }
+
+    static void imePolicyLocalOnlyWithLanternKeyboard() {
+        // DISPLAY_IME_POLICY_LOCAL (0) with the Lantern keyboard: under HIDE the server never binds
+        // it to a Lantern display's editor (docs/spikes/RESULTS.md, "Plan 2 Task 8: IME display
+        // policy"). HIDE (2) otherwise: the phone's own keyboard must never draw into the video.
+        eq(0, AppDisplay.Policy.imePolicy(true), "lantern keyboard: local");
+        eq(2, AppDisplay.Policy.imePolicy(false), "phone keyboard: hide");
     }
 
     static void rotationSwaps() {
@@ -72,6 +77,7 @@ public final class EncoderTest {
             {"alignsTo16", (Case) EncoderTest::alignsTo16},
             {"prefersHevcWhenListed", (Case) EncoderTest::prefersHevcWhenListed},
             {"displayFlagsExact", (Case) EncoderTest::displayFlagsExact},
+            {"imePolicyLocalOnlyWithLanternKeyboard", (Case) EncoderTest::imePolicyLocalOnlyWithLanternKeyboard},
             {"rotationSwaps", (Case) EncoderTest::rotationSwaps},
         };
         int failed = 0;
