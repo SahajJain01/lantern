@@ -127,6 +127,11 @@ public final class RouterTest {
         volatile boolean failOnCloseNext;
 
         Rig() throws IOException {
+            this(r -> { });
+        }
+
+        /** {@code setup} configures the router (hooks) before it starts. */
+        Rig(java.util.function.Consumer<Router> setup) throws IOException {
             try (ServerSocket ss = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
                 client = new Socket(InetAddress.getLoopbackAddress(), ss.getLocalPort());
                 server = ss.accept();
@@ -170,6 +175,7 @@ public final class RouterTest {
                     server.close();
                 },
                 msg -> { });
+            setup.accept(r);
             thread = new Thread(r::run, "router");
             thread.start();
         }
@@ -283,6 +289,45 @@ public final class RouterTest {
             r.send(0, "{\"t\":\"bye\"}");
             r.awaitExit(2000);
             eq("session close", r.events.get(r.events.size() - 1), "session closed last");
+        }
+    }
+
+    static void onSessionUpRunsAfterHelloReply() throws Exception {
+        Router[] router = {null};
+        try (Rig r = new Rig(rt -> {
+            router[0] = rt;
+            rt.setOnSessionUp(() -> rt.sendSession(Msg.of("companion").put("state", "ready")));
+            // e.g. the companion's catalogue, relayed while the session is still starting
+            check(rt.sendSession(Msg.of("app").put("pkg", "early.pkg")), "early sendSession accepted");
+        })) {
+            r.hello(); // the hello reply comes first
+            Msg m = r.control(0);
+            eq("companion", m.t, "hook's message follows the hello reply");
+            eq("ready", m.str("state"), "state");
+            Msg early = r.control(0);
+            eq("app", early.t, "message sent before session-up is held until after the hook");
+            eq("early.pkg", early.str("pkg"), "early pkg");
+            check(router[0].sendSession(Msg.of("app").put("pkg", "live.pkg")), "live sendSession");
+            eq("live.pkg", r.control(0).str("pkg"), "live message sent directly");
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+            check(!router[0].sendSession(Msg.of("companion").put("state", "ready")), "sendSession after exit is false");
+        }
+    }
+
+    static void setExtrasAcceptsHandler() throws Exception {
+        try (Rig r = new Rig(rt -> rt.setExtras(new Router.Extras() {
+            @Override
+            public void ime(String op, String text) {
+            }
+
+            @Override
+            public void clip(String text) {
+            }
+        }))) {
+            r.hello();
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
         }
     }
 
@@ -542,6 +587,8 @@ public final class RouterTest {
             {"rejectsWrongVersion", (Case) RouterTest::rejectsWrongVersion},
             {"requiresHelloFirst", (Case) RouterTest::requiresHelloFirst},
             {"helloStartsSessionAndReplies", (Case) RouterTest::helloStartsSessionAndReplies},
+            {"onSessionUpRunsAfterHelloReply", (Case) RouterTest::onSessionUpRunsAfterHelloReply},
+            {"setExtrasAcceptsHandler", (Case) RouterTest::setExtrasAcceptsHandler},
             {"openThenCloseCallsFactoryAndClose", (Case) RouterTest::openThenCloseCallsFactoryAndClose},
             {"openedSaysMovedForAnExistingTask", (Case) RouterTest::openedSaysMovedForAnExistingTask},
             {"eofClosesAllDisplays", (Case) RouterTest::eofClosesAllDisplays},

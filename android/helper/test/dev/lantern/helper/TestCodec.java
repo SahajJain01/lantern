@@ -8,7 +8,7 @@ import java.util.Map;
  * Host-JVM stand-in for {@link Control}'s org.json codec: flat JSON objects whose values are strings
  * integers or booleans. Test utility only (not a *Test class, so the build does not run it).
  */
-final class TestCodec implements ControlCodec {
+public final class TestCodec implements ControlCodec {
     @Override
     public Msg decode(byte[] payload) throws IOException {
         String s = new String(payload, StandardCharsets.UTF_8).trim();

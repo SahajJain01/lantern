@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Lantern companion: the app catalogue (Task 5) and the hidden PC-text IME (Task 7), linked to the
+  helper over a pipe pair the helper hands to LinkProvider (docs/protocol.md, "Companion link").
+  No permissions: no WRITE_SECURE_SETTINGS (the companion never writes settings), no INTERNET.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.lantern.companion">
+  <queries>
+    <intent>
+      <action android:name="android.intent.action.MAIN"/>
+      <category android:name="android.intent.category.LAUNCHER"/>
+    </intent>
+  </queries>
+  <application android:label="Lantern" android:allowBackup="false">
+    <!-- The helper's link: shell only (DUMP), and LinkProvider checks the calling uid too. -->
+    <provider android:name=".LinkProvider" android:authorities="dev.lantern.companion.link"
+        android:exported="true" android:permission="android.permission.DUMP"/>
+    <!-- Shell-only commands (DUMP): the test-activity toggle. -->
+    <receiver android:name=".LinkReceiver" android:exported="true" android:permission="android.permission.DUMP">
+      <intent-filter><action android:name="dev.lantern.companion.TEST_ACTIVITY"/></intent-filter>
+    </receiver>
+    <service android:name=".LanternIme" android:permission="android.permission.BIND_INPUT_METHOD" android:exported="true">
+      <intent-filter><action android:name="android.view.InputMethod"/></intent-filter>
+      <meta-data android:name="android.view.im" android:resource="@xml/ime"/>
+    </service>
+    <!-- Test-only text readback screen: disabled except while a device test runs (enabled through
+         LinkReceiver's TEST_ACTIVITY broadcast; the shell may not `pm enable` it). -->
+    <activity android:name=".TestActivity" android:enabled="false" android:exported="true" android:label="Lantern test"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar" android:windowSoftInputMode="stateVisible">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

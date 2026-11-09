@@ -18,6 +18,10 @@ const HELPER_JAR: &[u8] = include_bytes!("../../assets/helper.jar");
 /// The only protocol version this daemon speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// How long the helper may take to answer `hello`. It first waits up to 3 s for the companion
+/// to link, then starts the session (settings, panel), so this must cover both with margin.
+pub const HELLO_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Why a live session ended on its own (as opposed to being closed by the daemon).
 pub type EndReason = &'static str;
 
@@ -479,7 +483,7 @@ pub async fn handshake(mut stream: TcpStream, token: &str) -> Result<TcpStream> 
     .await
     .context("send hello")?;
 
-    let reply = timeout(Duration::from_secs(3), read_frame_async(&mut stream))
+    let reply = timeout(HELLO_REPLY_TIMEOUT, read_frame_async(&mut stream))
         .await
         .context("timed out waiting for hello reply")?
         .context("read hello reply")?

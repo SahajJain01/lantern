@@ -131,16 +131,32 @@ The helper talks to the companion app (`dev.lantern.companion`, shipped inside `
 helper jar) over its own connection, never through lanternd. It uses the same frames as above,
 all on stream 0, with control JSON.
 
-1. The helper listens on the abstract Unix socket `lantern-c-<16 hex>` and makes a separate
-   32-hex link token (not the session token).
-2. It sends `am broadcast --user 0 -n dev.lantern.companion/.LinkReceiver -a
-   dev.lantern.companion.LINK --es socket <name> --es token <token>`. The receiver requires
-   `android.permission.DUMP`, so only the shell can send it.
-3. The companion connects and sends `hello{version:1, token}`.
+The companion cannot dial the helper: SELinux denies an app `connectto` on the shell's Unix
+sockets, and the phone's network policy can block the companion's loopback TCP (the background
+firewall chain while it is cached; on Xiaomi also the restricted-networking chain, whatever its
+state). So the helper hands the connection over instead:
+
+1. The helper makes a 32-hex link token (not the session token) and two pipes.
+2. It acquires the companion's provider `content://dev.lantern.companion.link` as an external
+   client and calls `call("link", <token>, {in, out})`: `in` is the read end of the
+   helper→companion pipe, `out` the write end of the companion→helper pipe. The provider requires
+   `android.permission.DUMP` and refuses any caller but the shell (or root); it answers
+   `{ok:true}`, or `{ok:false}` for a malformed token or missing pipes. The helper holds the
+   provider until the session ends, which keeps the companion's process un-frozen
+   (`ext-provider`). If the provider is missing (companion not installed) the link fails at once.
+3. The companion sends `hello{version:1, token}` on its pipe.
 4. The helper answers `hello{version:1, token:""}`.
-5. A connection whose first frame is not a `hello` with the right version and token is closed.
-   The helper keeps accepting until its deadline. One authenticated companion is linked at a
-   time: a new authenticated one replaces the old.
+5. A connection whose first frame is not a `hello` with the right version and token within 2 s is
+   closed. One authenticated companion is linked at a time: a new authenticated one replaces the
+   old.
+
+The helper waits up to 3 s for the companion's hello before it starts the session, so lanternd
+allows 10 s for the hello reply.
+
+The companion's `LinkReceiver` (also DUMP-only) takes one test-only command, `am broadcast --user
+0 -n dev.lantern.companion/.LinkReceiver -a dev.lantern.companion.TEST_ACTIVITY --es enabled
+true|false`, which enables its `TestActivity` or returns it to disabled. The shell may not
+`pm enable` another package's component on Android 15.
 
 Messages on the link:
 

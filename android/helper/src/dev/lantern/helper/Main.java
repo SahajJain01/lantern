@@ -113,9 +113,30 @@ public final class Main {
                 new java.io.BufferedInputStream(client.getInputStream(), 1 << 16));
             java.io.DataOutputStream out = new java.io.DataOutputStream(
                 new java.io.BufferedOutputStream(client.getOutputStream(), 1 << 16));
+            final Router[] routerRef = {null};
+            final Runnable[] linkRef = {null};
+            final boolean[] linked = {false};
             Router router = new Router(in, out, AppDisplay::open, new Input(), Control.CODEC, token,
-                () -> Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log),
-                    JournalStore.device(Droid::log)),
+                () -> {
+                    // After a valid hello only: an unauthenticated client never reaches the companion.
+                    linked[0] = linkCompanion(routerRef, linkRef);
+                    // Task 7 adds the IME changes here when linked.
+                    Session session;
+                    try {
+                        session = Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log),
+                            JournalStore.device(Droid::log));
+                    } catch (RuntimeException e) {
+                        closeLink(linkRef[0]);
+                        throw e;
+                    }
+                    return () -> {
+                        try {
+                            session.close();
+                        } finally {
+                            closeLink(linkRef[0]);
+                        }
+                    };
+                },
                 () -> {
                     // shutdown first: close() alone may not wake a thread blocked in write.
                     try {
@@ -131,6 +152,10 @@ public final class Main {
                     client.close();
                 },
                 Droid::log);
+            routerRef[0] = router;
+            router.setOnSessionUp(() -> router.sendSession(linked[0]
+                ? Msg.of("companion").put("state", "ready")
+                : Msg.of("companion").put("state", "unavailable").put("msg", "companion did not connect")));
             router.run();
         } catch (java.io.IOException e) {
             Droid.log("serve: " + e);
@@ -144,6 +169,50 @@ public final class Main {
         }
         Droid.log("serve: exit");
         return 0;
+    }
+
+    /** How long a session start waits for the companion to link. */
+    static final long COMPANION_CONNECT_MS = 3000;
+
+    /**
+     * Hands a pipe pair to the companion's provider and waits up to {@link #COMPANION_CONNECT_MS}
+     * for its authenticated hello (false at once if the companion is not installed).
+     * Its catalogue messages go to lanternd on stream 0. Never throws: without the companion the
+     * session goes on.
+     */
+    private static boolean linkCompanion(Router[] routerRef, Runnable[] closeRef) {
+        try {
+            HandoffListener listener = new HandoffListener();
+            DeviceCompanion.Handoff handoff = new DeviceCompanion.Handoff(listener);
+            CompanionLink link = new CompanionLink(listener, handoff, Control.CODEC, DeviceCompanion.hex(16), m -> {
+                Router r = routerRef[0];
+                if (r != null) {
+                    r.sendSession(m);
+                }
+            }, Droid::log);
+            closeRef[0] = () -> {
+                link.close();
+                handoff.close();
+            };
+            long t0 = android.os.SystemClock.elapsedRealtime();
+            boolean ok = link.connect(COMPANION_CONNECT_MS);
+            Droid.log("serve: companion " + (ok ? "linked" : "unavailable") + " after "
+                + (android.os.SystemClock.elapsedRealtime() - t0) + " ms");
+            return ok;
+        } catch (RuntimeException e) {
+            Droid.log("serve: companion link setup failed: " + e);
+            return false;
+        }
+    }
+
+    private static void closeLink(Runnable close) {
+        if (close != null) {
+            try {
+                close.run();
+            } catch (RuntimeException e) {
+                Droid.log("serve: companion link close failed: " + e);
+            }
+        }
     }
 
     /** Starts a session, holds it for {@code seconds}, closes it. Prints {@code pid=N} for kill tests. */

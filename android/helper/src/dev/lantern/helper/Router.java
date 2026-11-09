@@ -75,6 +75,32 @@ public final class Router {
     });
     private AutoCloseable session;
     private volatile boolean stopping;
+    private volatile Runnable onSessionUp = () -> { };
+    private volatile Extras extras = NO_EXTRAS;
+    /** Guards {@link #sessionUp} and {@link #early}: session messages wait for the hello reply. */
+    private final Object sessionLock = new Object();
+    private boolean sessionUp;
+    private final List<Msg> early = new ArrayList<>();
+
+    /**
+     * Session-level messages from lanternd that the router hands off instead of handling itself
+     * (Tasks 7 and 9 route {@code ime} and {@code clip} here). Called on the control thread.
+     */
+    public interface Extras {
+        void ime(String op, String text);
+
+        void clip(String text);
+    }
+
+    static final Extras NO_EXTRAS = new Extras() {
+        @Override
+        public void ime(String op, String text) {
+        }
+
+        @Override
+        public void clip(String text) {
+        }
+    };
 
     /**
      * @param sessionStarter called once, after a valid Hello and before the Hello reply (an
@@ -93,6 +119,38 @@ public final class Router {
         this.sessionStarter = sessionStarter;
         this.transport = transport;
         this.log = log;
+    }
+
+    /**
+     * Runs on the control thread right after the hello reply, before any host frame is read
+     * ({@code Main} sends {@code companion{state}} from it). A throwing hook is logged, not fatal.
+     * Set before {@link #run}.
+     */
+    public void setOnSessionUp(Runnable r) {
+        onSessionUp = r == null ? () -> { } : r;
+    }
+
+    /** Set before {@link #run}; the default does nothing. */
+    public void setExtras(Extras e) {
+        extras = e == null ? NO_EXTRAS : e;
+    }
+
+    /**
+     * Sends {@code m} to lanternd on stream 0 (any thread). Before the session is up (hello reply
+     * sent) it is held and sent right after the {@link #setOnSessionUp} hook's messages; it is
+     * dropped if the session never comes up. False once tearing down or on a write failure.
+     */
+    public boolean sendSession(Msg m) {
+        synchronized (sessionLock) {
+            if (stopping) {
+                return false;
+            }
+            if (!sessionUp) {
+                early.add(m);
+                return true;
+            }
+        }
+        return send(0, m);
     }
 
     /** One open (or opening) window: also its video sink. */
@@ -200,6 +258,19 @@ public final class Router {
             throw new IOException("hello reply failed");
         }
         log.accept("router: session up");
+        // Under the lock: the hook's messages go first, then anything held, then live ones.
+        synchronized (sessionLock) {
+            sessionUp = true;
+            try {
+                onSessionUp.run();
+            } catch (RuntimeException e) {
+                log.accept("router: session-up hook failed: " + e);
+            }
+            for (Msg held : early) {
+                send(0, held);
+            }
+            early.clear();
+        }
         return true;
     }
 

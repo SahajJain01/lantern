@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Lantern build: phone helper jar (javac + d8, no Gradle), then the Rust host.
+"""Lantern build: phone helper jar and companion APK (no Gradle), then the Rust host.
 
-    python3 tools/build.py helper   # host-JVM tests, then build/helper/lantern-helper.jar
-    python3 tools/build.py all      # helper, then cargo build --release (host/)
+    python3 tools/build.py helper     # host-JVM tests, then build/helper/lantern-helper.jar
+    python3 tools/build.py companion  # host-JVM tests, then build/companion/lantern-companion.apk
+    python3 tools/build.py all        # helper, companion, then cargo build --release (host/)
     python3 tools/build.py install  # all, then ~/.local/bin/lantern + lanternd.service (enabled)
     python3 tools/build.py uninstall  # disable --now lanternd, remove the unit and the binary
 
@@ -10,6 +11,9 @@ install/uninstall are idempotent. install restarts a running lanternd only when 
 the unit changed.
 
 Toolchain: ~/.local/opt/pd-toolchain (override with PD_TC): jdk/, build-tools/, platform/.
+The companion is signed with ~/.local/share/lantern/companion-signing.p12 (override with
+LANTERN_COMPANION_KEY), created on first use. Keep it: with a new key the phone must uninstall
+the old companion before the new one installs.
 """
 import argparse
 import hashlib
@@ -18,6 +22,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 TC = Path(os.environ.get("PD_TC", Path.home() / ".local/opt/pd-toolchain"))
@@ -32,6 +37,21 @@ VENDOR = HELPER / "vendor"
 OUT = ROOT / "build/helper"
 JAR = OUT / "lantern-helper.jar"
 ASSET = ROOT / "host/lantern/assets/helper.jar"
+COMPANION = ROOT / "android/companion"
+COMPANION_OUT = ROOT / "build/companion"
+APK = COMPANION_OUT / "lantern-companion.apk"
+COMPANION_ASSET = ROOT / "host/lantern/assets/companion.apk"
+COMPANION_TARGET_SDK = "36"
+COMPANION_VERSION_CODE = "1"
+# Shared with the helper (the same sources, not copies): framing, messages and the control codec.
+SHARED = [HELPER / "src/dev/lantern/helper" / f
+          for f in ("Proto.java", "Msg.java", "ControlCodec.java", "Control.java")]
+# Host-JVM test utilities the companion tests reuse from the helper's test tree.
+SHARED_TEST = [HELPER / "test/dev/lantern/helper/TestCodec.java"]
+SIGNING_KEY = Path(os.environ.get("LANTERN_COMPANION_KEY",
+                                  Path.home() / ".local/share/lantern/companion-signing.p12"))
+SIGNING_PASS = "lantern-companion"
+SIGNING_ALIAS = "lantern-companion"
 RELEASE_BIN = ROOT / "host/target/release/lantern"
 UNIT_SRC = ROOT / "host/lantern/packaging/lanternd.service"
 UNIT = "lanternd.service"
@@ -89,18 +109,20 @@ def compile_helper():
     return classes
 
 
-def run_tests(classes):
+def run_tests(classes, test_root=HELPER / "test", out=OUT, extra_sources=()):
     """Plain-main test runners on the host JVM. android.jar is NOT on the runtime classpath, so a
     test that touches an Android class fails with NoClassDefFoundError."""
-    tests = OUT / "test-classes"
+    tests = out / "test-classes"
     fresh(tests)
-    sources = java_files(HELPER / "test")
-    javac(sources, tests, [classes])
+    sources = java_files(test_root)
+    if not sources:
+        return
+    javac(sources + list(extra_sources), tests, [classes])
     golden = ROOT / "host/proto/golden"
     for src in sources:
         if not src.name.endswith("Test.java"):
             continue
-        cls = ".".join(src.relative_to(HELPER / "test").with_suffix("").parts)
+        cls = ".".join(src.relative_to(test_root).with_suffix("").parts)
         run(JDK / "bin/java", f"-Dlantern.golden={golden}",
             "-cp", os.pathsep.join([str(tests), str(classes)]), cls, cwd=ROOT)
 
@@ -121,6 +143,58 @@ def build_helper():
     classes = compile_helper()
     run_tests(classes)
     dex(classes)
+
+
+def signing_key():
+    """The companion's signing key, created on first use (file 0600, directory 0700)."""
+    if not SIGNING_KEY.exists():
+        SIGNING_KEY.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        old = os.umask(0o077)
+        try:
+            run(JDK / "bin/keytool", "-genkeypair", "-storetype", "PKCS12", "-keystore", SIGNING_KEY,
+                "-storepass", SIGNING_PASS, "-keypass", SIGNING_PASS, "-alias", SIGNING_ALIAS,
+                "-keyalg", "RSA", "-keysize", "3072", "-validity", "36500",
+                "-dname", "CN=Lantern companion")
+        finally:
+            os.umask(old)
+        SIGNING_KEY.chmod(0o600)
+        print(f"created signing key {SIGNING_KEY}")
+    return SIGNING_KEY
+
+
+def build_companion():
+    """aapt2 compile + link, javac (with the helper's shared sources), host-JVM tests, d8, zip,
+    zipalign, then apksigner sign + verify."""
+    work = COMPANION_OUT / "work"
+    fresh(work)
+    gen, classes, dexes = work / "gen", work / "classes", work / "dex"
+    for d in (gen, classes, dexes):
+        d.mkdir()
+    res, unsigned, aligned = work / "res.zip", work / "unsigned.apk", work / "aligned.apk"
+    run(BT / "aapt2", "compile", "--dir", COMPANION / "res", "-o", res)
+    run(BT / "aapt2", "link", "-I", ANDROID_JAR, "--manifest", COMPANION / "AndroidManifest.xml",
+        "--min-sdk-version", MIN_API, "--target-sdk-version", COMPANION_TARGET_SDK,
+        "--version-code", COMPANION_VERSION_CODE, "--version-name", COMPANION_VERSION_CODE,
+        "--java", gen, "-o", unsigned, res)
+    javac(java_files(COMPANION / "src", gen) + SHARED, classes, [ANDROID_JAR])
+    run_tests(classes, COMPANION / "test", COMPANION_OUT, SHARED_TEST)
+    run(BT / "d8", "--release", "--lib", ANDROID_JAR, "--min-api", MIN_API,
+        "--output", dexes, *sorted(classes.rglob("*.class")))
+    with zipfile.ZipFile(unsigned, "a", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(dexes.glob("*.dex")):
+            z.write(f, f.name)
+    run(BT / "zipalign", "-f", "-p", "4", unsigned, aligned)
+    for f in (APK, APK.with_name(APK.name + ".idsig")):
+        if f.exists():
+            f.unlink()
+    run(BT / "apksigner", "sign", "--ks", signing_key(), "--ks-pass", f"pass:{SIGNING_PASS}",
+        "--ks-key-alias", SIGNING_ALIAS, "--v4-signing-enabled", "false", "--out", APK, aligned)
+    run(BT / "apksigner", "verify", "--verbose", APK)
+    COMPANION_ASSET.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(APK, COMPANION_ASSET)
+    digest = hashlib.sha256(APK.read_bytes()).hexdigest()
+    print(f"BUILT {APK.relative_to(ROOT)} bytes={APK.stat().st_size} sha256={digest}")
+    print(f"COPIED {COMPANION_ASSET.relative_to(ROOT)}")
 
 
 def place(src, dst, mode):
@@ -173,14 +247,18 @@ def uninstall():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("target", choices=["helper", "all", "install", "uninstall"])
+    ap.add_argument("target", choices=["helper", "companion", "all", "install", "uninstall"])
     target = ap.parse_args().target
     try:
         if target == "uninstall":
             uninstall()
             return
+        if target == "companion":
+            build_companion()
+            return
         build_helper()
         if target in ("all", "install"):
+            build_companion()
             run("cargo", "build", "--release", cwd=ROOT / "host")
         if target == "install":
             install()

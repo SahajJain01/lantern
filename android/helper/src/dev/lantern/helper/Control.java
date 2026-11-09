@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Control payloads: UTF-8 JSON objects tagged by {@code "t"} (docs/protocol.md), via the platform
@@ -33,6 +34,29 @@ public final class Control {
      * boolean and integral values are kept, anything else (unknown extras such as nested objects) is dropped.
      */
     public static Msg decode(byte[] payload) throws IOException {
+        return decode(payload, Msg.TYPES);
+    }
+
+    /**
+     * A codec accepting the tags in {@code types}: the companion link adds link-only types
+     * (e.g. {@code ime_prev}) that never travel to lanternd, so they are not in {@link Msg#TYPES}.
+     */
+    public static ControlCodec codec(Set<String> types) {
+        return new ControlCodec() {
+            @Override
+            public Msg decode(byte[] payload) throws IOException {
+                return Control.decode(payload, types);
+            }
+
+            @Override
+            public byte[] encode(Msg msg) {
+                return Control.encode(msg);
+            }
+        };
+    }
+
+    /** As {@link #decode(byte[])}, with {@code t} checked against {@code types}. */
+    public static Msg decode(byte[] payload, Set<String> types) throws IOException {
         JSONObject o;
         try {
             o = new JSONObject(new String(payload, StandardCharsets.UTF_8));
@@ -43,7 +67,7 @@ public final class Control {
         if (!(t instanceof String)) {
             throw new IOException("control json without a string t");
         }
-        if (!Msg.TYPES.contains(t)) {
+        if (!types.contains(t)) {
             throw new IOException("unknown control type " + t);
         }
         Msg m = Msg.of((String) t);

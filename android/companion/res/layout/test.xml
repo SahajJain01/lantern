@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TestActivity: one EditText filling the top 20% of the screen, focused on start. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:weightSum="5">
+  <EditText android:id="@+id/text"
+      android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+      android:gravity="top|start" android:inputType="textMultiLine|textNoSuggestions"
+      android:hint="Lantern test">
+    <requestFocus/>
+  </EditText>
+  <View android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="4"/>
+</LinearLayout>
