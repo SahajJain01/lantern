@@ -98,14 +98,14 @@ final class Link {
                 }
 
                 @Override
-                public void ime(String op, String text) {
+                public void ime(int display, String op, String text) {
                     LanternIme ime = ImeState.ime;
                     if (ime == null) {
                         // Not the selected keyboard (or not created yet): nowhere to type.
                         Log.i(TAG, ImeOps.logLine(op, false, text)); // never the text itself
                         return;
                     }
-                    ime.post(op, text);
+                    ime.post(display, op, text);
                 }
 
                 @Override

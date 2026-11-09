@@ -43,7 +43,7 @@ public final class LanternIme extends InputMethodService {
         String prev = ImeState.restoreTarget();
         boolean armed = ImeState.WATCHDOG.createdUnlinked(SystemClock.elapsedRealtime(), prev);
         handler.postDelayed(poll, POLL_MS);
-        Log.i(Link.TAG, "ime created" + (armed ? "; no helper link: the keyboard is given back in "
+        Log.i(Link.TAG, "ime created display=" + imeDisplayId() + (armed ? "; no helper link: the keyboard is given back in "
             + ImeWatchdog.DEFAULT_GRACE_MS + " ms unless the helper links (original "
             + (prev != null ? "known" : "unknown: fallback") + ")" : ""));
     }
@@ -69,13 +69,59 @@ public final class LanternIme extends InputMethodService {
         return false;
     }
 
-    /** Applies an {@code ime} op on the IME's thread (any thread may call it). */
-    void post(String op, String text) {
-        handler.post(() -> apply(op, text));
+    /** Applies an {@code ime} op for {@code display} on the IME's thread (any thread may call it). */
+    void post(int display, String op, String text) {
+        handler.post(() -> apply(display, op, text));
     }
 
-    /** {@code commit}, {@code compose} or {@code finish} on the current input connection. */
-    void apply(String op, String text) {
+    /** Logged once per IME instance when its display cannot be determined. */
+    private boolean unknownDisplayLogged;
+
+    /**
+     * The display this IME instance serves, or -1 if unknown. Under the IME display policy
+     * {@code LOCAL} the IME lives on the focused editor's display (it is recreated as focus moves
+     * between displays); InputMethodService is a window context, so its own display says which.
+     * Its window's decor view, when attached, is checked first.
+     */
+    private int imeDisplayId() {
+        try {
+            android.app.Dialog d = getWindow();
+            android.view.Window w = d == null ? null : d.getWindow();
+            android.view.View decor = w == null ? null : w.peekDecorView();
+            android.view.Display disp = decor == null ? null : decor.getDisplay();
+            if (disp != null) {
+                return disp.getDisplayId();
+            }
+        } catch (RuntimeException ignored) {
+            // fall through to the context's display
+        }
+        try {
+            android.view.Display disp = getDisplay();
+            if (disp != null) {
+                return disp.getDisplayId();
+            }
+        } catch (RuntimeException ignored) {
+            // UnsupportedOperationException: not a visual context
+        }
+        return -1;
+    }
+
+    /**
+     * {@code commit}, {@code compose} or {@code finish} on the current input connection, only if it
+     * belongs to {@code display} (the window the text was typed in): right after a window switch
+     * the IME may still be bound to another Lantern window's editor. An unknown display on either
+     * side lets it through (typing never breaks), logged once.
+     */
+    void apply(int display, String op, String text) {
+        int mine = imeDisplayId();
+        if (mine < 0 && display >= 0 && !unknownDisplayLogged) {
+            unknownDisplayLogged = true;
+            Log.w(Link.TAG, "ime: cannot tell this keyboard's display; applying ime without the display check");
+        }
+        if (!ImeOps.displayMatches(display, mine)) {
+            Log.i(Link.TAG, ImeOps.droppedLine(op, text, display, mine));
+            return;
+        }
         InputConnection ic = getCurrentInputConnection();
         boolean ok;
         try {

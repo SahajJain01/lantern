@@ -127,8 +127,8 @@ public final class LinkClientTest {
                         }
 
                         @Override
-                        public void ime(String op, String text) {
-                            got.add("ime " + op + " " + text);
+                        public void ime(int display, String op, String text) {
+                            got.add("ime " + display + " " + op + " " + text);
                         }
 
                         @Override
@@ -144,12 +144,14 @@ public final class LinkClientTest {
             t.start();
             r.send("{\"t\":\"ime_prev\",\"id\":\"com.example/.Keyboard\"}");
             r.send("{\"t\":\"clip\",\"text\":\"secret\"}");
-            r.send("{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"hi\"}");
+            r.send("{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"hi\",\"display\":12}");
+            r.send("{\"t\":\"ime\",\"op\":\"finish\",\"text\":\"\"}");
             r.send("{\"t\":\"sync\"}");
             r.helper.shutdownOutput();
             t.join(3000);
             check(!t.isAlive(), "run returns at EOF");
-            eq("[ime_prev com.example/.Keyboard, ime commit hi, sync, eof]", got.toString(), "dispatch");
+            eq("[ime_prev com.example/.Keyboard, ime 12 commit hi, ime -1 finish , sync, eof]", got.toString(),
+                "dispatch (display -1 when absent)");
             boolean logged = false;
             synchronized (r.logs) {
                 for (String l : r.logs) {

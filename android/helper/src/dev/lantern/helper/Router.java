@@ -88,7 +88,8 @@ public final class Router {
      * (Tasks 7 and 9 route {@code ime} and {@code clip} here). Called on the control thread.
      */
     public interface Extras {
-        void ime(String op, String text);
+        /** {@code display}: the Android display of the window the text was typed in. */
+        void ime(int display, String op, String text);
 
         void clip(String text);
     }
@@ -102,7 +103,7 @@ public final class Router {
 
     static final Extras NO_EXTRAS = new Extras() {
         @Override
-        public void ime(String op, String text) {
+        public void ime(int display, String op, String text) {
         }
 
         @Override
@@ -462,7 +463,8 @@ public final class Router {
         new java.util.HashSet<>(java.util.Arrays.asList("commit", "compose", "finish")));
 
     /**
-     * {@code ime{op, text}} for a live window goes to {@link Extras#ime}; for an unknown or closing
+     * {@code ime{op, text}} for a live window goes to {@link Extras#ime} with that window's display
+     * (the companion applies it only in an editor on that display); for an unknown or closing
      * window it is dropped. An unknown op or a text over {@link Proto#MAX_IME_TEXT} UTF-8 bytes is a
      * protocol error. Never logs the text.
      */
@@ -476,11 +478,12 @@ public final class Router {
         if (bytes > Proto.MAX_IME_TEXT) {
             throw new ProtocolError("ime.text of " + bytes + " bytes exceeds MAX_IME_TEXT");
         }
-        if (live(win, "ime") == null) {
+        Win wn = live(win, "ime");
+        if (wn == null) {
             return;
         }
         try {
-            extras.ime(op, t);
+            extras.ime(wn.handle.displayId(), op, t);
         } catch (RuntimeException e) {
             log.accept("router: ime win=" + win + " op=" + op + " failed: " + e);
         }

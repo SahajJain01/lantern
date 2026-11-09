@@ -39,7 +39,22 @@ final class ImeOps {
         }
     }
 
-    /** {@code ime op=<op> ok=<bool> len=<n>}: the only log line an {@code ime} gets. */
+    /**
+     * Whether an {@code ime} typed in the window on display {@code want} may be applied by the IME
+     * on display {@code have}. Either one unknown ({@code -1}) lets it through: typing never breaks
+     * because a display could not be read.
+     */
+    static boolean displayMatches(int want, int have) {
+        return want < 0 || have < 0 || want == have;
+    }
+
+    /** The log line of an {@code ime} dropped for another display: op, length and reason, never the text. */
+    static String droppedLine(String op, String text, int want, int have) {
+        return "ime op=" + op + " dropped len=" + (text == null ? 0 : text.length()) + ": typed for display "
+            + want + ", the keyboard is on display " + have;
+    }
+
+    /** {@code ime op=<op> ok=<bool> len=<n>}: the log line of an applied {@code ime} (never its text). */
     static String logLine(String op, boolean ok, String text) {
         return "ime op=" + op + " ok=" + ok + " len=" + (text == null ? 0 : text.length());
     }

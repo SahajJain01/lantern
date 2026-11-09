@@ -192,11 +192,13 @@ Messages on the link:
 | direction | `t` | fields |
 |---|---|---|
 | companion → helper | `app`, `apps_end`, `app_removed` | as above; the helper relays them to lanternd on stream 0 |
-| helper → companion | `ime` | `op`, `text`, as above (the helper forwards a window's `ime`) |
+| helper → companion | `ime` | `op`, `text`, as above (the helper forwards a window's `ime`), plus the link-only `display: u32`, the Android display of the window it was typed in |
 | helper → companion | `ime_prev` | `id: string`: the keyboard to restore if the link is lost (the session journal's original `default_input_method`, or `""`) |
 | helper → companion | `sync` | none: send the full app catalogue now |
 
-`ime_prev` and `sync` are link-only: they never travel between the helper and lanternd. The
+`ime_prev` and `sync` are link-only: they never travel between the helper and lanternd. So is
+`ime.display`: lanternd's `ime` (v1) has no `display`; the helper adds it, from the window's
+stream, only on the link. The
 helper sends `ime_prev` once the session's journal exists, and again to a newly linked companion.
 Any other `t` from the companion is logged and dropped.
 
@@ -224,6 +226,12 @@ Keyboard on the link:
 - The companion's `LanternIme` draws nothing (no input view, never fullscreen) and lets hardware
   keys pass. `commit` is `commitText(text, 1)`, `compose` is `setComposingText(text, 1)`,
   `finish` is `finishComposingText()`. It logs only `ime op=<op> ok=<bool> len=<n>`.
+- Text is bound to its window: the IME applies an `ime` only if its own display (the IME lives on
+  the focused editor's display under `LOCAL`; read from its window, else its window context)
+  equals `ime.display`. Otherwise (e.g. right after a switch to another Lantern window, before
+  the IME moved) it drops it, logging `ime op=<op> dropped len=<n>: typed for display <a>, the
+  keyboard is on display <b>`, never the text. If either display is unknown it applies the
+  `ime` (typing never breaks), logging that once per IME instance.
 - Lantern displays use the IME display policy `LOCAL` only while the session selected the Lantern
   keyboard, and `HIDE` otherwise (the keyboard-less fallback session). Under `HIDE` Android keeps
   the input connection on the launcher on display 0, so commits would never reach the app; under

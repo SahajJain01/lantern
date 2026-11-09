@@ -219,20 +219,21 @@ public final class ImeSetupTest {
             sent.add(m);
             return true;
         }, logs::add, Runnable::run);
-        relay.ime("commit", "secret text");
-        relay.ime("compose", "more secret");
+        relay.ime(11, "commit", "secret text");
+        relay.ime(11, "compose", "more secret");
         eq(1, logs.size(), "one log line for the unlinked stretch: " + logs);
         check(!logs.get(0).contains("secret"), "never logs text: " + logs);
         linked[0] = true;
-        relay.ime("commit", "hi");
+        relay.ime(12, "commit", "hi");
         eq(1, sent.size(), "sent once linked");
         Msg m = sent.get(0);
         eq("ime", m.t, "t");
         eq("commit", m.fields().get("op"), "op");
         eq("hi", m.fields().get("text"), "text");
+        eq(12L, m.fields().get("display"), "the window's display (link-only field)");
         linked[0] = false;
-        relay.ime("finish", "");
-        relay.ime("finish", "");
+        relay.ime(12, "finish", "");
+        relay.ime(12, "finish", "");
         eq(2, logs.size(), "a new unlinked stretch logs once more: " + logs);
     }
 
@@ -254,7 +255,7 @@ public final class ImeSetupTest {
             }, logs::add, exec);
             long t0 = System.nanoTime();
             for (int i = 0; i < 50; i++) {
-                relay.ime("commit", "t" + i);
+                relay.ime(11, "commit", "t" + i);
             }
             long ms = (System.nanoTime() - t0) / 1_000_000;
             check(ms < 500, "50 ime calls returned at once despite the jam: " + ms + " ms");

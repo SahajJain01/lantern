@@ -160,9 +160,13 @@ final class ImeSetup {
             this.exec = exec;
         }
 
+        /**
+         * {@code display} rides as the link-only field {@code display} (never sent to lanternd), so
+         * the companion commits only into an editor on the window's own display.
+         */
         @Override
-        public void ime(String op, String text) {
-            Msg m = Msg.of("ime").put("op", op).put("text", text);
+        public void ime(int display, String op, String text) {
+            Msg m = Msg.of("ime").put("op", op).put("text", text).put("display", display);
             try {
                 exec.execute(() -> {
                     boolean ok;

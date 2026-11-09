@@ -325,7 +325,7 @@ public final class RouterTest {
     static void setExtrasAcceptsHandler() throws Exception {
         try (Rig r = new Rig(rt -> rt.setExtras(new Router.Extras() {
             @Override
-            public void ime(String op, String text) {
+            public void ime(int display, String op, String text) {
             }
 
             @Override
@@ -342,7 +342,7 @@ public final class RouterTest {
     static Router.Extras recording(List<String> got) {
         return new Router.Extras() {
             @Override
-            public void ime(String op, String text) {
+            public void ime(int display, String op, String text) {
                 got.add(op + " " + text);
             }
 
@@ -370,6 +370,32 @@ public final class RouterTest {
             eq("commit vi\u1ec7t", got.get(1), "commit");
             eq("finish ", got.get(2), "finish");
             eq("commit " + new String(max), got.get(3), "max-size commit");
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+    }
+
+    /** Each ime carries the display of the window it was typed in, so the companion can refuse another window's editor. */
+    static void imeCarriesItsWindowsDisplay() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(new Router.Extras() {
+            @Override
+            public void ime(int display, String op, String text) {
+                got.add(display + " " + op + " " + text);
+            }
+
+            @Override
+            public void clip(String text) {
+            }
+        }))) {
+            r.hello();
+            r.open(1);
+            r.open(2);
+            r.send(2, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"two\"}");
+            r.send(1, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"one\"}");
+            Rig.await("2 ime calls", 2000, () -> got.size() == 2);
+            eq("12 commit two", got.get(0), "win 2's display");
+            eq("11 commit one", got.get(1), "win 1's display");
             r.send(0, "{\"t\":\"bye\"}");
             r.awaitExit(2000);
         }
@@ -771,6 +797,7 @@ public final class RouterTest {
             {"onSessionUpRunsAfterHelloReply", (Case) RouterTest::onSessionUpRunsAfterHelloReply},
             {"setExtrasAcceptsHandler", (Case) RouterTest::setExtrasAcceptsHandler},
             {"imeOnLiveWindowReachesExtras", (Case) RouterTest::imeOnLiveWindowReachesExtras},
+            {"imeCarriesItsWindowsDisplay", (Case) RouterTest::imeCarriesItsWindowsDisplay},
             {"imeForUnknownWindowIgnored", (Case) RouterTest::imeForUnknownWindowIgnored},
             {"imeUnknownOpIsAnError", (Case) RouterTest::imeUnknownOpIsAnError},
             {"imeTextOverLimitIsAnError", (Case) RouterTest::imeTextOverLimitIsAnError},

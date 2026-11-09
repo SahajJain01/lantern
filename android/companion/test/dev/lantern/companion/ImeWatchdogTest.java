@@ -373,6 +373,17 @@ public final class ImeWatchdogTest {
         eq("ime op=compose ok=false len=0", ImeOps.logLine("compose", false, null), "log line, null text");
     }
 
+    /** An ime applies only in the editor of the window it was typed in (I1). */
+    static void imeAppliesOnlyOnItsDisplay() {
+        check(ImeOps.displayMatches(12, 12), "same display");
+        check(!ImeOps.displayMatches(12, 11), "another window's editor: drop");
+        check(ImeOps.displayMatches(-1, 11), "no target display (older helper): allow");
+        check(ImeOps.displayMatches(12, -1), "IME display unknown: allow (never break typing)");
+        String line = ImeOps.droppedLine("commit", "secret words", 12, 11);
+        check(!line.contains("secret"), "never the text: " + line);
+        check(line.contains("len=12") && line.contains("display"), "op/len/reason: " + line);
+    }
+
     static void eq(Object want, Object got, String what) {
         if (want == null ? got != null : !want.equals(got)) {
             throw new AssertionError(what + ": want " + want + ", got " + got);
@@ -415,6 +426,7 @@ public final class ImeWatchdogTest {
             {"createdUnlinkedKeepsAnOngoingLoss", (Case) ImeWatchdogTest::createdUnlinkedKeepsAnOngoingLoss},
             {"switchThatTookReportsDone", (Case) ImeWatchdogTest::switchThatTookReportsDone},
             {"opsDispatch", (Case) ImeWatchdogTest::opsDispatch},
+            {"imeAppliesOnlyOnItsDisplay", (Case) ImeWatchdogTest::imeAppliesOnlyOnItsDisplay},
         };
         int failed = 0;
         for (Object[] c : cases) {

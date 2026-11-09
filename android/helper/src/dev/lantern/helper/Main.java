@@ -184,8 +184,8 @@ public final class Main {
             }, phoneClip::write);
             router.setExtras(new Router.Extras() {
                 @Override
-                public void ime(String op, String text) {
-                    ime.ime(op, text);
+                public void ime(int display, String op, String text) {
+                    ime.ime(display, op, text);
                 }
 
                 @Override

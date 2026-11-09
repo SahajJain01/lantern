@@ -319,7 +319,8 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
   - A scale-only change doesn't send the new dpi. Decoding runs on the reader thread.
     `windows.json.lock` is left behind.
   - Text: the first character after switching windows may be dropped (the Lantern IME is
-    recreated per display); a dead key with Ctrl/Alt/Super is swallowed; CapsLock/NumLock
+    recreated per display, and an `ime` for another display than the IME's is dropped on purpose
+    so text never lands in the previous window's editor); a dead key with Ctrl/Alt/Super is swallowed; CapsLock/NumLock
     characters go as text, not keys; the `LANTERN_DEBUG_INPUT` step log prints the typed test text.
   - "Connect your phone" also shows when lanternd isn't running at all.
 - **Tests**

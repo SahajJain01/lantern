@@ -41,8 +41,11 @@ public final class LinkClient {
         /** The keyboard to restore if the link is lost ({@code ""}: none known). */
         void imePrev(String id);
 
-        /** A window's {@code ime{op, text}} (Task 7). */
-        void ime(String op, String text);
+        /**
+         * A window's {@code ime{op, text}} (Task 7), with the link-only {@code display} of that
+         * window ({@code -1} when absent).
+         */
+        void ime(int display, String op, String text);
 
         /** {@code sync}: send the full app catalogue (the helper's daemon session is up). */
         void sync();
@@ -127,7 +130,8 @@ public final class LinkClient {
                         h.imePrev(m.str("id"));
                         break;
                     case "ime":
-                        h.ime(m.str("op"), m.fields().containsKey("text") ? m.str("text") : "");
+                        int display = m.fields().get("display") instanceof Long ? (int) m.num("display") : -1;
+                        h.ime(display, m.str("op"), m.fields().containsKey("text") ? m.str("text") : "");
                         break;
                     case "sync":
                         h.sync();
