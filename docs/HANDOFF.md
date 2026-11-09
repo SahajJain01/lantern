@@ -33,6 +33,13 @@ attached.
   window gets no frames (no configure acks, debug steps never start), and item 5 fails because item
   4 killed its window. 1–3, 7 and 9–11 pass there.
 - Not run (need Sahaj or the other phone): items 8 and 14 (`--manual`), and the Motorola check.
+- After the final-review fix wave: `--nested` **12/12 PASS** again (scratch `XDG_RUNTIME_DIR`,
+  real-session KWin config mtimes and `kwin_wayland`/`ksecretd`/`xdg-desktop-portal-kde` pids
+  unchanged). Also on the device: text bound to its window (TestActivity window on display A
+  typed `alpha`, Settings then took the IME to display B, A's next `text:` was dropped with
+  `ime op=commit dropped len=4: typed for display A, the keyboard is on display B`), a
+  left-enabled TestActivity disabled on relink, and lanternd waiting for the previous helper
+  before the companion update.
 
 **Deferred checks, with the commands to run:**
 1. Real desktop, unlocked, Sahaj at the PC:
@@ -45,6 +52,10 @@ attached.
    `Files (work)` and the taskbar icon is badged, and type into its search field.
 4. Typing with a real PC input method: start ibus or fcitx5 with a Vietnamese engine, type
    `Tiếng Việt` into the companion's test screen (or any phone app) on the real desktop.
+5. Reboot mid-session (see "Still unverified" below): the companion gives the keyboard back
+   after the phone restarts with the Lantern keyboard still selected.
+6. Two windows on the real desktop: type into the test screen, click a second Lantern window's
+   text field, type there, and check nothing typed lands in the other window's field.
 
 ### Still unverified
 - The Motorola work-profile catalogue, badged icons and the `Files (work)` title (Task 5/6/10).
