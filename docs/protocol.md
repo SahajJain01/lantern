@@ -121,9 +121,11 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
   (added or changed) and `app_removed` messages. A full catalogue whose `apps_end.count` matches
   the `app` messages received replaces the previous one (apps missing from it are removed); a
   partial one (the link dropped mid-list, or the count differs) removes nothing.
-- `companion{state}` is sent after the hello reply: `"ready"` when the companion linked,
-  `"unavailable"` (with a `msg`) when it did not. Without the companion the session still works,
-  with no catalogue and no PC text input.
+- `companion{state}` is sent after the hello reply: `"ready"` when the companion linked and the
+  Lantern keyboard is selected, `"unavailable"` (with a `msg`) otherwise: `"companion did not
+  connect"`, or `"keyboard switch failed: <reason>"` when the companion linked but selecting its
+  keyboard failed (the catalogue still syncs; only PC text input is missing). Without the
+  companion the session still works, with no catalogue and no PC text input.
 - `clip` carries plain text only; each side suppresses echoing back the text it just received.
 
 ## Companion link (helper ↔ companion)
@@ -187,6 +189,13 @@ Keyboard on the link:
   while it still holds Lantern's value. Without the companion only `stay_on_while_plugged_in`
   changes. `ime_prev.id` is the journal's original `default_input_method`, or `""` when it was
   absent or is Lantern's own.
+- The keyboard is optional: if the session start with the keyboard changes fails (e.g. `ime set`
+  refused) and its own rollback succeeded (every setting back, that attempt's Cleanup disarmed),
+  the helper starts the session again with `stay_on_while_plugged_in` only, under a fresh Cleanup,
+  sends no `ime_prev`, keeps the companion link (catalogue), and reports
+  `companion{state:"unavailable", msg:"keyboard switch failed: <reason>"}`. If that rollback
+  itself failed, the start fails as before (the phone may be mid-restore; Cleanup and the journal
+  own it).
 - The helper forwards a live window's `ime` in order from its own sender thread, so a companion
   that stops reading never stalls the session; at most 256 wait, newer ones are dropped. An `ime`
   that arrives while no companion is linked is dropped. Each dropping stretch is logged once,
@@ -196,9 +205,17 @@ Keyboard on the link:
   keys pass. `commit` is `commitText(text, 1)`, `compose` is `setComposingText(text, 1)`,
   `finish` is `finishComposingText()`. It logs only `ime op=<op> ok=<bool> len=<n>`.
 - Watchdog: when the link is lost, the IME (polling every 500 ms) switches to `ime_prev.id` once
-  5 s have passed, if the Lantern IME is still the current keyboard and the id is not `""`; at
-  most once per loss. A link that comes back within the 5 s (a new session) cancels it. A link
-  that a newer one replaced does not count as lost.
+  5 s have passed, if the Lantern IME is still the current keyboard and the id is not `""`. A
+  link that comes back within the 5 s (a new session) cancels it, and every new link clears the
+  stored `ime_prev` (so a loss before the new session's `ime_prev` restores nothing). A link that
+  a newer one replaced does not count as lost.
+- A watchdog switch that throws or does not take is retried every 2 s while the Lantern IME is
+  still current, up to 5 attempts. After that, or at once if `ime_prev.id` is not among the
+  enabled keyboards (`InputMethodManager.getEnabledInputMethodList()`), it switches to the first
+  enabled keyboard that is neither Lantern's nor the original, logging
+  `ime_restored fallback=<id>`. A fallback that does not take, or no candidate, is logged
+  (`ime_restore gave up: <reason>`) and it stops. Once another keyboard is current after a
+  switch, it is done for that loss.
 
 Catalogue on the link:
 

@@ -86,6 +86,128 @@ public final class ImeSetupTest {
             new Journal.Entry("secure", "default_input_method", ID, ID)))), "Lantern's own is never restored to");
     }
 
+    /** Settings whose {@code ime set} is refused (Ruling 15). */
+    static final class RefusingIme extends SessionTest.FakeSettings {
+        String refuseRestoreOf; // a put of this value throws (a failing rollback)
+
+        @Override
+        public void selectIme(String id) {
+            writes.add("selectIme " + id);
+            throw new IllegalStateException("ime set refused");
+        }
+
+        @Override
+        public void put(String ns, String key, String v) {
+            if (v != null && v.equals(refuseRestoreOf)) {
+                throw new IllegalStateException("put refused");
+            }
+            super.put(ns, key, v);
+        }
+    }
+
+    /** A starter like the device's: a fresh guard per attempt; records guard and change-list events. */
+    static final class RecordingStarter implements ImeSetup.Starter {
+        final SettingsBackend settings;
+        final List<String> events = new ArrayList<>();
+        int guards;
+
+        RecordingStarter(SettingsBackend settings) {
+            this.settings = settings;
+        }
+
+        @Override
+        public Session start(List<Change> changes) {
+            int n = ++guards;
+            events.add("start " + changes.size());
+            return Session.start(settings, new SessionTest.FakePower(), new Session.Guard() {
+                @Override
+                public void arm(String journalJson) {
+                    events.add("arm " + n);
+                }
+
+                @Override
+                public void disarm() {
+                    events.add("disarm " + n);
+                }
+            }, JournalStore.none(), changes);
+        }
+    }
+
+    static RefusingIme phoneWithLatin() {
+        RefusingIme s = new RefusingIme();
+        s.values.put("global/stay_on_while_plugged_in", "15");
+        s.values.put("secure/enabled_input_methods", LATIN);
+        s.values.put("secure/default_input_method", LATIN);
+        return s;
+    }
+
+    static void imeSwitchFailureFallsBackToStayOn() {
+        RefusingIme s = phoneWithLatin();
+        RecordingStarter st = new RecordingStarter(s);
+        List<String> logs = new ArrayList<>();
+        ImeSetup.Started r = ImeSetup.start(true, st, logs::add);
+        check(!r.imeSelected, "keyboard not selected");
+        eq("keyboard switch failed: ime set refused", r.imeFailure, "failure reason");
+        // The first attempt rolled back and disarmed its Cleanup before the second was spawned.
+        eq("[start 3, arm 1, disarm 1, start 1, arm 2]", st.events.toString(), "guard order");
+        eq(1, r.session.journal().entries().size(), "STAY_ON only");
+        eq("7", s.get("global", "stay_on_while_plugged_in"), "stay-on set");
+        eq(LATIN, s.get("secure", "enabled_input_methods"), "enabled list restored");
+        eq(LATIN, s.get("secure", "default_input_method"), "keyboard untouched");
+        check(logs.toString().contains("ime set refused"), "failure logged: " + logs);
+        r.session.close();
+        eq("15", s.get("global", "stay_on_while_plugged_in"), "restored at the end");
+        eq("disarm 2", st.events.get(st.events.size() - 1), "second guard disarmed at the end");
+    }
+
+    static void noRetryWhenRollbackFailed() {
+        RefusingIme s = phoneWithLatin();
+        s.refuseRestoreOf = LATIN; // restoring the enabled list fails: Cleanup owns the phone now
+        RecordingStarter st = new RecordingStarter(s);
+        try {
+            ImeSetup.start(true, st, m -> { });
+            throw new AssertionError("want the start failure rethrown");
+        } catch (IllegalStateException e) {
+            eq("ime set refused", e.getMessage(), "original failure");
+        }
+        eq("[start 3, arm 1]", st.events.toString(), "no second attempt, first guard left armed");
+    }
+
+    static void imeSelectedWhenItWorks() {
+        SessionTest.FakeSettings s = new SessionTest.FakeSettings();
+        s.values.put("secure/default_input_method", LATIN);
+        RecordingStarter st = new RecordingStarter(s);
+        ImeSetup.Started r = ImeSetup.start(true, st, m -> { });
+        check(r.imeSelected, "selected");
+        eq(null, r.imeFailure, "no failure");
+        eq("[start 3, arm 1]", st.events.toString(), "one attempt");
+        eq(ID, s.get("secure", "default_input_method"), "ours");
+        r.session.close();
+    }
+
+    static void notLinkedIsStayOnOnly() {
+        SessionTest.FakeSettings s = new SessionTest.FakeSettings();
+        RecordingStarter st = new RecordingStarter(s);
+        ImeSetup.Started r = ImeSetup.start(false, st, m -> { });
+        check(!r.imeSelected, "not selected");
+        eq(null, r.imeFailure, "nothing failed");
+        eq("[start 1, arm 1]", st.events.toString(), "STAY_ON only");
+        r.session.close();
+    }
+
+    static void companionStateMessages() throws Exception {
+        Msg ready = ImeSetup.companionState(true, null);
+        eq("companion", ready.t, "type");
+        eq("ready", ready.str("state"), "ready");
+        eq(1, ready.fields().size(), "no msg when ready");
+        Msg kb = ImeSetup.companionState(true, "keyboard switch failed: x");
+        eq("unavailable", kb.str("state"), "keyboard failed");
+        eq("keyboard switch failed: x", kb.str("msg"), "keyboard msg");
+        Msg none = ImeSetup.companionState(false, null);
+        eq("unavailable", none.str("state"), "not linked");
+        eq("companion did not connect", none.str("msg"), "not linked msg");
+    }
+
     static void relayDropsAndLogsOnceWhileUnlinked() {
         List<String> logs = new ArrayList<>();
         List<Msg> sent = new ArrayList<>();
@@ -174,6 +296,11 @@ public final class ImeSetupTest {
             {"prevImeFromJournal", (Case) ImeSetupTest::prevImeFromJournal},
             {"relayDropsAndLogsOnceWhileUnlinked", (Case) ImeSetupTest::relayDropsAndLogsOnceWhileUnlinked},
             {"relayNeverBlocksTheCaller", (Case) ImeSetupTest::relayNeverBlocksTheCaller},
+            {"imeSwitchFailureFallsBackToStayOn", (Case) ImeSetupTest::imeSwitchFailureFallsBackToStayOn},
+            {"noRetryWhenRollbackFailed", (Case) ImeSetupTest::noRetryWhenRollbackFailed},
+            {"imeSelectedWhenItWorks", (Case) ImeSetupTest::imeSelectedWhenItWorks},
+            {"notLinkedIsStayOnOnly", (Case) ImeSetupTest::notLinkedIsStayOnOnly},
+            {"companionStateMessages", (Case) ImeSetupTest::companionStateMessages},
         };
         int failed = 0;
         for (Object[] c : cases) {

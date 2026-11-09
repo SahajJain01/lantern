@@ -74,7 +74,9 @@ final class Link {
             c.handshake(token);
             client = c;
             linked = true;
-            ImeState.WATCHDOG.linkUp(); // a new session within the grace keeps its keyboard
+            // A new session within the grace keeps its keyboard, and the previous session's
+            // ime_prev is dropped (this session sends its own if it selects the Lantern IME).
+            ImeState.linkUp();
             Log.i(TAG, "linked to the helper");
             // Callbacks are registered now; the catalogue is sent when the helper asks (sync).
             // Without it (LauncherApps refused) the link still serves the IME.

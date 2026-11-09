@@ -117,26 +117,27 @@ public final class Main {
             final Runnable[] linkRef = {null};
             final CompanionLink[] companionRef = {null};
             final boolean[] linked = {false};
+            final String[] imeFailure = {null};
             Router router = new Router(in, out, AppDisplay::open, new Input(), Control.CODEC, token,
                 () -> {
                     // After a valid hello only: an unauthenticated client never reaches the companion.
                     linked[0] = linkCompanion(routerRef, linkRef, companionRef);
                     // With the companion linked, the session also enables and selects the Lantern
-                    // keyboard (journaled: restored at the end, by Cleanup, or by its watchdog).
-                    java.util.List<Change> changes = new java.util.ArrayList<>();
-                    changes.add(Session.STAY_ON);
-                    if (linked[0]) {
-                        changes.addAll(ImeSetup.changes());
-                    }
-                    Session session;
+                    // keyboard (journaled: restored at the end, by Cleanup, or by its watchdog). If
+                    // that fails, the session goes on with STAY_ON only (Ruling 15); the link stays
+                    // open for the catalogue. Each attempt spawns its own Cleanup guard.
+                    ImeSetup.Started started;
                     try {
-                        session = Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log),
-                            JournalStore.device(Droid::log), changes);
+                        started = ImeSetup.start(linked[0], changes -> Session.start(new ShellSettings(),
+                            new DevicePower(), Cleanup.spawnGuard(Droid::log), JournalStore.device(Droid::log),
+                            changes), Droid::log);
                     } catch (RuntimeException e) {
                         closeLink(linkRef[0]);
                         throw e;
                     }
-                    if (linked[0]) {
+                    Session session = started.session;
+                    imeFailure[0] = started.imeFailure;
+                    if (started.imeSelected) {
                         companionRef[0].setPrevIme(ImeSetup.prevIme(session.journal()));
                     }
                     return () -> {
@@ -173,9 +174,7 @@ public final class Main {
                 return l == null ? null : l.label(pkg, user);
             });
             router.setOnSessionUp(() -> {
-                router.sendSession(linked[0]
-                    ? Msg.of("companion").put("state", "ready")
-                    : Msg.of("companion").put("state", "unavailable").put("msg", "companion did not connect"));
+                router.sendSession(ImeSetup.companionState(linked[0], imeFailure[0]));
                 // Only now (after the hello reply) is the catalogue asked for, so it goes straight
                 // to lanternd instead of piling up in the router's pre-session buffer. A companion
                 // that links later is asked right after its own hello.

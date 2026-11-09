@@ -63,6 +63,67 @@ final class ImeSetup {
         return e.orig;
     }
 
+    /**
+     * Starts a {@link Session} with {@code changes}. Each call must arm a fresh guard (on the device
+     * a new {@code Cleanup.spawnGuard}): a guard is single-use.
+     */
+    interface Starter {
+        Session start(List<Change> changes);
+    }
+
+    /** The session {@link #start} brought up, and whether the Lantern keyboard is selected in it. */
+    static final class Started {
+        final Session session;
+        final boolean imeSelected;
+        /** {@code "keyboard switch failed: <reason>"} when the keyboard was tried and fell back; else null. */
+        final String imeFailure;
+
+        Started(Session session, boolean imeSelected, String imeFailure) {
+            this.session = session;
+            this.imeSelected = imeSelected;
+            this.imeFailure = imeFailure;
+        }
+    }
+
+    /**
+     * The session start (Ruling 15). Without {@code withIme}: {@link Session#STAY_ON} only. With it:
+     * STAY_ON plus {@link #changes()}; if that start fails and its own rollback succeeded (no
+     * suppressed close failure: every setting is back and that attempt's guard is disarmed), the
+     * keyboard is optional, so it starts again with STAY_ON only and reports the reason. A failed
+     * rollback is rethrown untouched: the phone may be mid-restore, which Cleanup and the journal
+     * own. A failure of the STAY_ON-only start is rethrown too.
+     */
+    static Started start(boolean withIme, Starter starter, Consumer<String> log) {
+        List<Change> stayOn = java.util.Collections.singletonList(Session.STAY_ON);
+        if (!withIme) {
+            return new Started(starter.start(stayOn), false, null);
+        }
+        List<Change> all = new java.util.ArrayList<>();
+        all.add(Session.STAY_ON);
+        all.addAll(changes());
+        try {
+            return new Started(starter.start(all), true, null);
+        } catch (RuntimeException e) {
+            if (e.getSuppressed().length > 0) {
+                throw e;
+            }
+            String reason = e.getMessage() != null ? e.getMessage() : e.toString();
+            log.accept("serve: keyboard switch failed (" + e + "), session without the Lantern keyboard");
+            return new Started(starter.start(stayOn), false, "keyboard switch failed: " + reason);
+        }
+    }
+
+    /** The {@code companion} message for lanternd once the session is up. */
+    static Msg companionState(boolean linked, String imeFailure) {
+        if (!linked) {
+            return Msg.of("companion").put("state", "unavailable").put("msg", "companion did not connect");
+        }
+        if (imeFailure != null) {
+            return Msg.of("companion").put("state", "unavailable").put("msg", imeFailure);
+        }
+        return Msg.of("companion").put("state", "ready");
+    }
+
     /** How many {@code ime} messages may wait for a slow companion before new ones are dropped. */
     static final int RELAY_QUEUE = 256;
 

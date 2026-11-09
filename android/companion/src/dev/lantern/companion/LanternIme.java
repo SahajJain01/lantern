@@ -7,6 +7,8 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodInfo;
+import android.view.inputmethod.InputMethodManager;
 
 /**
  * Lantern's hidden IME, selected by the helper for the length of a session: it draws nothing and
@@ -16,7 +18,7 @@ import android.view.inputmethod.InputConnection;
  * Never logs typed text: only {@code ime op=<op> ok=<bool> len=<n>}.
  */
 public final class LanternIme extends InputMethodService {
-    static final String ID = "dev.lantern.companion/.LanternIme";
+    static final String ID = ImeWatchdog.LANTERN_ID;
     static final long POLL_MS = 500;
 
     private Handler handler;
@@ -97,15 +99,30 @@ public final class LanternIme extends InputMethodService {
         } catch (RuntimeException e) {
             current = false;
         }
-        String prev = ImeState.WATCHDOG.due(SystemClock.elapsedRealtime(), current);
-        if (prev == null) {
+        ImeWatchdog.Action a = ImeState.WATCHDOG.due(SystemClock.elapsedRealtime(), current, this::enabledIds);
+        if (a == null) {
             return;
         }
-        try {
-            switchInputMethod(prev);
-            Log.i(Link.TAG, "ime_restored");
-        } catch (RuntimeException e) {
-            Log.w(Link.TAG, "ime_restore failed: " + e);
+        if (a.id == null) {
+            Log.w(Link.TAG, "ime_restore gave up: " + a.giveUp);
+            return;
         }
+        // A switch that throws or does not take is retried (then falls back) by the watchdog.
+        try {
+            switchInputMethod(a.id);
+            Log.i(Link.TAG, a.fallback ? "ime_restored fallback=" + a.id : "ime_restored");
+        } catch (RuntimeException e) {
+            Log.w(Link.TAG, "ime_restore failed" + (a.fallback ? " (fallback)" : "") + ": " + e);
+        }
+    }
+
+    /** The enabled IME ids (InputMethodInfo.getId), in the system's order. */
+    private java.util.List<String> enabledIds() {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        InputMethodManager imm = getSystemService(InputMethodManager.class);
+        for (InputMethodInfo info : imm.getEnabledInputMethodList()) {
+            ids.add(info.getId());
+        }
+        return ids;
     }
 }

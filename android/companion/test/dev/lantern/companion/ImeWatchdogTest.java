@@ -1,35 +1,54 @@
 package dev.lantern.companion;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Host-JVM tests for {@link ImeWatchdog} (when the IME gives the keyboard back after the helper's
- * link is lost) and {@link ImeOps} (op dispatch). Android classes must never be loaded here.
+ * link is lost, with retry and fallback), {@link ImeState#linkUp} and {@link ImeOps} (op dispatch).
+ * Android classes must never be loaded here.
  */
 public final class ImeWatchdogTest {
     static final String PREV = "com.android.inputmethod.latin/.LatinIME";
+    static final String OTHER = "com.other/.Keyboard";
+    static final String LANTERN = "dev.lantern.companion/.LanternIme";
+    static final Supplier<List<String>> ENABLED = () -> Arrays.asList(PREV, LANTERN);
+
+    /** The keyboard the watchdog switches to now (prev or fallback), or null. */
+    static String fire(ImeWatchdog w, long now, boolean current) {
+        return fire(w, now, current, ENABLED);
+    }
+
+    static String fire(ImeWatchdog w, long now, boolean current, Supplier<List<String>> enabled) {
+        ImeWatchdog.Action a = w.due(now, current, enabled);
+        return a == null ? null : a.id;
+    }
 
     static void firesAfterGrace() {
         ImeWatchdog w = new ImeWatchdog(5000);
         w.linkUp();
         w.linkLost(1000, PREV);
-        eq(PREV, w.due(6000, true), "fires at lostAt + grace");
+        ImeWatchdog.Action a = w.due(6000, true, ENABLED);
+        eq(PREV, a.id, "fires at lostAt + grace");
+        check(!a.fallback, "the original keyboard, not a fallback");
     }
 
     static void defaultGraceIsFiveSeconds() {
         ImeWatchdog w = new ImeWatchdog();
         w.linkLost(0, PREV);
-        eq(null, w.due(4999, true), "not before 5 s");
-        eq(PREV, w.due(5000, true), "at 5 s");
+        eq(null, fire(w, 4999, true), "not before 5 s");
+        eq(PREV, fire(w, 5000, true), "at 5 s");
     }
 
     static void notBeforeGrace() {
         ImeWatchdog w = new ImeWatchdog(5000);
         w.linkUp();
         w.linkLost(1000, PREV);
-        eq(null, w.due(1000, true), "at loss");
-        eq(null, w.due(5999, true), "1 ms before grace");
+        eq(null, fire(w, 1000, true), "at loss");
+        eq(null, fire(w, 5999, true), "1 ms before grace");
     }
 
     static void linkUpCancels() {
@@ -37,37 +56,137 @@ public final class ImeWatchdogTest {
         w.linkUp();
         w.linkLost(1000, PREV);
         w.linkUp(); // a new session within 5 s must not lose its keyboard
-        eq(null, w.due(10_000, true), "relinked: never fires");
-        eq(null, w.due(100_000, true), "still never");
+        eq(null, fire(w, 10_000, true), "relinked: never fires");
+        eq(null, fire(w, 100_000, true), "still never");
     }
 
     static void notWhenAnotherImeCurrent() {
         ImeWatchdog w = new ImeWatchdog(5000);
         w.linkLost(0, PREV);
-        eq(null, w.due(6000, false), "someone else's keyboard: leave it");
+        eq(null, fire(w, 6000, false), "someone else's keyboard: leave it");
     }
 
     static void notWithoutPrev() {
         ImeWatchdog w = new ImeWatchdog(5000);
         w.linkLost(0, "");
-        eq(null, w.due(6000, true), "empty prev");
+        eq(null, fire(w, 6000, true), "empty prev");
         ImeWatchdog n = new ImeWatchdog(5000);
         n.linkLost(0, null);
-        eq(null, n.due(6000, true), "null prev");
+        eq(null, fire(n, 6000, true), "null prev");
         ImeWatchdog never = new ImeWatchdog(5000);
-        eq(null, never.due(6000, true), "never linked, never lost");
+        eq(null, fire(never, 6000, true), "never linked, never lost");
     }
 
-    static void firesOnce() {
+    /** Once the switch took (we are no longer current), it never fires again for that loss. */
+    static void firesOnceWhenTheSwitchTakes() {
         ImeWatchdog w = new ImeWatchdog(5000);
         w.linkLost(0, PREV);
-        eq(PREV, w.due(6000, true), "first");
-        eq(null, w.due(6500, true), "not again for the same loss");
-        eq(null, w.due(60_000, true), "still not");
+        eq(PREV, fire(w, 6000, true), "first");
+        eq(null, fire(w, 6500, true), "not again before the retry interval");
+        eq(null, fire(w, 8000, false), "switched: done");
+        eq(null, fire(w, 60_000, true), "still not (Lantern re-selected without a link)");
         // A later link and loss arms it again.
         w.linkUp();
         w.linkLost(70_000, PREV);
-        eq(PREV, w.due(75_000, true), "fires for the next loss");
+        eq(PREV, fire(w, 75_000, true), "fires for the next loss");
+    }
+
+    static void retryConstants() {
+        eq(2000L, ImeWatchdog.RETRY_MS, "retry every 2 s");
+        eq(5, ImeWatchdog.MAX_ATTEMPTS, "5 attempts at the original keyboard");
+        eq(LANTERN, ImeWatchdog.LANTERN_ID, "Lantern's own ID");
+    }
+
+    /** A switch that did not take (threw, or silently ignored) is retried after RETRY_MS. */
+    static void failureRearms() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkLost(0, PREV);
+        eq(PREV, fire(w, 5000, true), "attempt 1");
+        eq(null, fire(w, 6999, true), "waits RETRY_MS");
+        eq(PREV, fire(w, 7000, true), "attempt 2: still on the Lantern IME");
+    }
+
+    static void fallsBackAfterMaxAttempts() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkLost(0, PREV);
+        Supplier<List<String>> enabled = () -> Arrays.asList(LANTERN, PREV, OTHER);
+        long t = 5000;
+        for (int i = 1; i <= ImeWatchdog.MAX_ATTEMPTS; i++, t += ImeWatchdog.RETRY_MS) {
+            ImeWatchdog.Action a = w.due(t, true, enabled);
+            eq(PREV, a.id, "attempt " + i);
+            check(!a.fallback, "attempt " + i + " is the original");
+        }
+        ImeWatchdog.Action fb = w.due(t, true, enabled);
+        eq(OTHER, fb.id, "fallback skips Lantern and the failing original");
+        check(fb.fallback, "marked as fallback");
+    }
+
+    static void fallsBackAtOnceWhenPrevNotEnabled() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkLost(0, PREV); // uninstalled or disabled since
+        ImeWatchdog.Action a = w.due(5000, true, () -> Arrays.asList(LANTERN, OTHER));
+        eq(OTHER, a.id, "first enabled that is not Lantern");
+        check(a.fallback, "fallback");
+    }
+
+    static void noCandidatesGivesUp() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkLost(0, PREV);
+        ImeWatchdog.Action a = w.due(5000, true, () -> Collections.singletonList(LANTERN));
+        check(a != null && a.id == null, "a give-up action");
+        check(a.giveUp != null && !a.giveUp.isEmpty(), "with a reason to log");
+        eq(null, w.due(7000, true, ENABLED), "stops");
+        eq(null, w.due(60_000, true, ENABLED), "for good");
+    }
+
+    static void failedFallbackGivesUp() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkLost(0, PREV);
+        Supplier<List<String>> enabled = () -> Arrays.asList(OTHER, LANTERN);
+        eq(OTHER, fire(w, 5000, true, enabled), "fallback at once");
+        ImeWatchdog.Action a = w.due(7000, true, enabled);
+        check(a != null && a.id == null && a.giveUp != null, "fallback did not take: give up");
+        eq(null, w.due(9000, true, enabled), "stops");
+    }
+
+    static void unreadableEnabledListRetriesPrevThenGivesUp() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkLost(0, PREV);
+        Supplier<List<String>> broken = () -> {
+            throw new IllegalStateException("no IMM");
+        };
+        long t = 5000;
+        for (int i = 1; i <= ImeWatchdog.MAX_ATTEMPTS; i++, t += ImeWatchdog.RETRY_MS) {
+            eq(PREV, fire(w, t, true, broken), "attempt " + i + " assumes prev is enabled");
+        }
+        ImeWatchdog.Action a = w.due(t, true, broken);
+        check(a != null && a.id == null && a.giveUp != null, "no candidates known: give up");
+    }
+
+    static void enabledListReadOnlyWhenFiring() {
+        int[] calls = {0};
+        Supplier<List<String>> counting = () -> {
+            calls[0]++;
+            return Arrays.asList(PREV, LANTERN);
+        };
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.due(1000, true, counting);
+        w.linkLost(0, PREV);
+        w.due(1000, true, counting);
+        w.due(6000, false, counting);
+        eq(0, calls[0], "not read while nothing is due");
+        w.due(6000, true, counting);
+        eq(1, calls[0], "read once when firing");
+    }
+
+    /** A relink drops the previous session's ime_prev, so a loss before the new one cannot restore it. */
+    static void linkUpClearsStaleImePrev() {
+        ImeState.prevIme = PREV;
+        ImeState.linkUp();
+        eq(null, ImeState.prevIme, "stale ime_prev cleared at linkUp");
+        ImeState.WATCHDOG.linkLost(0, ImeState.prevIme); // lost before the new ime_prev arrived
+        eq(null, fire(ImeState.WATCHDOG, 60_000, true), "nothing to restore");
+        ImeState.linkUp();
     }
 
     static void opsDispatch() {
@@ -125,7 +244,16 @@ public final class ImeWatchdogTest {
             {"linkUpCancels", (Case) ImeWatchdogTest::linkUpCancels},
             {"notWhenAnotherImeCurrent", (Case) ImeWatchdogTest::notWhenAnotherImeCurrent},
             {"notWithoutPrev", (Case) ImeWatchdogTest::notWithoutPrev},
-            {"firesOnce", (Case) ImeWatchdogTest::firesOnce},
+            {"firesOnceWhenTheSwitchTakes", (Case) ImeWatchdogTest::firesOnceWhenTheSwitchTakes},
+            {"retryConstants", (Case) ImeWatchdogTest::retryConstants},
+            {"failureRearms", (Case) ImeWatchdogTest::failureRearms},
+            {"fallsBackAfterMaxAttempts", (Case) ImeWatchdogTest::fallsBackAfterMaxAttempts},
+            {"fallsBackAtOnceWhenPrevNotEnabled", (Case) ImeWatchdogTest::fallsBackAtOnceWhenPrevNotEnabled},
+            {"noCandidatesGivesUp", (Case) ImeWatchdogTest::noCandidatesGivesUp},
+            {"failedFallbackGivesUp", (Case) ImeWatchdogTest::failedFallbackGivesUp},
+            {"unreadableEnabledListRetriesPrevThenGivesUp", (Case) ImeWatchdogTest::unreadableEnabledListRetriesPrevThenGivesUp},
+            {"enabledListReadOnlyWhenFiring", (Case) ImeWatchdogTest::enabledListReadOnlyWhenFiring},
+            {"linkUpClearsStaleImePrev", (Case) ImeWatchdogTest::linkUpClearsStaleImePrev},
             {"opsDispatch", (Case) ImeWatchdogTest::opsDispatch},
         };
         int failed = 0;
