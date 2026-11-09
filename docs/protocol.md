@@ -7,8 +7,8 @@ server (Java) over a single byte stream.
 
 - All integers are big-endian.
 - Frame: `u32 len` (bytes after this field), `u8 kind`, `u32 stream`, `payload[len-5]`.
-- Control payload: UTF-8 JSON. Stream `0` is the session (Hello/Bye/Error). Stream `N>0` is the window id
-  assigned by `lanternd`.
+- Control payload: UTF-8 JSON. Stream `0` is the session (hello/bye/error, and the session-wide
+  catalogue, `companion` and `clip` messages). Stream `N>0` is the window id assigned by `lanternd`.
 - Video payload: `u64 pts_us`, `u8 flags` (bit0 config, bit1 key), then the codec bytes (Annex-B).
 - Input payload: `u8 type` (1 pointer, 2 scroll, 3 key), then:
   - pointer: `u8 action` (0 down, 1 up, 2 move, 3 hover-move, 4 cancel), `u64 id`, `f32 x`, `f32 y`,
@@ -58,8 +58,8 @@ JSON objects tagged by `"t"` (snake_case). Example:
   replies `hello{version:1, token:""}`; on a wrong token (or anything else first) it sends one
   `error{msg}` on stream 0 and closes the connection. On a wrong version it sends
   `error{msg, code:"version", version:<the helper's own version>}` instead (the helper never
-  answers `hello` with another version). Phone state (stay-awake, panel) only changes after a
-  valid hello.
+  answers `hello` with another version). Phone state (stay-awake, keyboard, panel) only changes
+  after a valid hello.
 - `lanternd` treats a handshake `error` with `code:"version"` (or, from a helper predating
   `code`, a `msg` starting `protocol version mismatch`) as a version mismatch and exits 3 (see
   Exit statuses); any other handshake `error` is retried with backoff.
@@ -183,7 +183,9 @@ allows 10 s for the hello reply.
 The companion's `LinkReceiver` (also DUMP-only) takes one test-only command, `am broadcast --user
 0 -n dev.lantern.companion/.LinkReceiver -a dev.lantern.companion.TEST_ACTIVITY --es enabled
 true|false`, which enables its `TestActivity` or returns it to disabled. The shell may not
-`pm enable` another package's component on Android 15.
+`pm enable` another package's component (only a testOnly package's), so device tests use this.
+`TestActivity` is one EditText that logs `text=<content>` with tag `LanternTest` on every change;
+it is disabled outside tests.
 
 Messages on the link:
 
@@ -222,6 +224,10 @@ Keyboard on the link:
 - The companion's `LanternIme` draws nothing (no input view, never fullscreen) and lets hardware
   keys pass. `commit` is `commitText(text, 1)`, `compose` is `setComposingText(text, 1)`,
   `finish` is `finishComposingText()`. It logs only `ime op=<op> ok=<bool> len=<n>`.
+- Lantern displays use the IME display policy `LOCAL` only while the session selected the Lantern
+  keyboard, and `HIDE` otherwise (the keyboard-less fallback session). Under `HIDE` Android keeps
+  the input connection on the launcher on display 0, so commits would never reach the app; under
+  `LOCAL` any keyboard that draws (the phone's own) would appear inside the PC window.
 - Watchdog: when the link is lost, the IME (polling every 500 ms) switches to `ime_prev.id` once
   5 s have passed, if the Lantern IME is still the current keyboard and the id is not `""`. A
   link that comes back within the 5 s (a new session) cancels it, and every new link clears the
@@ -312,7 +318,7 @@ Host-only; the helper never sees these, and the daemon never forwards them.
   other unexpected control type.
 
 `lantern status` prints the report without `t`, e.g.
-`{"state":"ready","serial":"20e9318","helper":"ae30…","windows":[{"id":1,"pkg":"com.android.settings","user":0}]}`.
+`{"state":"ready","serial":"20e9318","helper":"ae30…","windows":[{"id":1,"pkg":"com.android.settings","user":0}],"companion":"ready"}`.
 
 ### Exit statuses (`lantern`)
 

@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py            # items 1-7
-    python3 tools/device_test.py --manual                                     # 1-7, then 8 (prompts)
-    python3 tools/device_test.py --state                                      # print phone state
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13
+    python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
+    python3 tools/device_test.py --only 12 13                        # by number or name
+    python3 tools/device_test.py --nested                            # windows in a nested KWin
+    python3 tools/device_test.py --state                             # print phone state
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
-(LANTERN_SERIAL, default 20e9318) authorized over USB, and KWin's scripting D-Bus (qdbus6).
-Opens only com.android.settings and org.lineageos.jelly, each for a few seconds, and touches
-no other window. Prints one PASS/FAIL line per item; exits 1 if any item failed.
+(LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
+Klipper's D-Bus (item 13). Opens only com.android.settings, org.lineageos.jelly and the
+companion's test screen (enabled only during items 10, 12 and 13), each for a few seconds, and
+touches no other window. Item 13 saves the PC clipboard's text and puts it back afterwards.
+Prints one PASS/FAIL line per item; exits 1 if any item failed.
+
+The window items (2-6, 11-13) need frames from the compositor, which a locked Plasma session does
+not give. --nested (or LANTERN_TEST_NESTED=1) runs every test window in a private headless
+`kwin_wayland --virtual` on its own D-Bus instead. That compositor gives no keyboard focus, so
+the text items prepend the window's `focus` debug step there. The clipboard still goes through
+the real session (lanternd's clipboard client and Klipper).
 """
 import argparse
 import json
@@ -27,14 +37,21 @@ LANTERN = shutil.which("lantern") or str(Path.home() / ".local/bin/lantern")
 UNIT = "lanternd.service"
 SETTINGS = "com.android.settings"
 JELLY = "org.lineageos.jelly"
+COMPANION = "dev.lantern.companion"
+LANTERN_IME = "dev.lantern.companion/.LanternIme"
 # The phone's own stay_on_while_plugged_in value, which a session must restore. Item 1 reads it
 # with the daemon stopped (or set LANTERN_STAY_ON_RESTORED to skip that).
 STAY_ON_RESTORED = os.environ.get("LANTERN_STAY_ON_RESTORED") or None
+# The keyboard settings a session must restore, snapshotted with the stay-awake baseline.
+IME_RESTORED = None   # secure default_input_method
+IMES_RESTORED = None  # secure enabled_input_methods
 STAY_ON_SESSION = "7"  # Session.STAY_ON in the helper
 JOURNAL = "/data/local/tmp/lantern-session.json"  # JournalStore.PATH in the helper
 RESIZE_LOGICAL = 900
 KILL_SIGNAL = "TERM"  # item 7; --signal=KILL
 LOG_DIR = Path(tempfile.mkdtemp(prefix="lantern-device-test-"))
+NESTED = None  # the Nested compositor while --nested
+IME_TEXT = "Tiếng Việt 👍việ"  # item 12: the EditText after text + compose + finish
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -51,8 +68,9 @@ def note(msg):
     print(f"    {msg}", flush=True)
 
 
-def sh(*args, timeout=20, check_rc=True):
-    r = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=timeout)
+def sh(*args, timeout=20, check_rc=True, env=None):
+    r = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=timeout,
+                       encoding="utf-8", errors="replace", env=env)
     if check_rc and r.returncode != 0:
         raise Fail(f"{' '.join(map(str, args))} -> {r.returncode}: {r.stderr.strip()}")
     return r.stdout
@@ -112,13 +130,15 @@ class Window:
         self.pkg = pkg
         self.log = LOG_DIR / f"{tag}.log"
         env = dict(os.environ, LANTERN_LOG="info", NO_COLOR="1")
+        if NESTED:
+            env["WAYLAND_DISPLAY"] = NESTED.socket
         if debug_input:
             env["LANTERN_DEBUG_INPUT"] = debug_input
         self.f = open(self.log, "w")
         self.p = subprocess.Popen([LANTERN, "open", pkg], stdout=self.f, stderr=self.f, env=env)
 
     def lines(self):
-        return [ANSI.sub("", l) for l in self.log.read_text().splitlines()]
+        return [ANSI.sub("", l) for l in self.log.read_text(errors="replace").splitlines()]
 
     def find(self, event, after=None):
         """Log lines whose message is `event`, as (utc_ts, {field: value})."""
@@ -181,6 +201,8 @@ def phone_state():
     helpers = adb("shell", "pgrep -f 'dev[.]lantern[.]helper' || true").split()
     return {
         "stay_on": adb("shell", "settings", "get", "global", "stay_on_while_plugged_in").strip(),
+        "ime": adb("shell", "settings", "get", "secure", "default_input_method").strip(),
+        "imes": adb("shell", "settings", "get", "secure", "enabled_input_methods").strip(),
         "panel": panel[0] if panel else "?",
         "displays": display_ids(),
         "forwards": forwards,
@@ -192,7 +214,9 @@ def phone_state():
 
 
 def restored(st):
-    return (st["stay_on"] == stay_on_baseline() and st["panel"] == "On"
+    base = baseline()
+    return (st["stay_on"] == base["stay_on"] and st["ime"] == base["ime"]
+            and st["imes"] == base["imes"] and st["panel"] == "On"
             and st["displays"] == ["0"] and not st["forwards"] and not st["helper_pids"]
             and not st["journal"])
 
@@ -204,25 +228,88 @@ def released(st):
 
 
 def read_stay_on_baseline():
-    """Stops lanternd, reads the phone's own stay-awake value, and leaves lanternd stopped."""
-    global STAY_ON_RESTORED
+    """Stops lanternd, reads the phone's own stay-awake and keyboard values (the restore
+    targets), and leaves lanternd stopped."""
+    global STAY_ON_RESTORED, IME_RESTORED, IMES_RESTORED
     systemctl("stop", UNIT)
     st, _ = wait_until("phone released after stop", 10, lambda: released(s := phone_state()) and s,
                        interval=0.2)
     if STAY_ON_RESTORED is None:
         STAY_ON_RESTORED = st["stay_on"]
-    note(f"baseline with lanternd stopped: stay_on={st['stay_on']} (expected restore value "
-         f"{STAY_ON_RESTORED})")
+    if IME_RESTORED is None:
+        IME_RESTORED, IMES_RESTORED = st["ime"], st["imes"]
+    note(f"baseline with lanternd stopped: stay_on={st['stay_on']} ime={st['ime']} "
+         f"imes={st['imes']} (restore targets: {STAY_ON_RESTORED}, {IME_RESTORED}, "
+         f"{IMES_RESTORED})")
+    check(LANTERN_IME not in str(IME_RESTORED) and LANTERN_IME not in str(IMES_RESTORED),
+          f"the Lantern keyboard is still selected or enabled with no session: {st}")
 
 
-def stay_on_baseline():
-    if STAY_ON_RESTORED is None:
+def baseline():
+    """The phone's own values a session must restore: {stay_on, ime, imes}."""
+    if STAY_ON_RESTORED is None or IME_RESTORED is None:
         try:
             read_stay_on_baseline()
         finally:
             systemctl("start", UNIT)
         wait_ready(15)
-    return str(STAY_ON_RESTORED)
+    return {"stay_on": str(STAY_ON_RESTORED), "ime": IME_RESTORED, "imes": IMES_RESTORED}
+
+
+def stay_on_baseline():
+    return baseline()["stay_on"]
+
+
+def phone_now():
+    """The phone's clock (epoch seconds), for reading logcat from a point on."""
+    return int(adb("shell", "date +%s").strip())
+
+
+def logcat_since(since, tags):
+    """`(epoch, message)` for the given logcat tags, at or after phone time `since`."""
+    out = []
+    for line in adb("logcat", "-d", "-v", "epoch", "-s", *tags, timeout=30).splitlines():
+        m = re.match(r"\s*(\d+\.\d+)\s+\d+\s+\d+\s+\w\s+(\S+)\s*: (.*)$", line)
+        if m and float(m.group(1)) >= since:
+            out.append((float(m.group(1)), m.group(3)))
+    return out
+
+
+def test_activity(on):
+    """Enables (or returns to disabled) the companion's test screen via its shell-only
+    TEST_ACTIVITY broadcast; the shell may not `pm enable` another package's component."""
+    out = adb("shell", "am", "broadcast", "--user", "0", "-n", f"{COMPANION}/.LinkReceiver",
+              "-a", f"{COMPANION}.TEST_ACTIVITY", "--es", "enabled", "true" if on else "false")
+    check("result=1" in out, f"TEST_ACTIVITY enabled={on}: {out.strip()}")
+
+
+def test_activity_listed():
+    out = adb("shell", "pm", "query-activities", "--user", "0", "-a", "android.intent.action.MAIN",
+              "-c", "android.intent.category.LAUNCHER", COMPANION)
+    return "TestActivity" in out
+
+
+def applications_dir():
+    data = os.environ.get("XDG_DATA_HOME", "")
+    return (Path(data) if data.startswith("/") else Path.home() / ".local/share") / "applications"
+
+
+def desktop_entry(app_id):
+    """The [Desktop Entry] keys of `<applications>/<app_id>.desktop`, or None if absent."""
+    path = applications_dir() / f"{app_id}.desktop"
+    if not path.exists():
+        return None
+    keys = {}
+    for line in path.read_text(errors="replace").splitlines():
+        if "=" in line and not line.startswith(("#", "[")):
+            k, v = line.split("=", 1)
+            keys.setdefault(k.strip(), v.strip())
+    return keys
+
+
+def klipper(*args):
+    """Klipper on the real session bus (never the nested one)."""
+    return sh("qdbus6", "org.kde.klipper", "/klipper", *args)
 
 
 def armed(st):
@@ -233,25 +320,67 @@ def armed(st):
 
 # --- KWin scripting ------------------------------------------------------------------------
 
+class Nested:
+    """A private headless KWin (`--virtual`) on its own D-Bus, for a locked desktop."""
+
+    def __init__(self):
+        self.socket = f"lantern-test-{os.getpid()}"
+        self.log = LOG_DIR / "nested-kwin.log"
+        out = sh("dbus-daemon", "--session", "--fork", "--print-address=1", "--print-pid=1")
+        addr, pid = out.split()[:2]
+        self.bus_pid = int(pid)
+        self.env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=addr)
+        self.env.pop("WAYLAND_DISPLAY", None)
+        self.f = open(self.log, "w")
+        self.kwin = subprocess.Popen(
+            ["kwin_wayland", "--virtual", "--no-lockscreen", "--socket", self.socket,
+             "--width", "1920", "--height", "1080"],
+            stdout=self.f, stderr=self.f, env=self.env, start_new_session=True)
+        sock = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / self.socket
+        wait_until("nested KWin up", 10, lambda: sock.exists() and sh(
+            "qdbus6", "org.kde.KWin", "/Scripting", check_rc=False, env=self.env), interval=0.2)
+
+    def output(self):
+        return self.log.read_text(errors="replace")
+
+    def stop(self):
+        if self.kwin.poll() is None:
+            self.kwin.terminate()
+            try:
+                self.kwin.wait(5)
+            except subprocess.TimeoutExpired:
+                self.kwin.kill()
+                self.kwin.wait(5)
+        self.f.close()
+        try:
+            os.kill(self.bus_pid, 15)
+        except OSError:
+            pass
+
+
 def kwin(js, name):
-    """Runs a KWin script; returns the lines it print()ed (tagged), read back from the journal."""
+    """Runs a KWin script; returns the lines it print()ed (tagged), read back from the journal
+    (or from the nested KWin's log)."""
     tag = f"LANTERN-T-{os.getpid()}-{time.monotonic_ns()}"
     path = LOG_DIR / f"{name}.js"
     path.write_text(js.replace("TAG", json.dumps(tag)))
     since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    env = NESTED.env if NESTED else None
+
+    def printed():
+        text = NESTED.output() if NESTED else sh(
+            "journalctl", "--user", "--since", since, "--no-pager", "-o", "cat")
+        return [l.split(tag, 1)[1].strip() for l in text.splitlines() if tag in l]
     sh("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", name,
-       check_rc=False)
+       check_rc=False, env=env)
     sid = sh("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript",
-             path, name).strip()
-    sh("qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run")
+             path, name, env=env).strip()
+    sh("qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run", env=env)
     try:
-        out, _ = wait_until(f"kwin script {name} output", 3, lambda: [
-            l.split(tag, 1)[1].strip()
-            for l in sh("journalctl", "--user", "--since", since, "--no-pager", "-o", "cat")
-            .splitlines() if tag in l])
+        out, _ = wait_until(f"kwin script {name} output", 3, printed)
     finally:
         sh("qdbus6", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript", name,
-           check_rc=False)
+           check_rc=False, env=env)
     return out
 
 
@@ -421,7 +550,7 @@ class Suite:
             code = w.wait_exit(15)
         finally:
             w.kill()
-        steps = [f["step"] if "step" in f else f for _, f in w.find("debug input")]
+        steps = [l for l in w.lines() if ": debug input" in l]
         closed = w.find("closed")
         note(f"debug input steps sent: {len(steps)}; closed {closed[-1][1] if closed else '-'}; "
              f"window exit={code}")
@@ -507,6 +636,187 @@ class Suite:
         check(any("stay_on_while_plugged_in to " + stay_on_baseline() in l for l in restores),
               "no stay-awake restore logged")
 
+    # --- Plan 2 ----------------------------------------------------------------------------
+
+    def companion_linked(self):
+        """A fresh session links the companion: `lantern status` shows companion ready within
+        10 s of the session being ready."""
+        systemctl("restart", UNIT)
+        st, secs = wait_ready(15)
+        note(f"ready {secs:.1f} s after the restart: companion={st.get('companion')}")
+        st, csecs = wait_until("companion ready", 10,
+                               lambda: (s := status()).get("companion") == "ready" and s)
+        note(f"companion ready {csecs:.1f} s after ready: {json.dumps(st)}")
+        ph = phone_state()
+        note(f"phone keyboard during the session: ime={ph['ime']} imes={ph['imes']}")
+
+    def catalogue_tracks_phone(self):
+        settings = desktop_entry(f"lantern.{SETTINGS}")
+        check(settings is not None,
+              f"{applications_dir()}/lantern.{SETTINGS}.desktop is missing")
+        assert settings is not None
+        icon = Path(settings.get("Icon", ""))
+        note(f"lantern.{SETTINGS}.desktop: Name={settings.get('Name')} Icon={icon} "
+             f"Exec={settings.get('Exec')}")
+        check(settings.get("Name") == "Settings", f"Name={settings.get('Name')!r}")
+        check(icon.is_absolute() and icon.is_file()
+              and icon.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", f"Icon {icon} is not a PNG")
+        comp = f"lantern.{COMPANION}"
+        if desktop_entry(comp) is not None or test_activity_listed():
+            note("test screen left enabled by an earlier run; disabling it first")
+            test_activity(False)
+            wait_until("companion entry gone before the test", 10,
+                       lambda: desktop_entry(comp) is None, interval=0.2)
+        try:
+            test_activity(True)
+            entry, secs = wait_until("companion entry appears", 5, lambda: desktop_entry(comp),
+                                     interval=0.1)
+            note(f"TEST_ACTIVITY on: {comp}.desktop appeared after {secs:.1f} s "
+                 f"(Name={entry.get('Name')})")
+            test_activity(False)
+            _, secs = wait_until("companion entry removed", 5,
+                                 lambda: desktop_entry(comp) is None, interval=0.1)
+            note(f"TEST_ACTIVITY off: {comp}.desktop removed after {secs:.1f} s")
+        finally:
+            test_activity(False)
+
+    def title_is_label(self):
+        w = Window(SETTINGS, "settings-title")
+        try:
+            wait_until("opened", 15, lambda: w.find("opened"))
+            desc, _ = wait_until("KWin lists the window", 5,
+                                 lambda: (d := kwin_on(SETTINGS, DESCRIBE, "lantern_describe"))
+                                 and "count=1" in d[0] and d, interval=0.3)
+            for line in desc:
+                note(f"kwin: {line}")
+            m = re.search(r" caption=(.*) client=", desc[1])
+            check(m and m.group(1) == "Settings", f"caption {m.group(1) if m else desc[1]!r}")
+            kwin_on(SETTINGS, CLOSE, "lantern_close")
+            code = w.wait_exit(5)
+            check(code == 0, f"window exit {code}")
+        finally:
+            w.kill()
+        wait_until("lantern display gone", 5, lambda: not lantern_displays())
+
+    def _test_window(self, tag, steps, timeout):
+        """Opens the companion's test screen with debug steps (ending in `close`), waits for the
+        window to exit, and returns (window, phone time before the open)."""
+        test_activity(True)
+        wait_until("test screen in the launcher", 5, test_activity_listed, interval=0.2)
+        since = phone_now()
+        w = Window(COMPANION, tag, debug_input=("focus;" if NESTED else "") + steps)
+        try:
+            wait_until("test screen opened", 15, lambda: w.find("opened"))
+            note(f"opened {w.find('opened')[0][1]}")
+            code = w.wait_exit(timeout)
+        finally:
+            w.kill()
+        closed = w.find("closed")
+        note(f"window exit={code}, closed {closed[-1][1] if closed else '-'}")
+        check(code == 0, f"window exit {code}")
+        return w, since
+
+    def ime_unicode_text(self):
+        try:
+            ime = phone_state()["ime"]
+            note(f"default_input_method during the session: {ime}")
+            check(ime == LANTERN_IME, f"the Lantern keyboard is not selected: {ime}")
+            _, since = self._test_window(
+                "ime-text", "tap:0.5,0.15;text:Tiếng Việt 👍;compose:việ;finish;close", 40)
+            texts = [m for _, m in logcat_since(since, ["LanternTest"])]
+            for t in texts:
+                note(f"LanternTest: {t}")
+            check(texts and texts[-1] == f"text={IME_TEXT}",
+                  f"last LanternTest line {texts[-1] if texts else None!r}, want 'text={IME_TEXT}'")
+            ops = [m for _, m in logcat_since(since, ["LanternCompanion"]) if "ime op=" in m]
+            note(f"companion: {ops}")
+            leaked = [m for _, m in logcat_since(since, ["LanternCompanion", "lantern"])
+                      if "Tiếng" in m or "việ" in m]
+            check(not leaked, f"typed text in the companion/helper log: {leaked}")
+        finally:
+            test_activity(False)
+
+    def clipboard_both_ways(self):
+        saved = klipper("getClipboardContents")
+        saved = saved[:-1] if saved.endswith("\n") else saved
+        note(f"saved the PC clipboard text ({len(saved)} chars)")
+        tag = f"{os.getpid()}{int(time.time()) % 100000}"
+        pc_text, phone_text = f"lantern-pc-{tag}", f"from-phone-{tag}"
+        try:
+            # 1. PC -> phone, before the window opens (the helper logs the length only).
+            since = phone_now()
+            klipper("setClipboardContents", pc_text)
+            want = f"clip: PC clipboard ({len(pc_text)} chars) set on the phone"
+            _, secs = wait_until("PC clipboard set on the phone", 5, lambda: [
+                m for _, m in logcat_since(since, ["lantern"]) if m == want], interval=0.3)
+            note(f"helper: {want!r} within {secs:.1f} s")
+            # 2. Paste it into the test screen; 3. copy a phone text back to the PC.
+            test_activity(True)
+            wait_until("test screen in the launcher", 5, test_activity_listed, interval=0.2)
+            since = phone_now()
+            w = Window(COMPANION, "clipboard", debug_input=("focus;" if NESTED else "") +
+                       f"tap:0.5,0.15;key:Ctrl+V;key:Ctrl+A;text:{phone_text};key:Ctrl+A;"
+                       f"key:Ctrl+C;close")
+            try:
+                wait_until("test screen opened", 15, lambda: w.find("opened"))
+                _, _ = wait_until("Klipper holds the phone's copy", 40,
+                                  lambda: klipper("getClipboardContents").rstrip("\n")
+                                  == phone_text, interval=0.05)
+                got_at = time.time()
+                code = w.wait_exit(15)
+            finally:
+                w.kill()
+            check(code == 0, f"window exit {code}")
+            ctrl_c = [datetime.fromisoformat(l.split()[0].replace("Z", "+00:00")).timestamp()
+                      for l in w.lines() if "debug input" in l and "Key(KeyC, true)" in l]
+            check(ctrl_c, "no Ctrl+C debug step in the window log")
+            lag = got_at - ctrl_c[-1]
+            note(f"phone -> PC: Klipper held {phone_text!r} {lag:.3f} s after the Ctrl+C step")
+            check(lag <= 2.0, f"phone copy reached Klipper after {lag:.3f} s (> 2 s)")
+            texts = [m for _, m in logcat_since(since, ["LanternTest"])]
+            for t in texts:
+                note(f"LanternTest: {t}")
+            check(f"text={pc_text}" in texts, f"Ctrl+V did not paste {pc_text!r}")
+            helper = [m for _, m in logcat_since(since, ["lantern"]) if m.startswith("clip:")]
+            note(f"helper: {helper}")
+            check(helper.count(f"clip: phone copy ({len(phone_text)} chars) sent to the PC") == 1,
+                  "phone copy not sent exactly once")
+        finally:
+            test_activity(False)
+            klipper("setClipboardContents", saved)
+            note("restored the PC clipboard text")
+
+    def usb_yank_restores_keyboard(self):
+        """Unplug: the phone's own cleanup puts the keyboard back. Checked after replug with
+        lanternd stopped, so no new session switches it again first."""
+        base = baseline()
+        st = status()
+        check(st["state"] == "ready", f"not ready before the yank: {st}")
+        check(phone_state()["ime"] == LANTERN_IME, "the Lantern keyboard is not selected")
+        since = phone_now()
+        input(">>> Unplug the phone's USB cable now, then press Enter ")
+        wait_until("device gone", 20, lambda: SERIAL not in sh("adb", "devices"))
+        print(">>> Keep it unplugged for 10 s...", flush=True)
+        time.sleep(10)
+        systemctl("stop", UNIT)
+        try:
+            input(">>> Plug the phone back in, then press Enter ")
+            sh("adb", "-s", SERIAL, "wait-for-device", timeout=120)
+            ph = phone_state()
+            note(f"after replug, lanternd stopped: {ph}")
+            lines = [m for _, m in logcat_since(since, ["lantern", "LanternCompanion"])
+                     if "ime_restored" in m or "default_input_method" in m]
+            for l in lines:
+                note(f"logcat: {l}")
+            check(any("ime_restored" in l or f"default_input_method to {base['ime']}" in l
+                      for l in lines), "no keyboard restore logged while unplugged")
+            check(ph["ime"] == base["ime"] and ph["imes"] == base["imes"],
+                  f"keyboard not restored: {ph['ime']} / {ph['imes']}, want {base}")
+            check(ph["stay_on"] == base["stay_on"], f"stay_on {ph['stay_on']}")
+        finally:
+            systemctl("start", UNIT)
+        wait_ready(15)
+
 
 ITEMS = [
     "session_starts_on_plug",
@@ -517,20 +827,45 @@ ITEMS = [
     "app_exit_closes_window",
     "daemon_kill_restores_phone",
     "usb_yank",
+    "companion_linked",
+    "catalogue_tracks_phone",
+    "title_is_label",
+    "ime_unicode_text",
+    "clipboard_both_ways",
+    "usb_yank_restores_keyboard",
 ]
+MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
+
+
+def desktop_locked():
+    """True if the graphical login session is locked (it then sends windows no frames)."""
+    try:
+        for sid in sh("loginctl", "list-sessions", "--no-legend").split("\n"):
+            if sid.split():
+                props = sh("loginctl", "show-session", sid.split()[0], "-p", "Type",
+                           "-p", "LockedHint")
+                if "Type=wayland" in props and "LockedHint=yes" in props:
+                    return True
+    except Fail:
+        pass
+    return False
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--manual", action="store_true", help="also run item 8 (usb_yank, prompts)")
+    ap.add_argument("--manual", action="store_true",
+                    help="also run items 8 and 14 (USB unplug; prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
-    ap.add_argument("--only", nargs="*", help="run only these items")
+    ap.add_argument("--only", nargs="*", help="run only these items (numbers or names)")
+    ap.add_argument("--nested", action="store_true",
+                    default=os.environ.get("LANTERN_TEST_NESTED") == "1",
+                    help="run test windows in a private headless KWin (for a locked desktop)")
     ap.add_argument("--signal", choices=["TERM", "KILL"], default="TERM",
                     help="item 7: TERM (clean stop, default) or KILL (no cleanup; systemd "
                          "restarts lanternd and its new session must drop the stale forward)")
     args = ap.parse_args()
-    global KILL_SIGNAL
+    global KILL_SIGNAL, NESTED
     KILL_SIGNAL = args.signal
     if args.state:
         try:
@@ -540,10 +875,21 @@ def main():
         print(json.dumps({"status": st, "phone": phone_state()}, indent=1))
         return 0
     suite = Suite()
-    items = ITEMS if args.manual else ITEMS[:-1]
+    items = [i for i in ITEMS if args.manual or i not in MANUAL]
     if args.only:
-        items = [i for i in ITEMS if i in args.only]
+        unknown = [o for o in args.only if o not in ITEMS
+                   and not (o.isdigit() and 1 <= int(o) <= len(ITEMS))]
+        if unknown:
+            ap.error(f"unknown items {unknown}; items: " +
+                     ", ".join(f"{n} {i}" for n, i in enumerate(ITEMS, 1)))
+        items = [i for n, i in enumerate(ITEMS, 1) if i in args.only or str(n) in args.only]
     print(f"lantern device test: serial={SERIAL} binary={LANTERN} logs={LOG_DIR}", flush=True)
+    if args.nested:
+        NESTED = Nested()
+        print(f"nested KWin: WAYLAND_DISPLAY={NESTED.socket} log={NESTED.log}", flush=True)
+    elif desktop_locked():
+        print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
+              "(4-6, 12, 13) cannot pass. Unlock it or use --nested.", flush=True)
     results = []
     try:
         for name in items:
@@ -570,8 +916,16 @@ def main():
         # Whatever happened (including Ctrl-C), no `lantern open` process outlives the suite.
         for w in Window.every:
             w.kill()
+        if NESTED:
+            NESTED.stop()
+        if {"catalogue_tracks_phone", "ime_unicode_text", "clipboard_both_ways"} & set(items):
+            try:  # the test screen is never left enabled
+                test_activity(False)
+            except Exception as e:
+                print(f"WARNING: could not disable the companion's test screen: {e}", flush=True)
     if not args.manual and not args.only:
-        print("SKIP 8 usb_yank (needs a person: run with --manual)")
+        for name in sorted(MANUAL, key=ITEMS.index):
+            print(f"SKIP {ITEMS.index(name) + 1} {name} (needs a person: run with --manual)")
     print(f"{sum(results)}/{len(results)} PASS", flush=True)
     return 0 if all(results) else 1
 
