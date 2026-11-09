@@ -211,9 +211,15 @@ def build_companion():
     run_tests(classes, COMPANION / "test", COMPANION_OUT, SHARED_TEST)
     run(BT / "d8", "--release", "--lib", ANDROID_JAR, "--min-api", MIN_API,
         "--output", dexes, *sorted(classes.rglob("*.class")))
+    # Reproducible: fixed entry time, mode and order, so the same sources give the same APK
+    # (lanternd reinstalls the companion whenever the embedded APK's sha changes).
     with zipfile.ZipFile(unsigned, "a", zipfile.ZIP_DEFLATED) as z:
         for f in sorted(dexes.glob("*.dex")):
-            z.write(f, f.name)
+            info = zipfile.ZipInfo(f.name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3  # unix
+            info.external_attr = 0o644 << 16
+            z.writestr(info, f.read_bytes())
     run(BT / "zipalign", "-f", "-p", "4", unsigned, aligned)
     for f in (APK, APK.with_name(APK.name + ".idsig")):
         if f.exists():
