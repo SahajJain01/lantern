@@ -16,10 +16,12 @@ Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
 The window items (2-6, 11-13) need frames from the compositor, which a locked Plasma session does
 not give. --nested (or LANTERN_TEST_NESTED=1) runs every test window in a private headless
-`kwin_wayland --virtual` on its own D-Bus instead, with scratch XDG config/data/state/cache dirs
-(removed afterwards, with every service that bus activated). That compositor gives no keyboard
-focus, so the text items prepend the window's `focus` debug step there. The clipboard still goes
-through the real session (lanternd's clipboard client and Klipper).
+`kwin_wayland --virtual` (no Xwayland, no DISPLAY) on its own D-Bus instead, with scratch XDG
+config/data/state/cache and runtime dirs (removed afterwards, with every service that bus
+activated); the windows keep the real XDG_RUNTIME_DIR and reach it by absolute WAYLAND_DISPLAY.
+That compositor gives no keyboard focus, so the text items prepend the window's `focus` debug
+step there. The clipboard still goes through the real session (lanternd's clipboard client and
+Klipper).
 """
 import argparse
 import json
@@ -132,7 +134,10 @@ class Window:
         self.log = LOG_DIR / f"{tag}.log"
         env = dict(os.environ, LANTERN_LOG="info", NO_COLOR="1")
         if NESTED:
-            env["WAYLAND_DISPLAY"] = NESTED.socket
+            # The real XDG_RUNTIME_DIR (lanternd's socket), the nested compositor by absolute
+            # path, and no DISPLAY, so a window can never fall back onto the real desktop.
+            env["WAYLAND_DISPLAY"] = NESTED.socket_path
+            env.pop("DISPLAY", None)
         if debug_input:
             env["LANTERN_DEBUG_INPUT"] = debug_input
         self.f = open(self.log, "w")
@@ -348,15 +353,27 @@ class Nested:
     """A private headless KWin (`--virtual`) on its own D-Bus, for a locked desktop."""
 
     def __init__(self):
-        self.socket = f"lantern-test-{os.getpid()}"
         self.log = LOG_DIR / "nested-kwin.log"
         self.bus_pid = self.kwin = self.f = None
         # Scratch XDG config/data/state/cache dirs for the bus and KWin, so nothing they write
         # (kwinoutputconfig.json's Virtual-0 output, kwinrc, caches) lands in the user's real
-        # ones. XDG_RUNTIME_DIR stays real: the windows find lanternd's socket there.
+        # ones, and a scratch XDG_RUNTIME_DIR (0700), so nothing the private bus activates (the
+        # document portal's FUSE mount, the at-spi bus, ksecretd, dconf) binds or replaces a real
+        # session socket under /run/user. No DISPLAY either: the nested KWin runs without Xwayland
+        # and nothing it starts may reach the real X server.
         self.home = Path(tempfile.mkdtemp(prefix="lantern-nested-kwin-"))
+        self.runtime = self.home / "runtime"
+        self.runtime.mkdir(mode=0o700)
+        os.chmod(self.runtime, 0o700)  # mkdir's mode is masked by the umask
+        self.socket = f"lantern-test-{os.getpid()}"
+        # Absolute, for the `lantern open` windows: they keep the real XDG_RUNTIME_DIR (lanternd's
+        # socket is there) and reach the nested compositor by path.
+        self.socket_path = str(self.runtime / self.socket)
         self.env = dict(os.environ)
-        self.env.pop("WAYLAND_DISPLAY", None)
+        for var in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY", "XAUTHORITY",
+                    "DBUS_SESSION_BUS_ADDRESS"):
+            self.env.pop(var, None)
+        self.env["XDG_RUNTIME_DIR"] = str(self.runtime)
         for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
             d = self.home / var.lower()
             d.mkdir()
@@ -368,12 +385,12 @@ class Nested:
             self.bus_pid = int(pid)
             self.env["DBUS_SESSION_BUS_ADDRESS"] = addr
             self.f = open(self.log, "w")
+            # No --xwayland: the nested KWin starts no X server.
             self.kwin = subprocess.Popen(
                 ["kwin_wayland", "--virtual", "--no-lockscreen", "--socket", self.socket,
                  "--width", "1920", "--height", "1080"],
                 stdout=self.f, stderr=self.f, env=self.env, start_new_session=True)
-            runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-            sock = Path(runtime) / self.socket
+            sock = Path(self.socket_path)
             wait_until("nested KWin up", 10, lambda: sock.exists() and sh(
                 "qdbus6", "org.kde.KWin", "/Scripting", check_rc=False, env=self.env),
                 interval=0.2)
@@ -398,7 +415,7 @@ class Nested:
         # and could recreate files in the scratch dirs. They inherited its environment, so the
         # unique scratch path identifies exactly them.
         self._reap()
-        if self.bus_pid:
+        if self.bus_pid and self._ours(self.bus_pid):
             try:
                 os.kill(self.bus_pid, 15)
             except OSError:
@@ -406,23 +423,28 @@ class Nested:
         self._reap()
         shutil.rmtree(self.home, ignore_errors=True)
 
+    def _ours(self, pid):
+        """True if `pid` is ours and its environment carries the scratch path (so the private
+        bus or KWin started it). Read fresh: a pid can exit and be reused at any time."""
+        if pid == os.getpid():
+            return False
+        d = Path("/proc") / str(pid)
+        try:
+            return (d.stat().st_uid == os.getuid()
+                    and str(self.home).encode() in (d / "environ").read_bytes())
+        except OSError:
+            return False
+
     def _started_here(self):
-        mark = str(self.home).encode()
-        pids = []
-        for d in Path("/proc").iterdir():
-            if not d.name.isdigit() or int(d.name) == os.getpid():
-                continue
-            try:
-                if d.stat().st_uid == os.getuid() and mark in (d / "environ").read_bytes():
-                    pids.append(int(d.name))
-            except OSError:
-                pass
-        return pids
+        return [int(d.name) for d in Path("/proc").iterdir()
+                if d.name.isdigit() and self._ours(int(d.name))]
 
     def _reap(self):
         pids = self._started_here()
         for sig in (15, 9):
             for pid in pids:
+                if not self._ours(pid):  # re-validated right before each kill (pid reuse)
+                    continue
                 try:
                     os.kill(pid, sig)
                 except OSError:
@@ -976,7 +998,7 @@ def main():
     try:
         if args.nested:
             NESTED = Nested()
-            print(f"nested KWin: WAYLAND_DISPLAY={NESTED.socket} log={NESTED.log} "
+            print(f"nested KWin: WAYLAND_DISPLAY={NESTED.socket_path} log={NESTED.log} "
                   f"config={NESTED.home}", flush=True)
         for name in items:
             idx = ITEMS.index(name) + 1
@@ -999,11 +1021,20 @@ def main():
                     note(f"could not close Settings through KWin: {e}")
                 suite.settings.kill()
     finally:
-        # Whatever happened (including Ctrl-C), no `lantern open` process outlives the suite.
+        # Whatever happened (including Ctrl-C), no `lantern open` process outlives the suite, the
+        # nested session is stopped and the test screen is disabled; each step is guarded so a
+        # failing one never skips the next.
         for w in Window.every:
-            w.kill()
+            try:
+                w.kill()
+            except Exception as e:
+                print(f"WARNING: could not stop a {w.pkg} window: {e}", flush=True)
         if NESTED:
-            NESTED.stop()
+            try:
+                NESTED.stop()
+            except Exception as e:
+                print(f"WARNING: nested KWin stop failed: {e}", flush=True)
+                shutil.rmtree(NESTED.home, ignore_errors=True)
         if {"catalogue_tracks_phone", "ime_unicode_text", "clipboard_both_ways"} & set(items):
             try:  # the test screen is never left enabled
                 test_activity(False)
