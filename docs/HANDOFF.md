@@ -6,13 +6,16 @@ Start here in a new session. Read this file, then `README.md`, then the spec
 ## Where things stand
 
 - **Plan 1** (`docs/superpowers/plans/2026-11-07-lantern-core.md`) is done and merged into
-  `master`.
+  `main`.
 - **Plan 2** (`docs/superpowers/plans/2026-11-10-lantern-desktop-integration.md`) is **done,
-  pending the deferred device checks below**. All 10 tasks passed their own reviews (Tasks 3, 4, 7,
-  8 and 9 after one fix round each). The work is on branch `plan2-desktop-integration` (worktree
-  `.worktrees/plan2`); the whole-branch review and the merge into `master` are still to do. The
-  SDD ledger and per-task reports are in `.superpowers/sdd/2026-11-10-lantern-desktop-integration/`.
-- There is no git remote yet (the proposed name is `SahajJain01/lantern`, still to create).
+  pending the deferred device checks below**. Each of the 10 tasks passed its own review (Tasks 3,
+  4, 7, 8 and 9 after one fix round each); the final whole-branch review then found 1 critical, 4
+  important and 5 minor issues, all fixed in one wave (`final-findings.md` and
+  `final-fix-report.md`). The work is on branch `plan2-desktop-integration` (worktree
+  `.worktrees/plan2`); the re-review of that fix wave and the merge into `main` are still to do.
+  The SDD ledger and per-task reports are in
+  `.superpowers/sdd/2026-11-10-lantern-desktop-integration/`.
+- The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
 Lantern is **installed and running** on the PC from the Plan 2 build: `~/.local/bin/lantern`, user
 unit `lanternd.service` (enabled). When the phone is plugged in, its screen turns off, the Lantern
@@ -90,8 +93,8 @@ attached.
 - Also used: a Motorola edge 50 pro, Android 16, users 0 and 10 (a managed work profile with
   `no_debugging_features`); its `stay_on_while_plugged_in` original is `0`.
 - Rust is in `~/.cargo/bin`, which is not on the agent tool's PATH. Prefix commands with
-  `export PATH="$HOME/.cargo/bin:$PATH"`. Work in `host/` (`cargo test --workspace`): 224 tests
-  (1 ignored). The helper build runs 162 host-JVM tests, the companion build 32.
+  `export PATH="$HOME/.cargo/bin:$PATH"`. Work in `host/` (`cargo test --workspace`): 227 tests
+  (1 ignored). The helper build runs 164 host-JVM tests, the companion build 41.
 - The FFmpeg, VA-API, Wayland and clang dev headers are installed. The GPU is Intel (renderD128).
 - The companion signing key is `~/.local/share/lantern/companion-signing.p12`
   (`LANTERN_COMPANION_KEY`); `build.py` pins its certificate into the helper (`CompanionPin`).
@@ -136,7 +139,8 @@ attached.
 - **IME display policy rule.** Lantern displays use `LOCAL` only while the session selected the
   Lantern keyboard, `HIDE` otherwise. Under `HIDE` Android keeps the IME bound to the launcher on
   display 0 and commits never reach the app; under `LOCAL` any keyboard that draws would draw into
-  the PC window. `AppDisplay.open` takes the session's `imeSelected`.
+  the PC window. `AppDisplay.open` takes it as `lanternIme` (the session's
+  `ImeSetup.Started.imeSelected`).
 - **Text vs keys.** The window sends a key event when Ctrl/Alt/Super is held or the text equals
   what the US layout gives for that key; any other text goes as an `ime commit`, and preedit as
   `compose`/`finish`. lanternd forwards `ime` only up to `MAX_IME_TEXT`.
