@@ -347,9 +347,13 @@ pub async fn deploy_helper(adb: &Adb) -> Result<(String, String)> {
     Ok((helper_sha, remote))
 }
 
-/// Installs or updates the companion (see [`companion::Setup::prepare`]; failures only notify
-/// and log), then starts a helper session. What `lanternd` runs for every session start.
+/// Waits for any previous session's helper (see [`wait_for_previous_helpers`]), installs or
+/// updates the companion (see [`companion::Setup::prepare`]; failures only notify and log), then
+/// starts a helper session. What `lanternd` runs for every session start. The wait comes first:
+/// a companion update kills the companion's process, and a previous helper or its Cleanup may
+/// still be restoring the keyboard while the companion's watchdog is armed.
 pub async fn start_with_companion(adb: &Adb, setup: &companion::Setup) -> Result<SessionConn> {
+    wait_for_previous_helpers(adb, PREVIOUS_HELPER_WAIT).await?;
     setup.prepare(adb).await;
     start(adb).await
 }

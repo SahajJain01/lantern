@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use lantern::adb::Adb;
-use lantern::daemon::session::{start, wait_for_previous_helpers};
+use lantern::daemon::session::{start, start_with_companion, wait_for_previous_helpers};
 use tokio::time::Instant;
 
 /// The main fake. Per-test files (all in the symlink's directory): `calls.log` (every
@@ -727,6 +727,40 @@ async fn setup_notifies_the_first_install_only() {
     let record: serde_json::Value = serde_json::from_str(&record).unwrap();
     assert_eq!(record["companion"], serde_json::json!(true));
     assert!(record["since"].as_u64().unwrap() > 1_700_000_000);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// The companion update (`pm install -r`, which kills the companion's process) must not run while
+/// a previous session's helper or its Cleanup may still be restoring the keyboard through it:
+/// wait for the previous helpers first, then prepare the companion, then start.
+#[tokio::test]
+async fn start_with_companion_waits_for_previous_helpers_before_the_companion_update() {
+    let fake = FakeAdb::new("comp-order", "0");
+    fake.installed(&"0".repeat(64)); // outdated: prepare() will install
+    std::fs::write(fake.dir.join("helpers"), "4242\n").unwrap();
+    std::fs::write(fake.dir.join("polls"), "2").unwrap();
+    let state = state_dir("order");
+    let (setup, _notes) = recording_setup(&state);
+    let _ = start_with_companion(&fake.adb(), &setup).await;
+    let calls = fake.calls();
+    let first_pm = position(&calls, |c| c.contains(" shell pm "))
+        .unwrap_or_else(|| panic!("companion never prepared: {calls:#?}"));
+    let install = position(&calls, |c| c.contains(" pm install "))
+        .unwrap_or_else(|| panic!("no companion update: {calls:#?}"));
+    let gone = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.contains(" shell pgrep"))
+        .map(|(i, _)| i)
+        .nth(2)
+        .unwrap_or_else(|| panic!("never saw the helpers gone: {calls:#?}"));
+    assert!(
+        gone < first_pm && first_pm < install,
+        "prepare before the previous helpers exited: {calls:#?}"
+    );
+    let spawned = position(&calls, helper_spawned).expect("helper never spawned");
+    assert!(install < spawned, "{calls:#?}");
+    wait_dead(fake.helper_pid()).await;
     let _ = std::fs::remove_dir_all(&state);
 }
 

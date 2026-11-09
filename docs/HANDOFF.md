@@ -122,7 +122,9 @@ attached.
   new phone-side IPC that carries tokens or text must keep that check.
 - **Startup order.** The helper waits up to 3 s for the companion, then `Session.start`, then the
   hello reply, so lanternd allows 20 s for the reply (the keyboard-less fallback path takes about
-  9 s). `ime_prev` (the original keyboard) is a link-only message sent after `Session.start`;
+  9 s). lanternd waits for the previous session's helpers before it updates the companion (an
+  update kills the companion's process). `ime_prev` (the original keyboard) is a link-only
+  message sent after `Session.start`;
   the catalogue starts only on the link-only `sync` sent from the session-up hook, so no bulk
   data waits in the Router's pre-hello buffer.
 - **Keyboard.** Journaled before any change, restored in reverse by the helper, by Cleanup on
