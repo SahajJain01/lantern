@@ -121,9 +121,10 @@ attached.
   runs without the companion. Holding the provider keeps the companion's process unfrozen. Any
   new phone-side IPC that carries tokens or text must keep that check.
 - **Startup order.** The helper waits up to 3 s for the companion, then `Session.start`, then the
-  hello reply, so lanternd allows 10 s for the reply. `ime_prev` (the original keyboard) is a
-  link-only message sent after `Session.start`; the catalogue starts only on the link-only `sync`
-  sent from the session-up hook, so no bulk data waits in the Router's pre-hello buffer.
+  hello reply, so lanternd allows 20 s for the reply (the keyboard-less fallback path takes about
+  9 s). `ime_prev` (the original keyboard) is a link-only message sent after `Session.start`;
+  the catalogue starts only on the link-only `sync` sent from the session-up hook, so no bulk
+  data waits in the Router's pre-hello buffer.
 - **Keyboard.** Journaled before any change, restored in reverse by the helper, by Cleanup on
   helper death, and by the companion's watchdog (5 s after the link is lost or after the IME is
   created with no link, e.g. after a reboot, from a persisted `ime_prev`, with retries and a
@@ -283,7 +284,7 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
   - Keyboard: the fallback triggers on any clean-rollback failure (a misleading "keyboard switch
     failed: Cleanup not ready" is possible); `ime_restored` is logged for a switch that didn't
     throw but didn't take; the IMM binder call runs under the watchdog monitor; the fallback's
-    hello reply takes about 9 s of lanternd's 10 s; the stale-armed watchdog if the hello write
+    hello reply takes about 9 s of lanternd's 20 s; the stale-armed watchdog if the hello write
     fails (benign); a mid-session keyboard change under `LOCAL` could draw into the video.
   - Clipboard: the `mHandler` reflection failing shows only in logcat (phone→PC then silently
     off); a clip timestamp of 0 disables the double-fire dedupe.

@@ -20,8 +20,11 @@ const HELPER_JAR: &[u8] = include_bytes!("../../assets/helper.jar");
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// How long the helper may take to answer `hello`. It first waits up to 3 s for the companion
-/// to link, then starts the session (settings, panel), so this must cover both with margin.
-pub const HELLO_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// to link, then starts the session (settings, panel); on the keyboard-less fallback path it
+/// starts it twice (each attempt spawns its own Cleanup guard), which took about 9 s on the
+/// Xiaomi. 20 s leaves about 2x headroom: a timeout here makes lanternd retry the whole start
+/// forever, so the phone would get no session at all.
+pub const HELLO_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Why a live session ended on its own (as opposed to being closed by the daemon).
 pub type EndReason = &'static str;
@@ -563,6 +566,17 @@ mod tests {
         ] {
             assert!(!re.is_match(other), "must not match {other:?}");
         }
+    }
+
+    /// The keyboard-less fallback path (3 s companion wait, then two `Session.start` attempts,
+    /// each spawning a Cleanup guard) took about 9 s on the Xiaomi: the hello-reply wait needs
+    /// about 2x headroom over that, or lanternd times out and retries forever.
+    #[test]
+    fn hello_reply_timeout_covers_the_fallback_path() {
+        assert_eq!(
+            super::HELLO_REPLY_TIMEOUT,
+            std::time::Duration::from_secs(20)
+        );
     }
 
     #[test]

@@ -177,8 +177,8 @@ state). So the helper hands the connection over instead:
    closed. One authenticated companion is linked at a time: a new authenticated one replaces the
    old.
 
-The helper waits up to 3 s for the companion's hello before it starts the session, so lanternd
-allows 10 s for the hello reply.
+The helper waits up to 3 s for the companion's hello before it starts the session (twice on the
+keyboard-less fallback path, about 9 s in all), so lanternd allows 20 s for the hello reply.
 
 The companion's `LinkReceiver` (also DUMP-only) takes one test-only command, `am broadcast --user
 0 -n dev.lantern.companion/.LinkReceiver -a dev.lantern.companion.TEST_ACTIVITY --es enabled
