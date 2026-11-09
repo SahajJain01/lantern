@@ -115,11 +115,11 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
 - `ime` is only meaningful for a live window: the helper drops (logs and ignores) an `ime` for a
   window that is unknown, closing or already closed, like any other window frame. An unknown `op`
   is a protocol error.
-- Catalogue: after the companion links, the helper relays a full catalogue (one `app` per launcher
-  app per profile, then `apps_end{count}`), then live `app` (added or changed) and `app_removed`
-  messages. A full catalogue whose `apps_end.count` matches the `app` messages received replaces
-  the previous one (apps missing from it are removed); a partial one (the link dropped mid-list,
-  or the count differs) removes nothing.
+- Catalogue: once the session is up and the companion is linked, the helper relays a full
+  catalogue (one `app` per launcher app per profile, then `apps_end{count}`), then live `app`
+  (added or changed) and `app_removed` messages. A full catalogue whose `apps_end.count` matches
+  the `app` messages received replaces the previous one (apps missing from it are removed); a
+  partial one (the link dropped mid-list, or the count differs) removes nothing.
 - `companion{state}` is sent after the hello reply: `"ready"` when the companion linked,
   `"unavailable"` (with a `msg`) when it did not. Without the companion the session still works,
   with no catalogue and no PC text input.
@@ -171,10 +171,36 @@ Messages on the link:
 | companion → helper | `app`, `apps_end`, `app_removed` | as above; the helper relays them to lanternd on stream 0 |
 | helper → companion | `ime` | `op`, `text`, as above (the helper forwards a window's `ime`) |
 | helper → companion | `ime_prev` | `id: string`: the keyboard to restore if the link is lost (the session journal's original `default_input_method`, or `""`) |
+| helper → companion | `sync` | none: send the full app catalogue now |
 
-`ime_prev` is link-only: it never travels between the helper and lanternd. The helper sends it
-once the session's journal exists, and again to a newly linked companion. Any other `t` from the
-companion is logged and dropped.
+`ime_prev` and `sync` are link-only: they never travel between the helper and lanternd. The
+helper sends `ime_prev` once the session's journal exists, and again to a newly linked companion.
+Any other `t` from the companion is logged and dropped.
+
+Catalogue on the link:
+
+- The companion starts a full catalogue only when it receives `sync`. The helper sends `sync`
+  right after its `hello` reply to lanternd (and the `companion{state}` that follows it), so the
+  catalogue goes straight to lanternd instead of being held while the session starts. A
+  companion that links later while the session is up gets `sync` right after its own `hello`
+  reply (after `ime_prev`, if any).
+- Full catalogue: for every profile in `LauncherApps.getProfiles()`, one `app` per package (its
+  first `getActivityList` entry): `label` is the activity's label, `icon` its badged icon drawn
+  at 192×192 ARGB, PNG, base64 without line breaks (`""` if the PNG is over `MAX_ICON`); then
+  `apps_end{count}`. `user` is the profile's Android user id.
+- Live updates (`LauncherApps.Callback`, per profile): `app` for an added or changed package
+  (or `app_removed` if it has no launcher activity left), `app_removed` for a removed one. A
+  profile becoming available or unavailable, or being added or removed, triggers a full
+  catalogue. Updates that happen before the first `sync` are dropped (the sync covers them).
+- The helper never relays a companion message as is. It rebuilds `app` as
+  `pkg, user, label, [work], icon`, setting `work:true` itself when `user` is a managed (work)
+  profile (`IUserManager.getUserInfo(user).isManagedProfile()`; false on any error) and ignoring
+  any `work` the companion sent. It drops (and logs) an `app`, `app_removed` or `apps_end` with a
+  missing or out-of-range field, since lanternd would treat it as a protocol error, and blanks an
+  icon whose base64 is longer than `MAX_ICON` allows. It keeps the labels it relayed (by
+  `pkg` and `user`; `app_removed` forgets one) for `opened.label`.
+- `opened` carries `label` when the helper has a catalogue label for that `pkg` and `user`, and
+  `work:true` when `open.user` is a managed profile.
 
 `activation_token` is an XDG activation token used only between `lanternd` and window clients.
 It is omitted from the JSON when absent (so `{"t":"focus"}` is the plain focus), the daemon never

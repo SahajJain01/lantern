@@ -12,6 +12,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
@@ -24,7 +25,7 @@ import java.util.function.Consumer;
  */
 public final class LinkClient {
     /** Link-only types: they travel between the helper and the companion, never to lanternd. */
-    static final Set<String> LINK_ONLY = Collections.singleton("ime_prev");
+    static final Set<String> LINK_ONLY = Collections.unmodifiableSet(new HashSet<>(Arrays.asList("ime_prev", "sync")));
 
     /** Every {@code t} the companion accepts from the helper's codec. */
     static final Set<String> LINK_TYPES;
@@ -42,6 +43,9 @@ public final class LinkClient {
 
         /** A window's {@code ime{op, text}} (Task 7). */
         void ime(String op, String text);
+
+        /** {@code sync}: send the full app catalogue (the helper's daemon session is up). */
+        void sync();
     }
 
     private final DataInputStream in;
@@ -99,7 +103,7 @@ public final class LinkClient {
         }
     }
 
-    /** Reads until EOF, handing {@code ime_prev} and {@code ime} to {@code h}; anything else is dropped. */
+    /** Reads until EOF, handing {@code ime_prev}, {@code ime} and {@code sync} to {@code h}; anything else is dropped. */
     public void run(Handler h) throws IOException {
         while (true) {
             Proto.Frame f = Proto.read(in);
@@ -124,6 +128,9 @@ public final class LinkClient {
                         break;
                     case "ime":
                         h.ime(m.str("op"), m.fields().containsKey("text") ? m.str("text") : "");
+                        break;
+                    case "sync":
+                        h.sync();
                         break;
                     default:
                         log.accept("link: unexpected " + m.t + " dropped");

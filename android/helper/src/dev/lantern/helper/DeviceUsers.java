@@ -109,6 +109,22 @@ final class DeviceUsers implements UserLaunch.Backend {
         }
     }
 
+    /** IUserManager.getUserInfo(user).isManagedProfile(); false on any error. */
+    @Override
+    public boolean managedProfile(int user) {
+        try {
+            Object info = call(um, "getUserInfo", user);
+            return info != null && (boolean) info.getClass().getMethod("isManagedProfile").invoke(info);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** {@link UserLaunch#managedOrFalse} with a fresh backend: the phone's answer, never throws. */
+    static boolean managed(int user) {
+        return UserLaunch.managedOrFalse(user, DeviceUsers::new);
+    }
+
     @Override
     public boolean debuggingBlocked(int user) {
         return (boolean) call(um, "hasUserRestriction", NO_DEBUGGING, user);

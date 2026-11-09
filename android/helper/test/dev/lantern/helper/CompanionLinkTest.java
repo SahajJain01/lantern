@@ -110,11 +110,16 @@ public final class CompanionLinkTest {
         volatile Runnable onBroadcast = () -> { };
 
         Rig() throws IOException {
+            this(u -> false);
+        }
+
+        /** {@code managed}: which Android users are managed (work) profiles. */
+        Rig(java.util.function.IntPredicate managed) throws IOException {
             listener = new HandoffListener();
             link = new CompanionLink(listener, (socket, token) -> {
                 broadcasts.add(socket + " " + token);
                 onBroadcast.run();
-            }, CODEC, TOKEN, toDaemon::add, logs::add);
+            }, CODEC, TOKEN, toDaemon::add, logs::add, managed);
         }
 
         @Override
@@ -191,7 +196,7 @@ public final class CompanionLinkTest {
 
     static void relaysCatalogueDropsOthers() throws Exception {
         try (Rig r = new Rig(); Companion c = linked(r)) {
-            c.send("{\"t\":\"app\",\"pkg\":\"org.example\",\"user\":0,\"label\":\"Example\"}");
+            c.send("{\"t\":\"app\",\"pkg\":\"org.example\",\"user\":0,\"label\":\"Example\",\"icon\":\"\"}");
             c.send("{\"t\":\"clip\",\"text\":\"secret\"}");
             c.send("{\"t\":\"app_removed\",\"pkg\":\"org.gone\",\"user\":0}");
             c.send("{\"t\":\"apps_end\",\"count\":1}");
@@ -247,6 +252,87 @@ public final class CompanionLinkTest {
                 check(m != null, "ime_prev, got EOF");
                 eq("ime_prev", m.t, "t");
                 eq("", m.str("id"), "empty id");
+            }
+        }
+    }
+
+    static void annotatesWorkProfile() throws Exception {
+        try (Rig r = new Rig(u -> u == 10); Companion c = linked(r)) {
+            c.send("{\"t\":\"app\",\"pkg\":\"com.android.files\",\"user\":10,\"label\":\"Files\",\"icon\":\"iVBO\"}");
+            c.send("{\"t\":\"app\",\"pkg\":\"com.android.files\",\"user\":0,\"label\":\"Files\",\"icon\":\"\"}");
+            // The companion has no say in work: the helper decides from the user.
+            c.send("{\"t\":\"app\",\"pkg\":\"org.liar\",\"user\":0,\"label\":\"Liar\",\"work\":true,\"icon\":\"\"}");
+            Msg w = r.toDaemon.poll(2, TimeUnit.SECONDS);
+            check(w != null, "work app relayed");
+            eq(Boolean.TRUE, w.fields().get("work"), "user 10 is work: " + w.fields().keySet());
+            eq("[pkg, user, label, work, icon]", w.fields().keySet().toString(), "field order");
+            eq("iVBO", w.str("icon"), "icon kept");
+            Msg p = r.toDaemon.poll(2, TimeUnit.SECONDS);
+            check(p != null, "personal app relayed");
+            eq("[pkg, user, label, icon]", p.fields().keySet().toString(), "user 0: no work key");
+            Msg l = r.toDaemon.poll(2, TimeUnit.SECONDS);
+            check(l != null, "liar relayed");
+            check(!l.fields().containsKey("work"), "companion-sent work dropped: " + l.fields().keySet());
+        }
+    }
+
+    static void malformedAppDropped() throws Exception {
+        try (Rig r = new Rig(); Companion c = linked(r)) {
+            c.send("{\"t\":\"app\",\"pkg\":\"x\"}");
+            c.send("{\"t\":\"app\",\"pkg\":\"x\",\"user\":-1,\"label\":\"X\",\"icon\":\"\"}");
+            c.send("{\"t\":\"app_removed\",\"pkg\":\"x\"}");
+            c.send("{\"t\":\"apps_end\",\"count\":-3}");
+            c.send("{\"t\":\"apps_end\",\"count\":0}");
+            Msg m = r.toDaemon.poll(2, TimeUnit.SECONDS);
+            eq("apps_end", m == null ? null : m.t, "only the well-formed message is relayed");
+            eq(0L, m.num("count"), "count");
+            check(r.toDaemon.poll(100, TimeUnit.MILLISECONDS) == null, "nothing else");
+            check(r.link.alive(), "a malformed message does not drop the link");
+        }
+    }
+
+    static void labelsTrackAppAndRemoved() throws Exception {
+        try (Rig r = new Rig(); Companion c = linked(r)) {
+            eq(null, r.link.label("org.example", 0), "unknown before");
+            c.send("{\"t\":\"app\",\"pkg\":\"org.example\",\"user\":0,\"label\":\"Example\",\"icon\":\"\"}");
+            c.send("{\"t\":\"app\",\"pkg\":\"org.example\",\"user\":10,\"label\":\"Example (work)\",\"icon\":\"\"}");
+            r.toDaemon.poll(2, TimeUnit.SECONDS);
+            r.toDaemon.poll(2, TimeUnit.SECONDS);
+            eq("Example", r.link.label("org.example", 0), "label user 0");
+            eq("Example (work)", r.link.label("org.example", 10), "label user 10");
+            c.send("{\"t\":\"app\",\"pkg\":\"org.example\",\"user\":0,\"label\":\"Renamed\",\"icon\":\"\"}");
+            r.toDaemon.poll(2, TimeUnit.SECONDS);
+            eq("Renamed", r.link.label("org.example", 0), "an app update replaces the label");
+            c.send("{\"t\":\"app_removed\",\"pkg\":\"org.example\",\"user\":0}");
+            r.toDaemon.poll(2, TimeUnit.SECONDS);
+            eq(null, r.link.label("org.example", 0), "removed");
+            eq("Example (work)", r.link.label("org.example", 10), "the other user's entry stays");
+        }
+    }
+
+    static void syncSentOnSessionUpAndToLateCompanion() throws Exception {
+        try (Rig r = new Rig(); Companion a = linked(r)) {
+            // Before the session is up: no sync (a marker message arrives first and alone).
+            check(r.link.send(Msg.of("ime").put("op", "finish").put("text", "")), "marker");
+            eq("ime", a.read().t, "nothing before the marker");
+            r.link.startSync();
+            Msg s = a.read();
+            check(s != null, "sync, got EOF");
+            eq("sync", s.t, "sync on session up");
+            eq("[]", s.fields().keySet().toString(), "sync has no fields");
+            try (Companion b = new Companion(r.listener)) {
+                b.hello(TOKEN);
+                b.expectHelloReply();
+                Msg again = b.read();
+                eq("sync", again == null ? null : again.t, "a late companion gets sync after its hello reply");
+            }
+        }
+        try (Rig r = new Rig()) {
+            r.link.setPrevIme("k");
+            r.link.startSync(); // before any companion links
+            try (Companion c = linked(r)) {
+                eq("ime_prev", c.read().t, "ime_prev first");
+                eq("sync", c.read().t, "then sync");
             }
         }
     }
@@ -334,6 +420,10 @@ public final class CompanionLinkTest {
             {"relaysCatalogueDropsOthers", (Case) CompanionLinkTest::relaysCatalogueDropsOthers},
             {"setPrevImeSendsImePrev", (Case) CompanionLinkTest::setPrevImeSendsImePrev},
             {"imePrevBeforeLinkIsSentOnLink", (Case) CompanionLinkTest::imePrevBeforeLinkIsSentOnLink},
+            {"annotatesWorkProfile", (Case) CompanionLinkTest::annotatesWorkProfile},
+            {"malformedAppDropped", (Case) CompanionLinkTest::malformedAppDropped},
+            {"labelsTrackAppAndRemoved", (Case) CompanionLinkTest::labelsTrackAppAndRemoved},
+            {"syncSentOnSessionUpAndToLateCompanion", (Case) CompanionLinkTest::syncSentOnSessionUpAndToLateCompanion},
             {"linkLossIsNotAlive", (Case) CompanionLinkTest::linkLossIsNotAlive},
             {"handoffListenerQueuesAndCloses", (Case) CompanionLinkTest::handoffListenerQueuesAndCloses},
         };

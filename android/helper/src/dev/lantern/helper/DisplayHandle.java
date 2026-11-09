@@ -38,6 +38,11 @@ public interface DisplayHandle extends AutoCloseable {
         return false;
     }
 
+    /** True when the app runs in a managed (work) profile: {@code opened.work}. */
+    default boolean work() {
+        return false;
+    }
+
     void requestKeyframe();
 
     void setStreamListener(StreamListener l);

@@ -78,6 +78,14 @@ public final class UserLaunchTest {
             return profileGroup.stream().mapToInt(Integer::intValue).toArray();
         }
 
+        final List<Integer> managed = new ArrayList<>(List.of(10));
+
+        @Override
+        public boolean managedProfile(int user) {
+            calls.add("managed " + user);
+            return managed.contains(user);
+        }
+
         @Override
         public String profileLauncherActivity(String pkg, int user) {
             calls.add("la " + pkg + " " + user);
@@ -126,6 +134,10 @@ public final class UserLaunchTest {
         public String profileLauncherActivity(String pkg, int user) {
             throw no();
         }
+
+        public boolean managedProfile(int user) {
+            throw no();
+        }
     }
 
     static void user0FallsBackToLegacyWhenHiddenApisFail() throws Exception {
@@ -138,6 +150,17 @@ public final class UserLaunchTest {
             throw new ClassNotFoundException("android.os.IUserManager$Stub");
         });
         eq(UserLaunch.Route.LEGACY, t.route, "route after ctor failure");
+    }
+
+    static void managedProfileOrFalse() {
+        Fake f = new Fake();
+        eq(true, UserLaunch.managedOrFalse(10, () -> f), "user 10 is the managed profile");
+        eq(false, UserLaunch.managedOrFalse(0, () -> f), "user 0 is not");
+        eq(false, f.calls.contains("managed 0"), "user 0 is never asked: " + f.calls);
+        eq(false, UserLaunch.managedOrFalse(10, Broken::new), "a failing backend is false");
+        eq(false, UserLaunch.managedOrFalse(10, () -> {
+            throw new ClassNotFoundException("android.os.IUserManager$Stub");
+        }), "a backend that can't be built is false");
     }
 
     static void otherUsersDoNotFallBack() {
@@ -288,6 +311,7 @@ public final class UserLaunchTest {
             {"missingUserIsAClearError", (Case) UserLaunchTest::missingUserIsAClearError},
             {"stoppedUserIsAClearError", (Case) UserLaunchTest::stoppedUserIsAClearError},
             {"user0FallsBackToLegacyWhenHiddenApisFail", (Case) UserLaunchTest::user0FallsBackToLegacyWhenHiddenApisFail},
+            {"managedProfileOrFalse", (Case) UserLaunchTest::managedProfileOrFalse},
             {"otherUsersDoNotFallBack", (Case) UserLaunchTest::otherUsersDoNotFallBack},
             {"user0RealErrorsStillWin", (Case) UserLaunchTest::user0RealErrorsStillWin},
             {"blockedProfileUsesLauncherApps", (Case) UserLaunchTest::blockedProfileUsesLauncherApps},

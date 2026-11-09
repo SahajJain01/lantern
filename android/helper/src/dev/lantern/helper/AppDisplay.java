@@ -72,6 +72,7 @@ public final class AppDisplay implements DisplayHandle {
     private int displayId = -1;
     private int taskId = -1;
     private boolean moved;
+    private boolean work;
     private int width;
     private int height;
     private int dpi;
@@ -107,7 +108,9 @@ public final class AppDisplay implements DisplayHandle {
     private void start(int user) throws Exception {
         // Resolve first: a missing user or app fails before any display exists.
         UserLaunch.Target target = UserLaunch.resolveOrLegacy(pkg, user, DeviceUsers::new);
-        Droid.log("resolve: " + target.flatten() + " user=" + user + " route=" + target.route);
+        work = DeviceUsers.managed(user);
+        Droid.log("resolve: " + target.flatten() + " user=" + user + " route=" + target.route
+            + (work ? " work=true" : ""));
         display = ServiceManager.getDisplayManager().createNewVirtualDisplay(
             "lantern-" + win + "-" + pkg, width, height, dpi, encoder.surface(), Policy.FLAGS);
         if (display == null || display.getDisplay() == null) {
@@ -249,6 +252,11 @@ public final class AppDisplay implements DisplayHandle {
     @Override
     public boolean moved() {
         return moved;
+    }
+
+    @Override
+    public boolean work() {
+        return work;
     }
 
     private static android.hardware.display.DisplayManager publicDisplayManager()

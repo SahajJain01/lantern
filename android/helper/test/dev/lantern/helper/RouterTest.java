@@ -35,6 +35,7 @@ public final class RouterTest {
         volatile String closeThread;
         volatile int keyframes;
         volatile boolean moved;
+        volatile boolean work;
 
         FakeHandle(Rig rig, int win, int w, int h, VideoSink sink) {
             this.rig = rig;
@@ -79,6 +80,11 @@ public final class RouterTest {
         @Override
         public boolean moved() {
             return moved;
+        }
+
+        @Override
+        public boolean work() {
+            return work;
         }
 
         @Override
@@ -149,6 +155,7 @@ public final class RouterTest {
                 FakeHandle fh = new FakeHandle(this, win, w, h, sink);
                 fh.failOnClose = failOnCloseNext;
                 fh.moved = pkg.equals("moved.pkg");
+                fh.work = pkg.equals("com.android.files"); // the fake work-profile app
                 handles.put(win, fh);
                 return fh;
             };
@@ -380,6 +387,46 @@ public final class RouterTest {
         }
     }
 
+    static void openedCarriesLabelAndWork() throws Exception {
+        try (Rig r = new Rig(rt -> rt.setLabels((p, u) -> p.equals("com.android.files") && u == 10 ? "Files" : null))) {
+            r.hello();
+            r.send(5, "{\"t\":\"open\",\"pkg\":\"com.android.files\",\"user\":10,\"w\":1280,\"h\":800,\"dpi\":160}");
+            Proto.Frame f = r.frame();
+            eq(5, f.stream, "opened stream");
+            String wire = new String(f.payload, java.nio.charset.StandardCharsets.UTF_8);
+            Msg m = CODEC.decode(f.payload);
+            eq("opened", m.t, "opened");
+            eq("Files", m.str("label"), "label: " + wire);
+            eq(Boolean.TRUE, m.fields().get("work"), "work: " + wire);
+            check(wire.endsWith(",\"label\":\"Files\",\"work\":true}"), "wire: " + wire);
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+    }
+
+    static void openedWithoutLabelHasNoLabelKey() throws Exception {
+        try (Rig r = new Rig(rt -> rt.setLabels((p, u) -> null))) {
+            r.hello();
+            r.send(6, "{\"t\":\"open\",\"pkg\":\"com.android.settings\",\"user\":0,\"w\":1280,\"h\":800,\"dpi\":160}");
+            Proto.Frame f = r.frame();
+            eq(6, f.stream, "opened stream");
+            // The v1 bytes: no label, no work.
+            eq("{\"t\":\"opened\",\"display\":16,\"task\":106,\"codec\":\"h264\",\"w\":1280,\"h\":800}",
+                new String(f.payload, java.nio.charset.StandardCharsets.UTF_8), "opened wire");
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+        // The default labels (none set) also add nothing.
+        try (Rig r = new Rig()) {
+            r.hello();
+            r.send(6, "{\"t\":\"open\",\"pkg\":\"com.android.settings\",\"user\":0,\"w\":1280,\"h\":800,\"dpi\":160}");
+            Msg m = r.control(6);
+            eq("[display, task, codec, w, h]", m.fields().keySet().toString(), "default labels: v1 fields");
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+    }
+
     static void eofClosesAllDisplays() throws Exception {
         try (Rig r = new Rig()) {
             r.hello();
@@ -591,6 +638,8 @@ public final class RouterTest {
             {"setExtrasAcceptsHandler", (Case) RouterTest::setExtrasAcceptsHandler},
             {"openThenCloseCallsFactoryAndClose", (Case) RouterTest::openThenCloseCallsFactoryAndClose},
             {"openedSaysMovedForAnExistingTask", (Case) RouterTest::openedSaysMovedForAnExistingTask},
+            {"openedCarriesLabelAndWork", (Case) RouterTest::openedCarriesLabelAndWork},
+            {"openedWithoutLabelHasNoLabelKey", (Case) RouterTest::openedWithoutLabelHasNoLabelKey},
             {"eofClosesAllDisplays", (Case) RouterTest::eofClosesAllDisplays},
             {"appExitSendsClosedAppExited", (Case) RouterTest::appExitSendsClosedAppExited},
             {"streamFailureClosesWithErrorOffDrainThread", (Case) RouterTest::streamFailureClosesWithErrorOffDrainThread},

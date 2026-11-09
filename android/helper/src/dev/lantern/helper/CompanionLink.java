@@ -13,12 +13,15 @@ import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.IntPredicate;
 
 /**
  * The helper's side of the companion link (docs/protocol.md, "Companion link"). Plain Java: on the
@@ -40,6 +43,9 @@ public final class CompanionLink implements Closeable {
     /** Companion messages relayed to lanternd; every other {@code t} is logged and dropped. */
     static final Set<String> RELAYED = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
         "app", "apps_end", "app_removed")));
+
+    /** Base64 length of a {@link Proto#MAX_ICON}-byte PNG (padded, no line breaks). */
+    static final int MAX_ICON_B64 = (Proto.MAX_ICON + 2) / 3 * 4;
 
     /** Where companion connections come from. */
     public interface Listener {
@@ -110,19 +116,55 @@ public final class CompanionLink implements Closeable {
         t.setDaemon(true);
         return t;
     });
+    private final IntPredicate managedProfile;
+    /** Whether a user is a managed profile, asked once per user (a profile's type never changes). */
+    private final Map<Integer, Boolean> managed = new ConcurrentHashMap<>();
+    /** Launcher labels from the catalogue, keyed {@code pkg + ":" + user}. */
+    private final Map<String, String> labels = new ConcurrentHashMap<>();
     private Peer current;
     private String prevIme;
+    /** Set by {@link #startSync}: every linked companion (now or later) is told to {@code sync}. */
+    private boolean syncWanted;
     private boolean started;
     private boolean closed;
 
     public CompanionLink(Listener listener, Broadcaster broadcaster, ControlCodec codec, String token,
             Consumer<Msg> toDaemon, Consumer<String> log) {
+        this(listener, broadcaster, codec, token, toDaemon, log, u -> false);
+    }
+
+    /**
+     * @param managedProfile whether an Android user is a managed (work) profile: relayed {@code app}
+     *     messages for it get {@code work:true}. Must not throw (on the device: false on any error).
+     */
+    public CompanionLink(Listener listener, Broadcaster broadcaster, ControlCodec codec, String token,
+            Consumer<Msg> toDaemon, Consumer<String> log, IntPredicate managedProfile) {
         this.listener = listener;
         this.broadcaster = broadcaster;
         this.codec = codec;
         this.token = token;
         this.toDaemon = toDaemon;
         this.log = log;
+        this.managedProfile = managedProfile;
+    }
+
+    /** The catalogue's launcher label of {@code pkg} in {@code user}, or null if unknown. */
+    public String label(String pkg, int user) {
+        return labels.get(pkg + ":" + user);
+    }
+
+    /**
+     * Tells the linked companion to send its full catalogue ({@code sync}), and every companion
+     * that links later too, right after its hello reply. Called once the daemon session is up, so
+     * the catalogue is never held in the router's pre-session buffer.
+     */
+    public void startSync() {
+        synchronized (lock) {
+            syncWanted = true;
+            if (current != null) {
+                current.write(Msg.of("sync"));
+            }
+        }
     }
 
     /**
@@ -298,6 +340,9 @@ public final class CompanionLink implements Closeable {
                 if (prevIme != null) {
                     p.write(imePrev());
                 }
+                if (syncWanted) {
+                    p.write(Msg.of("sync"));
+                }
                 old = current;
                 current = p;
                 lock.notifyAll();
@@ -356,6 +401,78 @@ public final class CompanionLink implements Closeable {
         }
     }
 
+    /**
+     * The catalogue message to relay for {@code m}, or null (logged) if it is malformed, since a
+     * malformed one would be a protocol error at lanternd and end the session. {@code app} is
+     * rebuilt as {@code pkg, user, label, [work], icon}: {@code work} is the helper's answer for
+     * the user, never the companion's. {@code app} and {@code app_removed} update {@link #label}.
+     * Logs pkg/user/icon length only, never the icon.
+     */
+    private Msg relayable(Msg m) {
+        try {
+            switch (m.t) {
+                case "app": {
+                    String pkg = m.str("pkg");
+                    int user = user(m);
+                    String label = m.str("label");
+                    String icon = m.str("icon");
+                    if (icon.length() > MAX_ICON_B64) {
+                        log.accept("companion: app " + pkg + " user=" + user + " icon of " + icon.length()
+                            + " base64 chars is over MAX_ICON, sent without it");
+                        icon = "";
+                    }
+                    Msg out = Msg.of("app").put("pkg", pkg).put("user", user).put("label", label);
+                    if (isManaged(user)) {
+                        out.put("work", Boolean.TRUE);
+                    }
+                    out.put("icon", icon);
+                    labels.put(pkg + ":" + user, label);
+                    return out;
+                }
+                case "app_removed": {
+                    String pkg = m.str("pkg");
+                    int user = user(m);
+                    labels.remove(pkg + ":" + user);
+                    return Msg.of("app_removed").put("pkg", pkg).put("user", user);
+                }
+                case "apps_end": {
+                    long count = m.num("count");
+                    if (count < 0 || count > 0xffffffffL) {
+                        throw new IOException("apps_end.count " + count + " out of range");
+                    }
+                    log.accept("companion: apps_end count=" + count);
+                    return Msg.of("apps_end").put("count", count);
+                }
+                default:
+                    return null;
+            }
+        } catch (IOException e) {
+            Object pkg = m.fields().get("pkg");
+            log.accept("companion: malformed " + m.t + (pkg instanceof String ? " pkg=" + pkg : "")
+                + " dropped: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static int user(Msg m) throws IOException {
+        long u = m.num("user");
+        if (u < 0 || u > Integer.MAX_VALUE) {
+            throw new IOException(m.t + ".user " + u + " out of range");
+        }
+        return (int) u;
+    }
+
+    private boolean isManaged(int user) {
+        return managed.computeIfAbsent(user, u -> {
+            try {
+                return managedProfile.test(u);
+            } catch (RuntimeException e) {
+                log.accept("companion: managed-profile check for user " + u + " failed: " + e);
+                return false;
+            }
+        });
+    }
+
     private void readLoop(Peer p) {
         try {
             while (true) {
@@ -375,8 +492,12 @@ public final class CompanionLink implements Closeable {
                     continue;
                 }
                 if (RELAYED.contains(m.t)) {
+                    Msg out = relayable(m);
+                    if (out == null) {
+                        continue;
+                    }
                     try {
-                        toDaemon.accept(m);
+                        toDaemon.accept(out);
                     } catch (RuntimeException e) {
                         log.accept("companion: relay of " + m.t + " failed: " + e);
                     }

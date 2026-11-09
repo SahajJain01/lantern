@@ -77,6 +77,7 @@ public final class Router {
     private volatile boolean stopping;
     private volatile Runnable onSessionUp = () -> { };
     private volatile Extras extras = NO_EXTRAS;
+    private volatile Labels labels = NO_LABELS;
     /** Guards {@link #sessionUp} and {@link #early}: session messages wait for the hello reply. */
     private final Object sessionLock = new Object();
     private boolean sessionUp;
@@ -91,6 +92,13 @@ public final class Router {
 
         void clip(String text);
     }
+
+    /** The launcher label of {@code pkg} in {@code user} for {@code opened.label}, or null if unknown. */
+    public interface Labels {
+        String label(String pkg, int user);
+    }
+
+    static final Labels NO_LABELS = (p, u) -> null;
 
     static final Extras NO_EXTRAS = new Extras() {
         @Override
@@ -133,6 +141,11 @@ public final class Router {
     /** Set before {@link #run}; the default does nothing. */
     public void setExtras(Extras e) {
         extras = e == null ? NO_EXTRAS : e;
+    }
+
+    /** Where {@code opened.label} comes from (the companion's catalogue); the default knows none. */
+    public void setLabels(Labels l) {
+        labels = l == null ? NO_LABELS : l;
     }
 
     /**
@@ -361,8 +374,21 @@ public final class Router {
             // Optional, only when true: a v1 opened without it is byte-identical to before.
             opened.put("moved", Boolean.TRUE);
         }
+        String label = null;
+        try {
+            label = labels.label(pkg, user);
+        } catch (RuntimeException e) {
+            log.accept("router: label lookup for " + pkg + " failed: " + e);
+        }
+        if (label != null) {
+            opened.put("label", label); // optional: absent when unknown, so the v1 bytes
+        }
+        if (d.work()) {
+            opened.put("work", Boolean.TRUE); // optional, only when true
+        }
         wn.ready(opened);
         log.accept("router: opened win=" + win + " " + pkg + " display=" + d.displayId() + " task=" + d.taskId()
+            + (label != null ? " label=\"" + label + "\"" : "") + (d.work() ? " work=true" : "")
             + (moved ? " moved=true (the task existed before the launch; closing the window quits it)" : ""));
         // Listeners after Opened, so nothing they send can precede it. Both hop to the worker: the
         // resize listener runs under the display's lock, the stream listener on its drain thread.

@@ -47,6 +47,9 @@ final class UserLaunch {
 
         /** LauncherApps' first launcher activity class of {@code pkg} in {@code user}, or null. */
         String profileLauncherActivity(String pkg, int user);
+
+        /** True when {@code user} is a managed (work) profile. False on any error. */
+        boolean managedProfile(int user);
     }
 
     enum Route {
@@ -94,6 +97,21 @@ final class UserLaunch {
                 return new Target(pkg, null, 0, Route.LEGACY);
             }
             throw new LaunchError("could not check Android user " + user + " on this phone: " + e);
+        }
+    }
+
+    /**
+     * True when {@code user} is a managed (work) profile. User 0 never is (not asked); any failure
+     * (building or asking the backend) is false: the work badge is cosmetic.
+     */
+    static boolean managedOrFalse(int user, Callable<Backend> backend) {
+        if (user == 0) {
+            return false;
+        }
+        try {
+            return backend.call().managedProfile(user);
+        } catch (Exception e) {
+            return false;
         }
     }
 

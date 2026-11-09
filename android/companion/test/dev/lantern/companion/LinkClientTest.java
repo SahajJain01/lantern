@@ -130,6 +130,11 @@ public final class LinkClientTest {
                         public void ime(String op, String text) {
                             got.add("ime " + op + " " + text);
                         }
+
+                        @Override
+                        public void sync() {
+                            got.add("sync");
+                        }
                     });
                     got.add("eof");
                 } catch (IOException e) {
@@ -140,10 +145,11 @@ public final class LinkClientTest {
             r.send("{\"t\":\"ime_prev\",\"id\":\"com.example/.Keyboard\"}");
             r.send("{\"t\":\"clip\",\"text\":\"secret\"}");
             r.send("{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"hi\"}");
+            r.send("{\"t\":\"sync\"}");
             r.helper.shutdownOutput();
             t.join(3000);
             check(!t.isAlive(), "run returns at EOF");
-            eq("[ime_prev com.example/.Keyboard, ime commit hi, eof]", got.toString(), "dispatch");
+            eq("[ime_prev com.example/.Keyboard, ime commit hi, sync, eof]", got.toString(), "dispatch");
             boolean logged = false;
             synchronized (r.logs) {
                 for (String l : r.logs) {
@@ -163,11 +169,13 @@ public final class LinkClientTest {
         }
     }
 
-    static void linkTypesAddImePrevOnly() {
-        check(LinkClient.LINK_TYPES.contains("ime_prev"), "ime_prev is a link type");
-        check(!Msg.TYPES.contains("ime_prev"), "but never a daemon type");
+    static void linkTypesAddImePrevAndSyncOnly() {
+        for (String t : new String[] {"ime_prev", "sync"}) {
+            check(LinkClient.LINK_TYPES.contains(t), t + " is a link type");
+            check(!Msg.TYPES.contains(t), t + " is never a daemon type");
+        }
         check(LinkClient.LINK_TYPES.containsAll(Msg.TYPES), "link types include every v1 type");
-        eq(Msg.TYPES.size() + 1, LinkClient.LINK_TYPES.size(), "exactly one link-only type");
+        eq(Msg.TYPES.size() + 2, LinkClient.LINK_TYPES.size(), "exactly two link-only types");
     }
 
     static void validatesLinkCall() {
@@ -211,7 +219,7 @@ public final class LinkClientTest {
             {"handshakeRejectsWrongReply", (Case) LinkClientTest::handshakeRejectsWrongReply},
             {"runStoresImePrevRoutesImeDropsOthers", (Case) LinkClientTest::runStoresImePrevRoutesImeDropsOthers},
             {"sendWritesControlFrames", (Case) LinkClientTest::sendWritesControlFrames},
-            {"linkTypesAddImePrevOnly", (Case) LinkClientTest::linkTypesAddImePrevOnly},
+            {"linkTypesAddImePrevAndSyncOnly", (Case) LinkClientTest::linkTypesAddImePrevAndSyncOnly},
             {"validatesLinkCall", (Case) LinkClientTest::validatesLinkCall},
             {"testActivityStateFromExtra", (Case) LinkClientTest::testActivityStateFromExtra},
         };

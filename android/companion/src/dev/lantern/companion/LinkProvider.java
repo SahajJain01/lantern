@@ -46,7 +46,7 @@ public final class LinkProvider extends ContentProvider {
             r.putBoolean("ok", false);
             return r;
         }
-        Link.start(new ParcelFileDescriptor.AutoCloseInputStream(in),
+        Link.start(getContext(), new ParcelFileDescriptor.AutoCloseInputStream(in),
             new ParcelFileDescriptor.AutoCloseOutputStream(out), arg);
         Bundle r = new Bundle();
         r.putBoolean("ok", true);

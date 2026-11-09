@@ -115,11 +115,12 @@ public final class Main {
                 new java.io.BufferedOutputStream(client.getOutputStream(), 1 << 16));
             final Router[] routerRef = {null};
             final Runnable[] linkRef = {null};
+            final CompanionLink[] companionRef = {null};
             final boolean[] linked = {false};
             Router router = new Router(in, out, AppDisplay::open, new Input(), Control.CODEC, token,
                 () -> {
                     // After a valid hello only: an unauthenticated client never reaches the companion.
-                    linked[0] = linkCompanion(routerRef, linkRef);
+                    linked[0] = linkCompanion(routerRef, linkRef, companionRef);
                     // Task 7 adds the IME changes here when linked.
                     Session session;
                     try {
@@ -153,9 +154,22 @@ public final class Main {
                 },
                 Droid::log);
             routerRef[0] = router;
-            router.setOnSessionUp(() -> router.sendSession(linked[0]
-                ? Msg.of("companion").put("state", "ready")
-                : Msg.of("companion").put("state", "unavailable").put("msg", "companion did not connect")));
+            router.setLabels((pkg, user) -> {
+                CompanionLink l = companionRef[0];
+                return l == null ? null : l.label(pkg, user);
+            });
+            router.setOnSessionUp(() -> {
+                router.sendSession(linked[0]
+                    ? Msg.of("companion").put("state", "ready")
+                    : Msg.of("companion").put("state", "unavailable").put("msg", "companion did not connect"));
+                // Only now (after the hello reply) is the catalogue asked for, so it goes straight
+                // to lanternd instead of piling up in the router's pre-session buffer. A companion
+                // that links later is asked right after its own hello.
+                CompanionLink l = companionRef[0];
+                if (l != null) {
+                    l.startSync();
+                }
+            });
             router.run();
         } catch (java.io.IOException e) {
             Droid.log("serve: " + e);
@@ -180,7 +194,7 @@ public final class Main {
      * Its catalogue messages go to lanternd on stream 0. Never throws: without the companion the
      * session goes on.
      */
-    private static boolean linkCompanion(Router[] routerRef, Runnable[] closeRef) {
+    private static boolean linkCompanion(Router[] routerRef, Runnable[] closeRef, CompanionLink[] linkRef) {
         try {
             HandoffListener listener = new HandoffListener();
             DeviceCompanion.Handoff handoff = new DeviceCompanion.Handoff(listener);
@@ -189,7 +203,8 @@ public final class Main {
                 if (r != null) {
                     r.sendSession(m);
                 }
-            }, Droid::log);
+            }, Droid::log, DeviceUsers::managed);
+            linkRef[0] = link;
             closeRef[0] = () -> {
                 link.close();
                 handoff.close();
