@@ -191,6 +191,29 @@ disconnects resumed right after it was released. Windows keeps it stable because
 stack always reads controllers. **Design impact:** `lanternd` should open gamepads for the whole
 session; that also prevents this churn.
 
+## Plan 2 Task 8: IME display policy (2026-11-10)
+
+Lantern displays now use `DISPLAY_IME_POLICY_LOCAL` (0) instead of `HIDE` (2), the plan's fallback.
+Under `HIDE`, PC text never reached the app. The companion's `TestActivity` ran on a Lantern
+display with its EditText focused, and the window's `focus` had moved the phone's top focus there
+(`mTopFocusedDisplayId` = the Lantern display). Even so, `dumpsys input_method` still showed
+`curClient` = the launcher on display 0 (`mSelfReportedDisplayId=0`, `packageName=com.android.launcher3`).
+The server logged `onRequestHide ... reason HIDE_DISPLAY_IME_POLICY_HIDE` for the app's
+`startInput`. `LanternIme` reported `ime op=commit ok=true`, but its input connection was the
+launcher's dummy one, and `LanternTest` logged nothing.
+
+With `LOCAL`, the same run bound `curClient` to the companion on the Lantern display
+(`mSelfReportedDisplayId=<lantern display>`). `LanternTest` logged `text=Tiếng Việt 👍` after the
+commit, then `text=Tiếng Việt 👍việ` after the compose. Debug keys `a`, `b`, `c` arrived as key
+events. `Ctrl+A` followed by a commit replaced the whole text (`text=ok`). The Lantern keyboard
+draws nothing, so `LOCAL` shows no on-screen keyboard. The IME service is destroyed and recreated
+each time the keyboard moves to a different display (`ime destroyed`/`ime created`). Its watchdog
+state is static (`ImeState`), so that state survives the recreation.
+
+Test setup: the PC's Plasma session was locked, so the window got no frame callbacks there. The
+run used a nested `kwin_wayland --virtual` (text-input-v3 present) and the `focus` debug step,
+because that compositor gives the window no keyboard focus.
+
 ## Not verified (needs Sahaj or a later test)
 
 - **Gamepad re-association** to a different display (Lantern's own UHID path); scrcpy pins it.

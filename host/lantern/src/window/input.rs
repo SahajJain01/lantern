@@ -7,12 +7,87 @@
 //! normalized to the video rect; a press outside the video is ignored, a drag that leaves it is
 //! clamped to the edge.
 
-use lantern_proto::{InputEvent, KeyAction, PointerAction};
+//!
+//! Keyboard: a key whose text is what the US-layout Android key event would type (or that has
+//! no text, or is pressed with Ctrl/Alt/Super) is sent as a key event; any other text (a dead
+//! key's `é`, a non-US layout's letters, AltGr symbols) is committed through the Lantern
+//! keyboard as `ime{commit}`. Composition from a PC input method arrives as winit `Ime` events
+//! and becomes `ime{compose|commit|finish}`.
+
+use lantern_proto::{Control, ImeOp, InputEvent, KeyAction, PointerAction, MAX_IME_TEXT};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::keyboard::{KeyCode, ModifiersState};
 
 use super::geometry::{clamp_normalized, to_normalized, Rect};
-use super::keymap::{meta_state, window_keycode};
+use super::keymap::{meta_state, us_char, window_keycode};
+
+/// What a keyboard event becomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Typed {
+    /// An Android key event ([`InputState::key`]).
+    Key,
+    /// Text committed through the Lantern keyboard.
+    Text(String),
+    /// Nothing (the release of a key sent as text, or a dead key).
+    Nothing,
+}
+
+/// Classifies one key event by its winit `text`. Ctrl, Alt or Super held: a key (shortcuts).
+/// A press whose text is what the US layout gives for the key: a key. A press with any other
+/// non-empty text free of control characters: that text. Anything else: a key.
+pub fn classify(
+    code: KeyCode,
+    text: Option<&str>,
+    mods: ModifiersState,
+    state: ElementState,
+) -> Typed {
+    if mods.control_key() || mods.alt_key() || mods.super_key() || state != ElementState::Pressed {
+        return Typed::Key;
+    }
+    let Some(text) = text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control)) else {
+        return Typed::Key;
+    };
+    let mut us = [0u8; 4];
+    match us_char(code, mods.shift_key()) {
+        Some(c) if c.encode_utf8(&mut us) == text => Typed::Key,
+        _ => Typed::Text(text.to_owned()),
+    }
+}
+
+/// The `ime` controls for one input-method event. A commit longer than [`MAX_IME_TEXT`] bytes
+/// is split into several, on char boundaries; an empty commit is nothing. A preedit cannot be
+/// split, so it is cut to [`MAX_IME_TEXT`] bytes. `finish` carries no text.
+pub fn ime_controls(op: ImeOp, text: &str) -> Vec<Control> {
+    let ime = |text: &str| Control::Ime {
+        op,
+        text: text.to_owned(),
+    };
+    match op {
+        ImeOp::Finish => vec![ime("")],
+        ImeOp::Compose => vec![ime(&text[..floor_char_boundary(text, MAX_IME_TEXT)])],
+        ImeOp::Commit => {
+            let mut out = Vec::new();
+            let mut rest = text;
+            while !rest.is_empty() {
+                let n = floor_char_boundary(rest, MAX_IME_TEXT);
+                out.push(ime(&rest[..n]));
+                rest = &rest[n..];
+            }
+            out
+        }
+    }
+}
+
+/// The largest char boundary of `s` at or below `max` bytes.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if s.len() <= max {
+        return s.len();
+    }
+    (0..=max)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0)
+}
 
 pub const BUTTON_PRIMARY: u32 = 1;
 pub const BUTTON_SECONDARY: u32 = 2;
@@ -30,6 +105,8 @@ pub struct InputState {
     pub mods: ModifiersState,
     /// Android keycodes currently down, with their repeat count.
     keys_down: Vec<(KeyCode, u32, u32)>,
+    /// Keys whose press was sent as text (or was a dead key): their release sends nothing.
+    text_keys: Vec<KeyCode>,
 }
 
 fn pointer(action: PointerAction, (x, y): (f32, f32), buttons: u32) -> InputEvent {
@@ -134,7 +211,49 @@ impl InputState {
                 }),
         );
         self.mods = ModifiersState::empty();
+        self.text_keys.clear();
         out
+    }
+
+    /// [`classify`] with memory: a key whose press went as text (or a `dead` key, which types
+    /// nothing until the next key) sends nothing on release, so the phone never gets an
+    /// unmatched key-up; a key already down as a key keeps repeating as a key.
+    pub fn typed(
+        &mut self,
+        code: KeyCode,
+        text: Option<&str>,
+        dead: bool,
+        state: ElementState,
+        repeat: bool,
+    ) -> Typed {
+        let as_text = self.text_keys.contains(&code);
+        match state {
+            ElementState::Released => {
+                if as_text {
+                    self.text_keys.retain(|&k| k != code);
+                    return Typed::Nothing;
+                }
+                Typed::Key
+            }
+            ElementState::Pressed => {
+                if repeat && self.keys_down.iter().any(|k| k.0 == code) {
+                    return Typed::Key;
+                }
+                if dead {
+                    if !as_text {
+                        self.text_keys.push(code);
+                    }
+                    return Typed::Nothing;
+                }
+                let typed = classify(code, text, self.mods, state);
+                match typed {
+                    Typed::Text(_) if !as_text => self.text_keys.push(code),
+                    Typed::Key if as_text => return Typed::Nothing,
+                    _ => {}
+                }
+                typed
+            }
+        }
     }
 
     pub fn wheel(&mut self, rect: Rect, delta: MouseScrollDelta) -> Option<InputEvent> {
@@ -355,6 +474,172 @@ mod tests {
                 h: -0.0,
                 v: 2.0
             })
+        );
+    }
+
+    const P: ElementState = ElementState::Pressed;
+    const U: ElementState = ElementState::Released;
+    const NONE: ModifiersState = ModifiersState::empty();
+
+    #[test]
+    fn classify_ascii_is_key() {
+        assert_eq!(classify(KeyCode::KeyA, Some("a"), NONE, P), Typed::Key);
+        let shift = ModifiersState::SHIFT;
+        assert_eq!(classify(KeyCode::KeyA, Some("A"), shift, P), Typed::Key);
+        assert_eq!(classify(KeyCode::Digit1, Some("!"), shift, P), Typed::Key);
+        assert_eq!(classify(KeyCode::Space, Some(" "), NONE, P), Typed::Key);
+        assert_eq!(classify(KeyCode::Slash, Some("/"), NONE, P), Typed::Key);
+        // Control characters and keys with no text stay keys.
+        assert_eq!(classify(KeyCode::Enter, Some("\r"), NONE, P), Typed::Key);
+        assert_eq!(classify(KeyCode::Tab, Some("\t"), NONE, P), Typed::Key);
+        assert_eq!(
+            classify(KeyCode::Backspace, Some("\u{8}"), NONE, P),
+            Typed::Key
+        );
+        assert_eq!(classify(KeyCode::ArrowLeft, None, NONE, P), Typed::Key);
+        assert_eq!(classify(KeyCode::ShiftLeft, None, NONE, P), Typed::Key);
+        assert_eq!(classify(KeyCode::KeyA, Some(""), NONE, P), Typed::Key);
+        // A release is always a key here (InputState decides what a text key's release is).
+        assert_eq!(classify(KeyCode::KeyE, Some("é"), NONE, U), Typed::Key);
+    }
+
+    #[test]
+    fn classify_dead_key_e_acute_is_text() {
+        assert_eq!(
+            classify(KeyCode::KeyE, Some("é"), NONE, P),
+            Typed::Text("é".into())
+        );
+        // A non-US layout: German Y/Z swap, French A/Q.
+        assert_eq!(
+            classify(KeyCode::KeyY, Some("z"), NONE, P),
+            Typed::Text("z".into())
+        );
+        // AltGr is not Alt in winit's state.
+        assert_eq!(
+            classify(KeyCode::KeyE, Some("€"), NONE, P),
+            Typed::Text("€".into())
+        );
+    }
+
+    #[test]
+    fn classify_ctrl_c_is_key() {
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(classify(KeyCode::KeyC, Some("\u{3}"), ctrl, P), Typed::Key);
+        assert_eq!(classify(KeyCode::KeyC, Some("c"), ctrl, P), Typed::Key);
+        assert_eq!(
+            classify(KeyCode::KeyE, Some("é"), ModifiersState::ALT, P),
+            Typed::Key
+        );
+        assert_eq!(
+            classify(KeyCode::KeyE, Some("é"), ModifiersState::SUPER, P),
+            Typed::Key
+        );
+    }
+
+    #[test]
+    fn text_press_has_no_release() {
+        let mut s = InputState::default();
+        assert_eq!(
+            s.typed(KeyCode::KeyE, Some("é"), false, P, false),
+            Typed::Text("é".into())
+        );
+        // A repeat of a text key repeats the text.
+        assert_eq!(
+            s.typed(KeyCode::KeyE, Some("é"), false, P, true),
+            Typed::Text("é".into())
+        );
+        assert_eq!(
+            s.typed(KeyCode::KeyE, None, false, U, false),
+            Typed::Nothing
+        );
+        // Its release was consumed: a second one is a plain key release (unmatched, so `key`
+        // sends nothing).
+        assert_eq!(s.typed(KeyCode::KeyE, None, false, U, false), Typed::Key);
+        assert_eq!(s.key(KeyCode::KeyE, U, false), None);
+
+        // A dead key sends nothing at all, press or release.
+        assert_eq!(
+            s.typed(KeyCode::Quote, None, true, P, false),
+            Typed::Nothing
+        );
+        assert_eq!(
+            s.typed(KeyCode::Quote, None, false, U, false),
+            Typed::Nothing
+        );
+
+        // A plain key is unaffected and its up matches its down.
+        assert_eq!(
+            s.typed(KeyCode::KeyA, Some("a"), false, P, false),
+            Typed::Key
+        );
+        assert!(s.key(KeyCode::KeyA, P, false).is_some());
+        assert_eq!(s.typed(KeyCode::KeyA, None, false, U, false), Typed::Key);
+        assert!(s.key(KeyCode::KeyA, U, false).is_some());
+
+        // A text key held at blur is forgotten (no up is owed to the phone).
+        assert_eq!(
+            s.typed(KeyCode::KeyY, Some("z"), false, P, false),
+            Typed::Text("z".into())
+        );
+        assert_eq!(s.focus_lost(R), vec![]);
+        assert_eq!(s.typed(KeyCode::KeyY, None, false, U, false), Typed::Key);
+    }
+
+    #[test]
+    fn long_commit_splits_on_char_boundary() {
+        let max = lantern_proto::MAX_IME_TEXT;
+        assert_eq!(ime_controls(ImeOp::Commit, ""), vec![]);
+        assert_eq!(
+            ime_controls(ImeOp::Commit, "Tiếng"),
+            vec![Control::Ime {
+                op: ImeOp::Commit,
+                text: "Tiếng".into()
+            }]
+        );
+        // 'ế' is 3 bytes: MAX-1 ASCII bytes then 'ế' does not fit in the first commit.
+        let text = format!("{}ế{}", "a".repeat(max - 1), "b".repeat(max));
+        let parts = ime_controls(ImeOp::Commit, &text);
+        let texts: Vec<&str> = parts
+            .iter()
+            .map(|c| match c {
+                Control::Ime {
+                    op: ImeOp::Commit,
+                    text,
+                } => text.as_str(),
+                other => panic!("not a commit: {other:?}"),
+            })
+            .collect();
+        assert_eq!(texts.len(), 3);
+        assert!(texts.iter().all(|t| !t.is_empty() && t.len() <= max));
+        assert_eq!(texts[0].len(), max - 1);
+        assert_eq!(texts.concat(), text);
+        // Exactly MAX bytes is one commit.
+        assert_eq!(ime_controls(ImeOp::Commit, &"x".repeat(max)).len(), 1);
+        // A preedit cannot be split: it is cut to MAX bytes on a char boundary.
+        let long = "ệ".repeat(max);
+        match &ime_controls(ImeOp::Compose, &long)[..] {
+            [Control::Ime {
+                op: ImeOp::Compose,
+                text,
+            }] => {
+                assert!(text.len() <= max && text.len() > max - 3);
+                assert!(long.starts_with(text.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            ime_controls(ImeOp::Compose, ""),
+            vec![Control::Ime {
+                op: ImeOp::Compose,
+                text: String::new()
+            }]
+        );
+        assert_eq!(
+            ime_controls(ImeOp::Finish, "ignored"),
+            vec![Control::Ime {
+                op: ImeOp::Finish,
+                text: String::new()
+            }]
         );
     }
 

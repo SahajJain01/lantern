@@ -23,13 +23,15 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use lantern_proto::{read_frame, write_frame, Control, Frame, InputEvent, Kind, VideoPacket};
+use lantern_proto::{
+    read_frame, write_frame, Control, Frame, ImeOp, InputEvent, Kind, VideoPacket,
+};
 use serde::{Deserialize, Serialize};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{ActivationToken, Window, WindowId};
@@ -38,7 +40,7 @@ use crate::daemon::ipc;
 use debounce::Debouncer;
 use decode::{Decoder, Nv12Frame};
 use geometry::{display_request, rotation_request, ResizeRequests, ResizedKind};
-use input::InputState;
+use input::{InputState, Typed};
 use outcome::{Exit, OpenState};
 use render::Renderer;
 
@@ -210,11 +212,38 @@ enum DebugStep {
     Tap(f64, f64),
     /// Wheel notches at a fraction of the window.
     Scroll(f64, f64, f32),
-    Key(KeyCode),
+    /// A key press and release; `true`: with Ctrl held (a Ctrl down/up around it).
+    Key(KeyCode, bool),
+    /// An input-method event, as from a PC input method.
+    Ime(ImeOp, String),
+    /// What the window does on keyboard focus (for compositors that give none, e.g. headless).
+    Focus,
     Close,
 }
 
-/// `LANTERN_DEBUG_INPUT="tap:0.5,0.3;scroll:0.5,0.5,-3;key:Escape;close"`.
+/// A `key:` step's argument: `Escape`, `Enter`, `Down`, `Up`, `Tab`, a letter or digit, or
+/// `Ctrl+<Letter>`.
+fn parse_debug_key(arg: &str) -> Option<DebugStep> {
+    let single = |s: &str| {
+        let mut chars = s.chars();
+        chars.next().filter(|_| chars.next().is_none())
+    };
+    if arg.len() > 5 && arg.is_char_boundary(5) && arg[..5].eq_ignore_ascii_case("ctrl+") {
+        let c = single(&arg[5..]).filter(char::is_ascii_alphabetic)?;
+        return Some(DebugStep::Key(keymap::char_key(c)?, true));
+    }
+    let code = match arg {
+        "Escape" => KeyCode::Escape,
+        "Enter" => KeyCode::Enter,
+        "Down" => KeyCode::ArrowDown,
+        "Up" => KeyCode::ArrowUp,
+        "Tab" => KeyCode::Tab,
+        _ => keymap::char_key(single(arg)?)?,
+    };
+    Some(DebugStep::Key(code, false))
+}
+
+/// `LANTERN_DEBUG_INPUT="tap:0.5,0.3;scroll:0.5,0.5,-3;key:Escape;key:Ctrl+A;text:Tiếng;compose:việ;finish;close"`.
 fn parse_debug_steps(s: &str) -> Vec<DebugStep> {
     let mut out = Vec::new();
     for step in s.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -226,14 +255,11 @@ fn parse_debug_steps(s: &str) -> Vec<DebugStep> {
         let parsed = match (cmd, nums.as_slice()) {
             ("tap", [x, y]) => Some(DebugStep::Tap(*x, *y)),
             ("scroll", [x, y, v]) => Some(DebugStep::Scroll(*x, *y, *v as f32)),
-            ("key", _) => match args {
-                "Escape" => Some(DebugStep::Key(KeyCode::Escape)),
-                "Enter" => Some(DebugStep::Key(KeyCode::Enter)),
-                "Down" => Some(DebugStep::Key(KeyCode::ArrowDown)),
-                "Up" => Some(DebugStep::Key(KeyCode::ArrowUp)),
-                "Tab" => Some(DebugStep::Key(KeyCode::Tab)),
-                _ => None,
-            },
+            ("key", _) => parse_debug_key(args),
+            ("text", _) => Some(DebugStep::Ime(ImeOp::Commit, args.to_owned())),
+            ("compose", _) => Some(DebugStep::Ime(ImeOp::Compose, args.to_owned())),
+            ("finish", _) => Some(DebugStep::Ime(ImeOp::Finish, String::new())),
+            ("focus", _) => Some(DebugStep::Focus),
             ("close", _) => Some(DebugStep::Close),
             _ => None,
         };
@@ -270,6 +296,8 @@ struct App {
     requests: ResizeRequests,
     debounce: Debouncer,
     input: InputState,
+    /// A PC input method's preedit is showing (sent as `ime{compose}`, not yet committed).
+    preedit: bool,
     last_frame: Option<Nv12Frame>,
     closing: Option<Instant>,
     disconnected: Option<Instant>,
@@ -305,6 +333,68 @@ impl App {
                     payload: ev.encode(),
                 });
             }
+        }
+    }
+
+    /// The window got keyboard focus: the phone focuses its task (and so its display, which
+    /// the phone's keyboard then serves).
+    fn focused(&self) {
+        if let (Some(win), None) = (self.state.win(), self.closing) {
+            tracing::debug!(win, "focused");
+            self.send_control(
+                win,
+                Control::Focus {
+                    activation_token: None,
+                },
+            );
+        }
+    }
+
+    /// Sends an input-method event as `ime` controls (a long commit split, see
+    /// [`input::ime_controls`]) and tracks whether a preedit is showing.
+    fn send_ime(&mut self, op: ImeOp, text: &str) {
+        let Some(win) = self.state.win() else { return };
+        if self.closing.is_some() || self.disconnected.is_some() {
+            return;
+        }
+        if op == ImeOp::Compose && text.is_empty() && !self.preedit {
+            return; // no preedit to clear
+        }
+        self.preedit = op == ImeOp::Compose && !text.is_empty();
+        tracing::debug!(?op, len = text.len(), "ime");
+        for c in input::ime_controls(op, text) {
+            self.send_control(win, c);
+        }
+    }
+
+    /// One keyboard event: an Android key, committed text, or nothing.
+    fn key_event(
+        &mut self,
+        code: KeyCode,
+        text: Option<&str>,
+        dead: bool,
+        state: ElementState,
+        repeat: bool,
+    ) {
+        match self.input.typed(code, text, dead, state, repeat) {
+            Typed::Key => {
+                let ev = self.input.key(code, state, repeat);
+                self.send_input(ev);
+            }
+            Typed::Text(text) => self.send_ime(ImeOp::Commit, &text),
+            Typed::Nothing => {}
+        }
+    }
+
+    /// Keeps the PC input method's candidate popup at the window's bottom-left quarter (the
+    /// phone does not report where its text cursor is).
+    fn update_ime_area(&self) {
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            window.set_ime_cursor_area(
+                PhysicalPosition::new(0, size.height / 2),
+                PhysicalSize::new(size.width / 2, size.height / 2),
+            );
         }
     }
 
@@ -363,8 +453,11 @@ impl App {
         self.scale = window.scale_factor();
         let renderer = Renderer::new(window.clone(), el.owned_display_handle())?;
         window.request_redraw();
+        // Text input (text-input-v3): a PC input method's preedit/commit arrive as `Ime`.
+        window.set_ime_allowed(true);
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.update_ime_area();
         Ok(())
     }
 
@@ -574,12 +667,26 @@ impl App {
                     self.send_input(ev);
                 }
             }
-            DebugStep::Key(code) => {
-                let ev = self.input.key(code, ElementState::Pressed, false);
-                self.send_input(ev);
-                let ev = self.input.key(code, ElementState::Released, false);
-                self.send_input(ev);
+            DebugStep::Key(code, ctrl) => {
+                // The real key path, with the text a US layout gives (none while Ctrl is held).
+                let (pressed, released) = (ElementState::Pressed, ElementState::Released);
+                let mods = self.input.mods;
+                if ctrl {
+                    self.key_event(KeyCode::ControlLeft, None, false, pressed, false);
+                    self.input.mods = ModifiersState::CONTROL;
+                }
+                let mut buf = [0u8; 4];
+                let text = keymap::us_char(code, false).map(|c| &*c.encode_utf8(&mut buf));
+                self.key_event(code, text, false, pressed, false);
+                self.key_event(code, None, false, released, false);
+                if ctrl {
+                    self.input.mods = ModifiersState::empty();
+                    self.key_event(KeyCode::ControlLeft, None, false, released, false);
+                }
+                self.input.mods = mods;
             }
+            DebugStep::Ime(op, text) => self.send_ime(op, &text),
+            DebugStep::Focus => self.focused(),
             DebugStep::Close => self.request_close(),
         }
     }
@@ -651,21 +758,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.debounce
                     .push(Instant::now(), (size.width, size.height));
+                self.update_ime_area();
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => self.scale = scale_factor,
-            WindowEvent::Focused(true) => {
-                if let (Some(win), None) = (self.state.win(), self.closing) {
-                    self.send_control(
-                        win,
-                        Control::Focus {
-                            activation_token: None,
-                        },
-                    );
-                }
-            }
+            WindowEvent::Focused(true) => self.focused(),
             WindowEvent::Focused(false) => {
                 for ev in self.input.focus_lost(rect) {
                     self.send_input(Some(ev));
@@ -712,10 +811,21 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    let ev = self.input.key(code, event.state, event.repeat);
-                    self.send_input(ev);
+                    let dead = matches!(event.logical_key, Key::Dead(_));
+                    let text = event.text.as_deref();
+                    self.key_event(code, text, dead, event.state, event.repeat);
                 }
             }
+            WindowEvent::Ime(ime) => match ime {
+                Ime::Enabled => {}
+                Ime::Preedit(text, _) => self.send_ime(ImeOp::Compose, &text),
+                Ime::Commit(text) => self.send_ime(ImeOp::Commit, &text),
+                Ime::Disabled => {
+                    if self.preedit {
+                        self.send_ime(ImeOp::Finish, "");
+                    }
+                }
+            },
             _ => {}
         }
     }
@@ -834,6 +944,7 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
         requests: ResizeRequests::default(),
         debounce: Debouncer::new(),
         input: InputState::default(),
+        preedit: false,
         last_frame: None,
         closing: None,
         disconnected: None,
@@ -858,6 +969,34 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_steps_text_compose_finish_and_ctrl_keys() {
+        let steps = parse_debug_steps(
+            "focus;tap:0.5,0.15;text:Tiếng Việt 👍;compose:việ;finish;key:Ctrl+C;key:ctrl+v;key:a;key:Escape;key:Ctrl+Escape;close",
+        );
+        let got: Vec<String> = steps.iter().map(|s| format!("{s:?}")).collect();
+        assert_eq!(
+            got,
+            [
+                "Focus",
+                "Tap(0.5, 0.15)",
+                "Ime(Commit, \"Tiếng Việt 👍\")",
+                "Ime(Compose, \"việ\")",
+                "Ime(Finish, \"\")",
+                "Key(KeyC, true)",
+                "Key(KeyV, true)",
+                "Key(KeyA, false)",
+                "Key(Escape, false)",
+                "Close",
+            ]
+        );
+        // Text keeps inner spaces and commas.
+        assert!(matches!(
+            &parse_debug_steps("text:a, b")[..],
+            [DebugStep::Ime(ImeOp::Commit, t)] if t == "a, b"
+        ));
+    }
 
     #[test]
     fn concurrent_remember_size_keeps_every_window() {

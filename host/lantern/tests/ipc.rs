@@ -13,8 +13,8 @@ use lantern::daemon::ipc;
 use lantern::daemon::session::{handshake, SessionConn};
 use lantern::daemon::{serve, serve_with_catalog, RetryPolicy};
 use lantern_proto::{
-    read_frame_async, write_frame_async, CloseReason, CompanionState, Control, Frame, Kind,
-    SessionState, StatusReport, WindowInfo,
+    read_frame_async, write_frame_async, CloseReason, CompanionState, Control, Frame, ImeOp, Kind,
+    SessionState, StatusReport, WindowInfo, MAX_IME_TEXT,
 };
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -950,6 +950,81 @@ async fn out_of_range_resize_drops_only_that_client() {
         send(&mut good, &resize).await;
         assert_eq!(helper.next().await, resize, "in-range resize is forwarded");
     }
+    daemon.shutdown().await;
+}
+
+fn ime(win: u32, op: ImeOp, text: &str) -> Frame {
+    control(
+        win,
+        Control::Ime {
+            op,
+            text: text.into(),
+        },
+    )
+}
+
+#[tokio::test]
+async fn ipc_forwards_ime() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (mut client, win) = open_window(&daemon.sock, &mut helper, "com.example", 0).await;
+    let full = "ế".repeat(MAX_IME_TEXT / 3) + &"x".repeat(MAX_IME_TEXT % 3);
+    assert_eq!(full.len(), MAX_IME_TEXT);
+    for frame in [
+        ime(win, ImeOp::Commit, "Tiếng Việt 👍"),
+        ime(win, ImeOp::Compose, "việ"),
+        ime(win, ImeOp::Compose, ""),
+        ime(win, ImeOp::Finish, ""),
+        ime(win, ImeOp::Commit, &full),
+    ] {
+        send(&mut client, &frame).await;
+        assert_eq!(helper.next().await, frame, "ime is forwarded unchanged");
+    }
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn ipc_rejects_oversize_ime() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let (mut good, good_win) = open_window(&daemon.sock, &mut helper, "com.good", 0).await;
+    let over = "x".repeat(MAX_IME_TEXT + 1);
+    // Multi-byte: fewer than MAX chars but more than MAX bytes.
+    let over_utf8 = "ế".repeat(MAX_IME_TEXT / 3 + 1);
+    for (i, (op, text)) in [
+        (ImeOp::Commit, &over),
+        (ImeOp::Compose, &over),
+        (ImeOp::Commit, &over_utf8),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (mut client, win) =
+            open_window(&daemon.sock, &mut helper, &format!("com.bad{i}"), 0).await;
+        send(&mut client, &ime(win, op, text)).await;
+        assert_eof(&mut client).await;
+        let close = helper.next().await;
+        assert_eq!(
+            (close.stream, decode(&close)),
+            (win, Control::Close),
+            "oversize ime must close only its window, never reach the helper"
+        );
+    }
+    // An unknown op never decodes, so it is a protocol error too.
+    let (mut client, win) = open_window(&daemon.sock, &mut helper, "com.badop", 0).await;
+    let bogus = Frame {
+        kind: Kind::Control,
+        stream: win,
+        payload: br#"{"t":"ime","op":"paste","text":"x"}"#.to_vec(),
+    };
+    send(&mut client, &bogus).await;
+    assert_eof(&mut client).await;
+    assert_eq!(decode(&helper.next().await), Control::Close);
+    helper.assert_quiet().await;
+
+    let ok = ime(good_win, ImeOp::Commit, "ok");
+    send(&mut good, &ok).await;
+    assert_eq!(helper.next().await, ok, "the good window is unaffected");
     daemon.shutdown().await;
 }
 

@@ -42,7 +42,9 @@ public final class EncoderTest {
         eq(want, AppDisplay.Policy.FLAGS, "display flags");
         // VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS must never be set.
         eq(0, AppDisplay.Policy.FLAGS & (1 << 9), "no system decorations");
-        eq(2, AppDisplay.Policy.IME_POLICY_HIDE, "ime policy hide");
+        // DISPLAY_IME_POLICY_LOCAL: under HIDE the server never binds the keyboard to a Lantern
+        // display's editor (docs/spikes/RESULTS.md, "Plan 2 Task 8: IME display policy").
+        eq(0, AppDisplay.Policy.IME_POLICY, "ime policy local");
     }
 
     static void rotationSwaps() {

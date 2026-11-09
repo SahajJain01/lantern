@@ -133,6 +133,65 @@ pub fn window_keycode(k: KeyCode, mods: ModifiersState) -> Option<u32> {
     android_keycode(k)
 }
 
+const LETTERS: [KeyCode; 26] = {
+    use KeyCode::*;
+    [
+        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO,
+        KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
+    ]
+};
+
+const DIGITS: [KeyCode; 10] = {
+    use KeyCode::*;
+    [
+        Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
+    ]
+};
+
+/// The character a US layout gives for a letter, digit, space or US punctuation key, with or
+/// without Shift. These are exactly the characters the Android key events Lantern sends for the
+/// key produce, so a key whose text matches is sent as a key, anything else as text.
+pub fn us_char(k: KeyCode, shift: bool) -> Option<char> {
+    use KeyCode::*;
+    if let Some(i) = LETTERS.iter().position(|&l| l == k) {
+        let c = (b'a' + i as u8) as char;
+        return Some(if shift { c.to_ascii_uppercase() } else { c });
+    }
+    if let Some(i) = DIGITS.iter().position(|&d| d == k) {
+        return Some(if shift {
+            b")!@#$%^&*("[i] as char
+        } else {
+            (b'0' + i as u8) as char
+        });
+    }
+    let (plain, shifted) = match k {
+        Space => (' ', ' '),
+        Minus => ('-', '_'),
+        Equal => ('=', '+'),
+        BracketLeft => ('[', '{'),
+        BracketRight => (']', '}'),
+        Backslash => ('\\', '|'),
+        Semicolon => (';', ':'),
+        Quote => ('\'', '"'),
+        Comma => (',', '<'),
+        Period => ('.', '>'),
+        Slash => ('/', '?'),
+        Backquote => ('`', '~'),
+        _ => return None,
+    };
+    Some(if shift { shifted } else { plain })
+}
+
+/// The US-layout letter or digit key for `c` (either case), for debug `key:` steps.
+pub fn char_key(c: char) -> Option<KeyCode> {
+    let c = c.to_ascii_lowercase();
+    match c {
+        'a'..='z' => Some(LETTERS[(c as u8 - b'a') as usize]),
+        '0'..='9' => Some(DIGITS[(c as u8 - b'0') as usize]),
+        _ => None,
+    }
+}
+
 const META_SHIFT_ON: u32 = 0x1;
 const META_ALT_ON: u32 = 0x2;
 const META_ALT_LEFT_ON: u32 = 0x10;
@@ -219,6 +278,69 @@ mod tests {
             window_keycode(KeyCode::KeyA, ModifiersState::SUPER),
             Some(29)
         );
+    }
+
+    #[test]
+    fn us_char_letters_digits_punct() {
+        assert_eq!(us_char(KeyCode::KeyA, false), Some('a'));
+        assert_eq!(us_char(KeyCode::KeyA, true), Some('A'));
+        assert_eq!(us_char(KeyCode::KeyZ, false), Some('z'));
+        assert_eq!(us_char(KeyCode::KeyE, true), Some('E'));
+        assert_eq!(us_char(KeyCode::Digit0, false), Some('0'));
+        assert_eq!(us_char(KeyCode::Digit9, false), Some('9'));
+        let shifted_digits = ")!@#$%^&*(";
+        let digits = [
+            KeyCode::Digit0,
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ];
+        for (k, c) in digits.into_iter().zip(shifted_digits.chars()) {
+            assert_eq!(us_char(k, true), Some(c), "{k:?}");
+        }
+        assert_eq!(us_char(KeyCode::Space, false), Some(' '));
+        assert_eq!(us_char(KeyCode::Space, true), Some(' '));
+        let punct = [
+            (KeyCode::Minus, '-', '_'),
+            (KeyCode::Equal, '=', '+'),
+            (KeyCode::BracketLeft, '[', '{'),
+            (KeyCode::BracketRight, ']', '}'),
+            (KeyCode::Backslash, '\\', '|'),
+            (KeyCode::Semicolon, ';', ':'),
+            (KeyCode::Quote, '\'', '"'),
+            (KeyCode::Comma, ',', '<'),
+            (KeyCode::Period, '.', '>'),
+            (KeyCode::Slash, '/', '?'),
+            (KeyCode::Backquote, '`', '~'),
+        ];
+        for (k, plain, shifted) in punct {
+            assert_eq!(us_char(k, false), Some(plain), "{k:?}");
+            assert_eq!(us_char(k, true), Some(shifted), "{k:?} shifted");
+        }
+        for k in [
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Escape,
+            KeyCode::ArrowUp,
+            KeyCode::Numpad1,
+            KeyCode::IntlBackslash,
+        ] {
+            assert_eq!(us_char(k, false), None, "{k:?}");
+        }
+        // Every letter and digit maps back to its key (debug `key:` steps).
+        for c in ('a'..='z').chain('0'..='9') {
+            let k = char_key(c).unwrap();
+            assert_eq!(us_char(k, false), Some(c));
+            assert_eq!(char_key(c.to_ascii_uppercase()), Some(k));
+        }
+        assert_eq!(char_key('é'), None);
     }
 
     #[test]

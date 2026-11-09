@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use lantern_proto::{
     read_frame_async, write_frame_async, CompanionState, Control, Frame, InputEvent, Kind,
-    SessionState, StatusReport, WindowInfo,
+    SessionState, StatusReport, WindowInfo, MAX_IME_TEXT,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -228,8 +228,8 @@ pub mod limits {
 /// Checks a client frame on its window's own stream and returns what to forward to the
 /// helper, or `None` for a protocol error. A malformed input payload or a resize outside
 /// [`limits`] would end the whole helper session (every window), so it is caught here and
-/// costs only this client. The activation token is daemon↔window only and is stripped from a
-/// client's `focus`.
+/// costs only this client; so would an `ime` text over [`MAX_IME_TEXT`] bytes. The activation
+/// token is daemon↔window only and is stripped from a client's `focus`.
 fn client_frame_for_helper(frame: Frame) -> Option<Frame> {
     match frame.kind {
         Kind::Input => InputEvent::decode(&frame.payload).is_ok().then_some(frame),
@@ -243,6 +243,12 @@ fn client_frame_for_helper(frame: Frame) -> Option<Frame> {
             )),
             Control::Resize { w, h, dpi } => limits::geometry_ok(w, h, dpi).then_some(frame),
             Control::Close => Some(frame),
+            // The helper's Router rejects a text over MAX_IME_TEXT UTF-8 bytes (and an unknown
+            // op, which never decodes here). Log the op and size only, never the typed text.
+            Control::Ime { op, text } => {
+                tracing::debug!(stream = frame.stream, ?op, len = text.len(), "ime");
+                (text.len() <= MAX_IME_TEXT).then_some(frame)
+            }
             _ => None,
         },
     }

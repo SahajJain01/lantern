@@ -41,8 +41,12 @@ public final class AppDisplay implements DisplayHandle {
         static final int FLAGS = PUBLIC | PRESENTATION | OWN_CONTENT_ONLY | SUPPORTS_TOUCH
             | ROTATES_WITH_CONTENT | DESTROY_CONTENT_ON_REMOVAL | TRUSTED | OWN_DISPLAY_GROUP
             | ALWAYS_UNLOCKED | TOUCH_FEEDBACK_DISABLED | OWN_FOCUS | DEVICE_DISPLAY_GROUP;
-        /** WindowManager.DISPLAY_IME_POLICY_HIDE. */
-        static final int IME_POLICY_HIDE = 2;
+        /**
+         * WindowManager.DISPLAY_IME_POLICY_LOCAL: the keyboard serves the display's own editor.
+         * Under HIDE (2) the server never binds the keyboard to a Lantern display's editor, so
+         * text from the PC goes nowhere. The Lantern keyboard draws nothing, so LOCAL shows none.
+         */
+        static final int IME_POLICY = 0;
 
         private Policy() {
         }
@@ -117,7 +121,7 @@ public final class AppDisplay implements DisplayHandle {
             throw new IllegalStateException("createNewVirtualDisplay returned no display");
         }
         displayId = display.getDisplay().getDisplayId();
-        ServiceManager.getWindowManager().setDisplayImePolicy(displayId, Policy.IME_POLICY_HIDE);
+        ServiceManager.getWindowManager().setDisplayImePolicy(displayId, Policy.IME_POLICY);
         int ime = ServiceManager.getWindowManager().getDisplayImePolicy(displayId);
         Droid.log("display: id=" + displayId + " " + width + "x" + height + "/" + dpi + " flags=0x"
             + Integer.toHexString(Policy.FLAGS) + " ime_policy=" + ime + " mime=" + encoder.mime() + " win=" + win);
