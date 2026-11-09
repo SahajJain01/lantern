@@ -16,9 +16,10 @@ Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
 The window items (2-6, 11-13) need frames from the compositor, which a locked Plasma session does
 not give. --nested (or LANTERN_TEST_NESTED=1) runs every test window in a private headless
-`kwin_wayland --virtual` on its own D-Bus instead. That compositor gives no keyboard focus, so
-the text items prepend the window's `focus` debug step there. The clipboard still goes through
-the real session (lanternd's clipboard client and Klipper).
+`kwin_wayland --virtual` on its own D-Bus instead, with scratch XDG config/data/state/cache dirs
+(removed afterwards, with every service that bus activated). That compositor gives no keyboard
+focus, so the text items prepend the window's `focus` debug step there. The clipboard still goes
+through the real session (lanternd's clipboard client and Klipper).
 """
 import argparse
 import json
@@ -308,8 +309,31 @@ def desktop_entry(app_id):
 
 
 def klipper(*args):
-    """Klipper on the real session bus (never the nested one)."""
-    return sh("qdbus6", "org.kde.klipper", "/klipper", *args)
+    """Klipper on the real session bus (never the nested one). A failure names only the method:
+    the arguments may be the user's clipboard text, which is never logged."""
+    try:
+        r = subprocess.run(["qdbus6", "org.kde.klipper", "/klipper", *args], capture_output=True,
+                           text=True, timeout=20, encoding="utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Fail(f"klipper {args[0]}: {type(e).__name__}")
+    if r.returncode != 0:
+        raise Fail(f"klipper {args[0]} -> {r.returncode}")
+    return r.stdout
+
+
+def cleanup(ok, *steps):
+    """Runs every (what, fn) cleanup step even if an earlier one fails. If the item itself
+    failed (`ok` false) the step errors are only noted, so they never mask its real failure;
+    otherwise the first one is raised."""
+    errors = []
+    for what, fn in steps:
+        try:
+            fn()
+        except Exception as e:
+            errors.append(f"{what}: {type(e).__name__}: {e}")
+            note(f"cleanup failed: {errors[-1]}")
+    if ok and errors:
+        raise Fail("cleanup: " + "; ".join(errors))
 
 
 def armed(st):
@@ -326,36 +350,89 @@ class Nested:
     def __init__(self):
         self.socket = f"lantern-test-{os.getpid()}"
         self.log = LOG_DIR / "nested-kwin.log"
-        out = sh("dbus-daemon", "--session", "--fork", "--print-address=1", "--print-pid=1")
-        addr, pid = out.split()[:2]
-        self.bus_pid = int(pid)
-        self.env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=addr)
+        self.bus_pid = self.kwin = self.f = None
+        # Scratch XDG config/data/state/cache dirs for the bus and KWin, so nothing they write
+        # (kwinoutputconfig.json's Virtual-0 output, kwinrc, caches) lands in the user's real
+        # ones. XDG_RUNTIME_DIR stays real: the windows find lanternd's socket there.
+        self.home = Path(tempfile.mkdtemp(prefix="lantern-nested-kwin-"))
+        self.env = dict(os.environ)
         self.env.pop("WAYLAND_DISPLAY", None)
-        self.f = open(self.log, "w")
-        self.kwin = subprocess.Popen(
-            ["kwin_wayland", "--virtual", "--no-lockscreen", "--socket", self.socket,
-             "--width", "1920", "--height", "1080"],
-            stdout=self.f, stderr=self.f, env=self.env, start_new_session=True)
-        sock = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / self.socket
-        wait_until("nested KWin up", 10, lambda: sock.exists() and sh(
-            "qdbus6", "org.kde.KWin", "/Scripting", check_rc=False, env=self.env), interval=0.2)
+        for var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+            d = self.home / var.lower()
+            d.mkdir()
+            self.env[var] = str(d)
+        try:
+            out = sh("dbus-daemon", "--session", "--fork", "--print-address=1", "--print-pid=1",
+                     env=self.env)
+            addr, pid = out.split()[:2]
+            self.bus_pid = int(pid)
+            self.env["DBUS_SESSION_BUS_ADDRESS"] = addr
+            self.f = open(self.log, "w")
+            self.kwin = subprocess.Popen(
+                ["kwin_wayland", "--virtual", "--no-lockscreen", "--socket", self.socket,
+                 "--width", "1920", "--height", "1080"],
+                stdout=self.f, stderr=self.f, env=self.env, start_new_session=True)
+            runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            sock = Path(runtime) / self.socket
+            wait_until("nested KWin up", 10, lambda: sock.exists() and sh(
+                "qdbus6", "org.kde.KWin", "/Scripting", check_rc=False, env=self.env),
+                interval=0.2)
+        except BaseException:
+            self.stop()  # a half-started bus or KWin never outlives a failed start
+            raise
 
     def output(self):
         return self.log.read_text(errors="replace")
 
     def stop(self):
-        if self.kwin.poll() is None:
+        if self.kwin and self.kwin.poll() is None:
             self.kwin.terminate()
             try:
                 self.kwin.wait(5)
             except subprocess.TimeoutExpired:
                 self.kwin.kill()
                 self.kwin.wait(5)
-        self.f.close()
-        try:
-            os.kill(self.bus_pid, 15)
-        except OSError:
-            pass
+        if self.f:
+            self.f.close()
+        # Services the private bus activated (xdg-desktop-portal-kde, ksecretd, ...) outlive it,
+        # and could recreate files in the scratch dirs. They inherited its environment, so the
+        # unique scratch path identifies exactly them.
+        self._reap()
+        if self.bus_pid:
+            try:
+                os.kill(self.bus_pid, 15)
+            except OSError:
+                pass
+        self._reap()
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _started_here(self):
+        mark = str(self.home).encode()
+        pids = []
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit() or int(d.name) == os.getpid():
+                continue
+            try:
+                if d.stat().st_uid == os.getuid() and mark in (d / "environ").read_bytes():
+                    pids.append(int(d.name))
+            except OSError:
+                pass
+        return pids
+
+    def _reap(self):
+        pids = self._started_here()
+        for sig in (15, 9):
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            t0 = time.monotonic()
+            while (pids := self._started_here()) and time.monotonic() - t0 < 3:
+                time.sleep(0.1)
+            if not pids:
+                return
+        note(f"nested session processes still running: {pids}")
 
 
 def kwin(js, name):
@@ -717,6 +794,7 @@ class Suite:
         return w, since
 
     def ime_unicode_text(self):
+        ok = False
         try:
             ime = phone_state()["ime"]
             note(f"default_input_method during the session: {ime}")
@@ -733,8 +811,9 @@ class Suite:
             leaked = [m for _, m in logcat_since(since, ["LanternCompanion", "lantern"])
                       if "Tiếng" in m or "việ" in m]
             check(not leaked, f"typed text in the companion/helper log: {leaked}")
+            ok = True
         finally:
-            test_activity(False)
+            cleanup(ok, ("disable the test screen", lambda: test_activity(False)))
 
     def clipboard_both_ways(self):
         saved = klipper("getClipboardContents")
@@ -742,6 +821,7 @@ class Suite:
         note(f"saved the PC clipboard text ({len(saved)} chars)")
         tag = f"{os.getpid()}{int(time.time()) % 100000}"
         pc_text, phone_text = f"lantern-pc-{tag}", f"from-phone-{tag}"
+        ok = False
         try:
             # 1. PC -> phone, before the window opens (the helper logs the length only).
             since = phone_now()
@@ -781,10 +861,15 @@ class Suite:
             note(f"helper: {helper}")
             check(helper.count(f"clip: phone copy ({len(phone_text)} chars) sent to the PC") == 1,
                   "phone copy not sent exactly once")
+            ok = True
         finally:
-            test_activity(False)
-            klipper("setClipboardContents", saved)
-            note("restored the PC clipboard text")
+            # The user's clipboard first: disabling the test screen fails exactly when the phone
+            # dropped, and the suite's own finally disables it again anyway.
+            def restore():
+                klipper("setClipboardContents", saved)
+                note("restored the PC clipboard text")
+            cleanup(ok, ("restore the PC clipboard", restore),
+                    ("disable the test screen", lambda: test_activity(False)))
 
     def usb_yank_restores_keyboard(self):
         """Unplug: the phone's own cleanup puts the keyboard back. Checked after replug with
@@ -884,14 +969,15 @@ def main():
                      ", ".join(f"{n} {i}" for n, i in enumerate(ITEMS, 1)))
         items = [i for n, i in enumerate(ITEMS, 1) if i in args.only or str(n) in args.only]
     print(f"lantern device test: serial={SERIAL} binary={LANTERN} logs={LOG_DIR}", flush=True)
-    if args.nested:
-        NESTED = Nested()
-        print(f"nested KWin: WAYLAND_DISPLAY={NESTED.socket} log={NESTED.log}", flush=True)
-    elif desktop_locked():
+    if not args.nested and desktop_locked():
         print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
               "(4-6, 12, 13) cannot pass. Unlock it or use --nested.", flush=True)
     results = []
     try:
+        if args.nested:
+            NESTED = Nested()
+            print(f"nested KWin: WAYLAND_DISPLAY={NESTED.socket} log={NESTED.log} "
+                  f"config={NESTED.home}", flush=True)
         for name in items:
             idx = ITEMS.index(name) + 1
             print(f"[{idx}] {name}", flush=True)
