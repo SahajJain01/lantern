@@ -411,6 +411,78 @@ fn undo_setup_refuses_live_session() {
     );
 }
 
+/// An idle lanternd may be waiting to retry a session, so undo-setup refuses whenever lanternd
+/// answers at all, not only while a session is live.
+#[test]
+fn undo_setup_refuses_idle_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("undo-idle");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.join("adb.log");
+    // No device online (the daemon stays idle); every other adb call fails fast.
+    let adb = bin.join("adb");
+    std::fs::write(
+        &adb,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$*\" in *track-devices*) exec sleep 30;; esac\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let notify = bin.join("notify-send");
+    std::fs::write(&notify, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&notify, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .arg("daemon")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("PATH", &path)
+        .env_remove("LANTERN_SERIAL")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .arg("status")
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.contains("\"idle\"") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never idle: {stdout}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let calls_before = std::fs::read_to_string(&log).unwrap_or_default();
+    let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .args(["undo-setup", "--serial", "dev"])
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let calls_after = std::fs::read_to_string(&log).unwrap_or_default();
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("stop lanternd first: systemctl --user stop lanternd"),
+        "stderr: {stderr}"
+    );
+    let new_calls = &calls_after[calls_before.len().min(calls_after.len())..];
+    assert!(
+        !new_calls.contains("-s dev"),
+        "undo-setup touched the phone: {new_calls}"
+    );
+}
+
 #[test]
 fn undo_setup_usage_errors_exit_2() {
     for args in [

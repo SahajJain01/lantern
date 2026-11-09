@@ -169,7 +169,9 @@ notification "Lantern set up your phone" and records the phone in
 `~/.local/state/lantern/devices/<serial>.json`. If the install fails, the session runs without the
 companion and one notification per daemon run says so (details in `journalctl --user -u lanternd`).
 
-`lantern undo-setup` refuses while lanternd is starting or serving that phone. It restores any
+`lantern undo-setup` refuses whenever lanternd answers on its socket, even when idle (it may be
+about to retry a session). It cannot see a lanternd on another runtime dir or another program using
+adb on the phone; stop those first. It restores any
 setting a dead session left changed (only where the setting still holds Lantern's value), deletes
 Lantern's files from `/data/local/tmp`, uninstalls the companion, and forgets the phone. It prints one
 line per step and exits 0 only if every step succeeded. Without `--serial` it uses `$LANTERN_SERIAL`

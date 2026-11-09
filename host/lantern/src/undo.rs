@@ -12,19 +12,12 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use lantern_proto::{SessionState, StatusReport};
 
 use crate::adb::{parse_device_list, Adb, ADB_CALL_TIMEOUT};
 use crate::daemon::{companion, ipc, session};
 
-/// Why undo-setup refuses while lanternd serves the phone.
+/// Why undo-setup refuses while lanternd runs.
 pub const STOP_FIRST: &str = "stop lanternd first: systemctl --user stop lanternd";
-
-/// Whether lanternd's `report` means a session is starting or live on `serial`.
-pub fn session_blocks(report: &StatusReport, serial: &str) -> bool {
-    matches!(report.state, SessionState::Ready | SessionState::Starting)
-        && report.serial.as_deref() == Some(serial)
-}
 
 /// True if `error` (from [`ipc::query_status`]) means no lanternd is listening.
 fn daemon_absent(error: &anyhow::Error) -> bool {
@@ -38,11 +31,12 @@ fn daemon_absent(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Fails with [`STOP_FIRST`] if lanternd (on `sock`) is starting or serving `serial`.
-pub fn check_daemon(sock: &Path, serial: &str) -> Result<()> {
+/// Fails with [`STOP_FIRST`] if lanternd answers on `sock` in any state: even idle it may be
+/// waiting to retry a session, which would race the undo (reinstall the companion, write a
+/// journal, have its helper killed).
+pub fn check_daemon(sock: &Path) -> Result<()> {
     match ipc::query_status(sock) {
-        Ok(report) if session_blocks(&report, serial) => bail!(STOP_FIRST),
-        Ok(_) => Ok(()),
+        Ok(_) => bail!(STOP_FIRST),
         Err(error) if daemon_absent(&error) => Ok(()),
         Err(error) => Err(error.context("could not ask lanternd whether a session is live")),
     }
@@ -120,10 +114,10 @@ fn first_line(error: &anyhow::Error) -> String {
 }
 
 /// Runs undo-setup for `adb`'s serial, printing one line per step to `out`. `Err` means it
-/// refused (lanternd live on that phone) or could not check; otherwise `Ok(all steps ok)`.
+/// refused (lanternd running) or could not check; otherwise `Ok(all steps ok)`.
 pub async fn run(adb: &Adb, sock: &Path, state_dir: &Path, out: &mut dyn Write) -> Result<bool> {
     let serial = adb.serial().to_owned();
-    check_daemon(sock, &serial)?;
+    check_daemon(sock)?;
     let mut phone_ok = true;
 
     match forget(adb).await {
@@ -174,34 +168,10 @@ pub async fn run(adb: &Adb, sock: &Path, state_dir: &Path, out: &mut dyn Write) 
 mod tests {
     use super::*;
 
-    fn report(state: SessionState, serial: Option<&str>) -> StatusReport {
-        StatusReport {
-            state,
-            serial: serial.map(str::to_owned),
-            helper: None,
-            windows: vec![],
-            companion: None,
-        }
-    }
-
-    #[test]
-    fn only_a_starting_or_live_session_on_that_serial_blocks() {
-        assert!(session_blocks(&report(SessionState::Ready, Some("a")), "a"));
-        assert!(session_blocks(
-            &report(SessionState::Starting, Some("a")),
-            "a"
-        ));
-        assert!(!session_blocks(&report(SessionState::Idle, None), "a"));
-        assert!(!session_blocks(
-            &report(SessionState::Ready, Some("b")),
-            "a"
-        ));
-    }
-
     #[test]
     fn no_daemon_does_not_block() {
         let dir = std::env::temp_dir().join(format!("lantern-undo-{}", std::process::id()));
-        check_daemon(&dir.join("absent.sock"), "a").unwrap();
+        check_daemon(&dir.join("absent.sock")).unwrap();
     }
 
     #[test]
