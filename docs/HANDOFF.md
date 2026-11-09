@@ -53,6 +53,12 @@ attached.
 - The keyboard-less fallback session on a device (`ime set` refused → stay-awake-only session,
   IME policy HIDE). Host-JVM tested only; forcing it needs a hand-made settings change.
 - The companion's watchdog switch on a device (link lost and nothing else restored the keyboard).
+- **Reboot mid-session** (host-JVM tested only, `ImeWatchdogTest`): with a session live, reboot
+  the phone (`adb reboot`) with lanternd stopped or the cable out, unlock it, and check that within
+  about 5 s `settings get secure default_input_method` reads the original keyboard again, logcat
+  `LanternCompanion` shows `ime created; no helper link: ...` then `ime_restored` and
+  `ime_restore done`, and that the next session restores `enabled_input_methods` and stay-awake
+  from the journal. Not run because a reboot is disruptive to Sahaj's phone.
 - A real password manager's secret hint (tested with a throwaway ext-data-control client, not
   KeePassXC).
 - **Encoder crash on resize (observation, not fixed):** in Task 9, 1 of 3 window opens died on the
@@ -97,7 +103,10 @@ attached.
     session is live, stay-awake reads 7, the keyboard is `dev.lantern.companion/.LanternIme`
     (appended to the enabled list), and the panel is off.
 - Any helper or daemon death restores the phone, through the setsid Cleanup child and the persisted
-  journal; the companion's watchdog is the last line for the keyboard.
+  journal; the companion's watchdog is the last line for the keyboard, also after a phone reboot
+  or battery death mid-session (it persists `ime_prev` in device-protected storage and arms when
+  the Lantern IME is created with no link). After such a reboot, stay-awake (7) and the Lantern
+  entry in `enabled_input_methods` stay until the next session restores them from the journal.
 - A locked Plasma session gives windows no frames. Window checks then need `--nested` (or
   `kwin_wayland --virtual --no-lockscreen --socket <name>` and `WAYLAND_DISPLAY=<name>`); that
   compositor gives no keyboard focus, hence the `focus` debug step.
@@ -116,7 +125,8 @@ attached.
   link-only message sent after `Session.start`; the catalogue starts only on the link-only `sync`
   sent from the session-up hook, so no bulk data waits in the Router's pre-hello buffer.
 - **Keyboard.** Journaled before any change, restored in reverse by the helper, by Cleanup on
-  helper death, and by the companion's watchdog (5 s after the link is lost, with retries and a
+  helper death, and by the companion's watchdog (5 s after the link is lost or after the IME is
+  created with no link, e.g. after a reboot, from a persisted `ime_prev`, with retries and a
   fallback keyboard). Each restore applies only while the setting still holds Lantern's value. If
   the switch fails, the session falls back to stay-awake only and reports
   `companion{unavailable, "keyboard switch failed: …"}`; a session never fails for the keyboard.

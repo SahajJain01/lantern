@@ -154,8 +154,15 @@ session), lanternd starts a session on the phone at once, even if no window is o
     `unavailable`), and the phone's own keyboard stays hidden on Lantern displays.
 
   The original values are restored when the session ends, including when the helper is killed
-  or the cable is pulled. A separate guard process on the phone does that restore, and as a last
-  line the companion switches back to your keyboard by itself 5 s after it loses the helper. The
+  or the cable is pulled. A separate guard process on the phone does that restore. As a last line
+  for the keyboard, the companion keeps your keyboard's id (also on disk, so it survives a
+  reboot) and switches back to it by itself 5 s after it loses the helper, or, after a reboot or battery
+  death mid-session, 5 s after the phone is unlocked with the Lantern keyboard still selected.
+  If your keyboard is gone or won't take, it picks the first other enabled keyboard instead; only
+  when there is no other enabled keyboard at all does the Lantern keyboard stay selected (pick
+  one in the phone's settings, or plug in again and let the next session restore it). The
+  companion can only switch the selected keyboard; the stay-awake value and the enabled-keyboards
+  list wait for the next session after such a reboot. The
   original values are also journaled to `/data/local/tmp/lantern-session.json` before anything
   changes, and the file is deleted after a clean restore. If both helper and guard die without
   restoring (reboot, battery death, `kill -9` of both), the next session takes the originals from

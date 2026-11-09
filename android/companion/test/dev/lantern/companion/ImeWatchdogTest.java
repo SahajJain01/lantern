@@ -66,15 +66,23 @@ public final class ImeWatchdogTest {
         eq(null, fire(w, 6000, false), "someone else's keyboard: leave it");
     }
 
-    static void notWithoutPrev() {
-        ImeWatchdog w = new ImeWatchdog(5000);
-        w.linkLost(0, "");
-        eq(null, fire(w, 6000, true), "empty prev");
-        ImeWatchdog n = new ImeWatchdog(5000);
-        n.linkLost(0, null);
-        eq(null, fire(n, 6000, true), "null prev");
+    /** No original known (reboot before any ime_prev, or ""): fall back to the first other enabled keyboard. */
+    static void noPrevFallsBackToFirstEnabled() {
+        for (String prev : new String[] {"", null}) {
+            ImeWatchdog w = new ImeWatchdog(5000);
+            w.linkLost(0, prev);
+            eq(null, fire(w, 4999, true, () -> Arrays.asList(LANTERN, PREV)), "not before the grace");
+            ImeWatchdog.Action a = w.due(5000, true, () -> Arrays.asList(LANTERN, PREV));
+            check(a != null, "acts without a known original (" + prev + ")");
+            eq(PREV, a.id, "first enabled keyboard that is not Lantern's");
+            check(a.fallback, "marked as fallback");
+        }
+        ImeWatchdog only = new ImeWatchdog(5000);
+        only.linkLost(0, null);
+        ImeWatchdog.Action a = only.due(5000, true, () -> Collections.singletonList(LANTERN));
+        check(a != null && a.id == null && a.giveUp != null, "no candidate at all: give up with a reason");
         ImeWatchdog never = new ImeWatchdog(5000);
-        eq(null, fire(never, 6000, true), "never linked, never lost");
+        eq(null, fire(never, 6000, true), "never linked, never lost, never created: nothing");
     }
 
     /** Once the switch took (we are no longer current), it never fires again for that loss. */
@@ -179,14 +187,159 @@ public final class ImeWatchdogTest {
         eq(1, calls[0], "read once when firing");
     }
 
-    /** A relink drops the previous session's ime_prev, so a loss before the new one cannot restore it. */
-    static void linkUpClearsStaleImePrev() {
-        ImeState.prevIme = PREV;
-        ImeState.linkUp();
-        eq(null, ImeState.prevIme, "stale ime_prev cleared at linkUp");
-        ImeState.WATCHDOG.linkLost(0, ImeState.prevIme); // lost before the new ime_prev arrived
-        eq(null, fire(ImeState.WATCHDOG, 60_000, true), "nothing to restore");
-        ImeState.linkUp();
+    /** In-memory stand-in for the companion's device-protected store. */
+    static final class FakeStore implements PrevStore {
+        String value;
+        int puts;
+
+        FakeStore(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String get() {
+            return value;
+        }
+
+        @Override
+        public void put(String id) {
+            puts++;
+            value = id;
+        }
+
+        @Override
+        public void clear() {
+            value = null;
+        }
+    }
+
+    /**
+     * ime_prev is persisted (it must survive a reboot); a relink only marks the in-memory copy
+     * stale, so the persisted one stays the restore target until the new session's ime_prev
+     * replaces it or a restore succeeded.
+     */
+    static void imePrevPersistsAcrossLinkUpUntilReplacedOrRestored() {
+        FakeStore store = new FakeStore(null);
+        PrevStore saved = ImeState.store;
+        ImeState.store = store;
+        try {
+            ImeState.linkUp();
+            eq(null, ImeState.restoreTarget(), "nothing known yet");
+            ImeState.imePrev(PREV);
+            eq(PREV, store.value, "persisted when received");
+            eq(PREV, ImeState.restoreTarget(), "restore target");
+            ImeState.linkUp();
+            eq(null, ImeState.prevIme, "in-memory copy dropped at linkUp (stale)");
+            eq(PREV, store.value, "persisted copy kept at linkUp");
+            eq(PREV, ImeState.restoreTarget(), "a loss before the new ime_prev still restores a keyboard");
+            ImeState.imePrev("");
+            eq(PREV, store.value, "an empty ime_prev never erases a known original");
+            ImeState.imePrev(OTHER);
+            eq(OTHER, store.value, "a new ime_prev replaces it");
+            eq(OTHER, ImeState.restoreTarget(), "fresh value wins");
+            ImeState.restored();
+            eq(null, store.value, "cleared once a restore took");
+            eq(null, ImeState.restoreTarget(), "nothing left");
+        } finally {
+            ImeState.store = saved;
+            ImeState.linkUp();
+        }
+    }
+
+    /** A broken store never breaks the link or the watchdog. */
+    static void brokenStoreIsHarmless() {
+        PrevStore saved = ImeState.store;
+        ImeState.store = new PrevStore() {
+            @Override
+            public String get() {
+                throw new IllegalStateException("locked");
+            }
+
+            @Override
+            public void put(String id) {
+                throw new IllegalStateException("locked");
+            }
+
+            @Override
+            public void clear() {
+                throw new IllegalStateException("locked");
+            }
+        };
+        try {
+            ImeState.imePrev(PREV);
+            eq(PREV, ImeState.restoreTarget(), "the in-memory copy still works");
+            ImeState.linkUp();
+            eq(null, ImeState.restoreTarget(), "unreadable store: unknown (the watchdog falls back)");
+            ImeState.restored();
+        } finally {
+            ImeState.store = saved;
+            ImeState.linkUp();
+        }
+    }
+
+    /** After a reboot the IME is created with no link: arm, and restore the persisted keyboard after the grace. */
+    static void createdWithNoLinkArmsWithPersistedPrev() {
+        FakeStore store = new FakeStore(PREV);
+        PrevStore saved = ImeState.store;
+        ImeState.store = store;
+        ImeState.prevIme = null; // a fresh process: memory is empty
+        try {
+            ImeWatchdog w = new ImeWatchdog(5000);
+            check(w.createdUnlinked(1000, ImeState.restoreTarget()), "armed");
+            eq(null, fire(w, 5999, true), "not before the grace");
+            ImeWatchdog.Action a = w.due(6000, true, ENABLED);
+            eq(PREV, a.id, "the persisted original");
+            check(!a.fallback, "not a fallback");
+        } finally {
+            ImeState.store = saved;
+        }
+    }
+
+    static void createdWithNoLinkAndNoPrevFallsBack() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        check(w.createdUnlinked(0, null), "armed without a known original");
+        ImeWatchdog.Action a = w.due(5000, true, () -> Arrays.asList(LANTERN, OTHER));
+        eq(OTHER, a.id, "fallback candidate");
+        check(a.fallback, "fallback");
+    }
+
+    static void createdWhileLinkedDoesNothing() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkUp();
+        check(!w.createdUnlinked(0, PREV), "a linked session's IME (e.g. recreated for another display) is not armed");
+        eq(null, fire(w, 60_000, true), "never fires");
+    }
+
+    static void createdUnlinkedThenLinkWithinGraceCancels() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        check(w.createdUnlinked(0, PREV), "armed");
+        w.linkUp(); // the IME was bound a moment before the companion processed the hello reply
+        eq(null, fire(w, 5000, true), "cancelled");
+        eq(null, fire(w, 60_000, true), "for good");
+    }
+
+    /** A recreated IME (display move) during a loss keeps the loss's progress. */
+    static void createdUnlinkedKeepsAnOngoingLoss() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkUp();
+        w.linkLost(0, PREV);
+        eq(PREV, fire(w, 5000, true), "attempt 1");
+        check(!w.createdUnlinked(6000, OTHER), "already armed: not reset");
+        eq(PREV, fire(w, 7000, true), "attempt 2 keeps the original and the retry timing");
+    }
+
+    /** When a switch took, due() says so once (so the persisted original can be cleared). */
+    static void switchThatTookReportsDone() {
+        ImeWatchdog w = new ImeWatchdog(5000);
+        w.linkLost(0, PREV);
+        eq(PREV, fire(w, 5000, true), "switch");
+        ImeWatchdog.Action done = w.due(7000, false, ENABLED);
+        check(done != null && done.done && done.id == null && done.giveUp == null, "done");
+        eq(null, w.due(9000, false, ENABLED), "only once");
+        ImeWatchdog idle = new ImeWatchdog(5000);
+        idle.linkLost(0, PREV);
+        eq(null, idle.due(6000, false, ENABLED), "another keyboard before any switch: not done, stays armed");
+        eq(PREV, fire(idle, 6500, true), "still armed");
     }
 
     static void opsDispatch() {
@@ -243,7 +396,7 @@ public final class ImeWatchdogTest {
             {"notBeforeGrace", (Case) ImeWatchdogTest::notBeforeGrace},
             {"linkUpCancels", (Case) ImeWatchdogTest::linkUpCancels},
             {"notWhenAnotherImeCurrent", (Case) ImeWatchdogTest::notWhenAnotherImeCurrent},
-            {"notWithoutPrev", (Case) ImeWatchdogTest::notWithoutPrev},
+            {"noPrevFallsBackToFirstEnabled", (Case) ImeWatchdogTest::noPrevFallsBackToFirstEnabled},
             {"firesOnceWhenTheSwitchTakes", (Case) ImeWatchdogTest::firesOnceWhenTheSwitchTakes},
             {"retryConstants", (Case) ImeWatchdogTest::retryConstants},
             {"failureRearms", (Case) ImeWatchdogTest::failureRearms},
@@ -253,7 +406,14 @@ public final class ImeWatchdogTest {
             {"failedFallbackGivesUp", (Case) ImeWatchdogTest::failedFallbackGivesUp},
             {"unreadableEnabledListRetriesPrevThenGivesUp", (Case) ImeWatchdogTest::unreadableEnabledListRetriesPrevThenGivesUp},
             {"enabledListReadOnlyWhenFiring", (Case) ImeWatchdogTest::enabledListReadOnlyWhenFiring},
-            {"linkUpClearsStaleImePrev", (Case) ImeWatchdogTest::linkUpClearsStaleImePrev},
+            {"imePrevPersistsAcrossLinkUpUntilReplacedOrRestored", (Case) ImeWatchdogTest::imePrevPersistsAcrossLinkUpUntilReplacedOrRestored},
+            {"brokenStoreIsHarmless", (Case) ImeWatchdogTest::brokenStoreIsHarmless},
+            {"createdWithNoLinkArmsWithPersistedPrev", (Case) ImeWatchdogTest::createdWithNoLinkArmsWithPersistedPrev},
+            {"createdWithNoLinkAndNoPrevFallsBack", (Case) ImeWatchdogTest::createdWithNoLinkAndNoPrevFallsBack},
+            {"createdWhileLinkedDoesNothing", (Case) ImeWatchdogTest::createdWhileLinkedDoesNothing},
+            {"createdUnlinkedThenLinkWithinGraceCancels", (Case) ImeWatchdogTest::createdUnlinkedThenLinkWithinGraceCancels},
+            {"createdUnlinkedKeepsAnOngoingLoss", (Case) ImeWatchdogTest::createdUnlinkedKeepsAnOngoingLoss},
+            {"switchThatTookReportsDone", (Case) ImeWatchdogTest::switchThatTookReportsDone},
             {"opsDispatch", (Case) ImeWatchdogTest::opsDispatch},
         };
         int failed = 0;

@@ -14,7 +14,8 @@ import android.view.inputmethod.InputMethodManager;
  * Lantern's hidden IME, selected by the helper for the length of a session: it draws nothing and
  * commits PC text ({@code ime} messages from the link) into the focused field. Hardware key events
  * pass through (no {@code onKeyDown} override). Every {@value #POLL_MS} ms it asks
- * {@link ImeState#WATCHDOG} whether to give the keyboard back after the helper's link was lost.
+ * {@link ImeState#WATCHDOG} whether to give the keyboard back after the helper's link was lost, or
+ * after it was created with no link up (a reboot or battery death mid-session).
  * Never logs typed text: only {@code ime op=<op> ok=<bool> len=<n>}.
  */
 public final class LanternIme extends InputMethodService {
@@ -35,8 +36,16 @@ public final class LanternIme extends InputMethodService {
         super.onCreate();
         handler = new Handler(Looper.getMainLooper());
         ImeState.ime = this;
+        PrefsPrevStore.install(this);
+        // Created with no helper link (e.g. the phone rebooted mid-session and the system bound the
+        // still-selected Lantern IME): nothing else will give the keyboard back, so arm the
+        // watchdog with the persisted ime_prev (or none: then the first other enabled keyboard).
+        String prev = ImeState.restoreTarget();
+        boolean armed = ImeState.WATCHDOG.createdUnlinked(SystemClock.elapsedRealtime(), prev);
         handler.postDelayed(poll, POLL_MS);
-        Log.i(Link.TAG, "ime created");
+        Log.i(Link.TAG, "ime created" + (armed ? "; no helper link: the keyboard is given back in "
+            + ImeWatchdog.DEFAULT_GRACE_MS + " ms unless the helper links (original "
+            + (prev != null ? "known" : "unknown: fallback") + ")" : ""));
     }
 
     @Override
@@ -101,6 +110,11 @@ public final class LanternIme extends InputMethodService {
         }
         ImeWatchdog.Action a = ImeState.WATCHDOG.due(SystemClock.elapsedRealtime(), current, this::enabledIds);
         if (a == null) {
+            return;
+        }
+        if (a.done) {
+            ImeState.restored(); // nothing left to give back: the persisted ime_prev is cleared
+            Log.i(Link.TAG, "ime_restore done");
             return;
         }
         if (a.id == null) {

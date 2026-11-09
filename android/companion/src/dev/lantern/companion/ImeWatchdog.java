@@ -5,17 +5,20 @@ import java.util.function.Supplier;
 
 /**
  * When the Lantern IME gives the keyboard back on its own (pure; {@link LanternIme} polls it). The
- * helper and its Cleanup normally restore the phone's keyboard; this covers the rest (e.g. the
- * helper and Cleanup both gone). After the helper's link is lost, {@link #due} says what to switch
- * to once {@code graceMs} passed, while the Lantern IME is the current one. A link that comes back
- * within the grace (a new session) cancels it.
+ * helper and its Cleanup normally restore the phone's keyboard; this covers the rest: the helper
+ * and Cleanup both gone, or a reboot or battery death mid-session, after which the system binds
+ * the still-selected Lantern IME with no helper at all. It arms when the helper's link is lost
+ * ({@link #linkLost}) or when the IME is created while no link is up ({@link #createdUnlinked});
+ * then {@link #due} says what to switch to once {@code graceMs} passed, while the Lantern IME is
+ * the current one. A link that comes up within the grace (a new session) cancels it.
  *
  * <p>A switch can fail (it throws, or is silently ignored: the original keyboard was uninstalled or
  * disabled), so after each switch it checks again {@link #RETRY_MS} later: if the Lantern IME is
  * still current it tries again, up to {@link #MAX_ATTEMPTS} times; then (or at once if the original
- * is not among the enabled keyboards) it falls back to the first enabled keyboard that is neither
- * Lantern's nor the original. A fallback that does not take, or no candidate, gives up (once, with a
- * reason to log). Thread-safe.
+ * is not among the enabled keyboards, or no original is known) it falls back to the first enabled
+ * keyboard that is neither Lantern's nor the original. A fallback that does not take, or no
+ * candidate, gives up (once, with a reason to log). A switch that took ends it with a
+ * {@link Action#done} action (once). Thread-safe.
  */
 final class ImeWatchdog {
     static final long DEFAULT_GRACE_MS = 5000;
@@ -26,22 +29,39 @@ final class ImeWatchdog {
     /** The Lantern IME: never a fallback. */
     static final String LANTERN_ID = "dev.lantern.companion/.LanternIme";
 
-    /** What to do now: switch to {@link #id} (the original, or a {@link #fallback}), or give up. */
+    /** What to do now: switch to {@link #id} (the original, or a {@link #fallback}), give up, or done. */
     static final class Action {
-        /** The keyboard to switch to; null when giving up. */
+        /** The keyboard to switch to; null when giving up or done. */
         final String id;
         final boolean fallback;
-        /** Why it gives up (to log), when {@link #id} is null. */
+        /** Why it gives up (to log), when {@link #id} is null and not {@link #done}. */
         final String giveUp;
+        /** The last switch took (another keyboard is current): the restore is over. */
+        final boolean done;
 
-        private Action(String id, boolean fallback, String giveUp) {
+        private Action(String id, boolean fallback, String giveUp, boolean done) {
             this.id = id;
             this.fallback = fallback;
             this.giveUp = giveUp;
+            this.done = done;
+        }
+
+        static Action switchTo(String id, boolean fallback) {
+            return new Action(id, fallback, null, false);
+        }
+
+        static Action giveUp(String why) {
+            return new Action(null, false, why, false);
+        }
+
+        static Action done() {
+            return new Action(null, false, null, true);
         }
     }
 
     private final long graceMs;
+    /** A helper link is up (between {@link #linkUp} and {@link #linkLost}). */
+    private boolean linked;
     private boolean down;
     /** When to act next (the end of the grace, then each retry). */
     private long nextAt;
@@ -60,12 +80,31 @@ final class ImeWatchdog {
 
     /** The helper linked: nothing to restore. */
     synchronized void linkUp() {
+        linked = true;
         down = false;
         prevIme = null;
     }
 
-    /** The link was lost at {@code nowMs}; {@code prevIme} is the last {@code ime_prev} (or null). */
+    /**
+     * The Lantern IME was created at {@code nowMs}. With no link up and nothing armed yet (e.g.
+     * after a reboot), arm as for a loss, with {@code prevIme} the persisted {@code ime_prev} (or
+     * null). True if it armed. A link that comes up within the grace cancels it, as for a loss.
+     */
+    synchronized boolean createdUnlinked(long nowMs, String prevIme) {
+        if (linked || down) {
+            return false;
+        }
+        arm(nowMs, prevIme);
+        return true;
+    }
+
+    /** The link was lost at {@code nowMs}; {@code prevIme} is the keyboard to give back (or null). */
     synchronized void linkLost(long nowMs, String prevIme) {
+        linked = false;
+        arm(nowMs, prevIme);
+    }
+
+    private void arm(long nowMs, String prevIme) {
         down = true;
         nextAt = nowMs + graceMs;
         this.prevIme = prevIme;
@@ -75,56 +114,64 @@ final class ImeWatchdog {
 
     /**
      * What to do now, or null. Nothing while the link is up, before the grace (or the next retry)
-     * is over, without a non-empty {@code prevIme}, or while another keyboard is current (before
-     * the first switch it stays armed; after a switch that means the switch took, which ends it).
-     * {@code enabled} (the enabled IME ids) is read only when about to act; if it cannot be read,
-     * the original is assumed enabled and no fallback is known.
+     * is over, or while another keyboard is current (before the first switch it stays armed; after
+     * a switch that means the switch took, which ends it with one {@link Action#done}). Without a
+     * non-empty {@code prevIme} it goes straight to the fallback. {@code enabled} (the enabled IME
+     * ids) is read only when about to act; if it cannot be read, the original is assumed enabled
+     * and no fallback is known.
      */
     synchronized Action due(long nowMs, boolean weAreCurrent, Supplier<List<String>> enabled) {
-        if (!down || nowMs < nextAt || prevIme == null || prevIme.isEmpty()) {
+        if (!down || nowMs < nextAt) {
             return null;
         }
         if (!weAreCurrent) {
             if (attempts > 0 || fallbackTried) {
                 end(); // the last switch took (or someone else picked a keyboard): done
+                return Action.done();
             }
             return null;
         }
         if (fallbackTried) {
             end();
-            return new Action(null, false, "fallback keyboard did not take");
+            return Action.giveUp("fallback keyboard did not take");
         }
+        boolean known = prevIme != null && !prevIme.isEmpty();
         List<String> list;
         try {
             list = enabled.get();
         } catch (RuntimeException e) {
             list = null;
         }
-        boolean prevEnabled = list == null || contains(list, prevIme);
+        boolean prevEnabled = known && (list == null || contains(list, prevIme));
         if (prevEnabled && attempts < MAX_ATTEMPTS) {
             attempts++;
             nextAt = nowMs + RETRY_MS;
-            return new Action(prevIme, false, null);
+            return Action.switchTo(prevIme, false);
         }
         String candidate = null;
         if (list != null) {
+            String original = known ? component(prevIme) : null;
             for (String id : list) {
+                if (id == null) {
+                    continue;
+                }
                 String c = component(id);
-                if (!c.equals(LANTERN_ID) && !c.equals(component(prevIme))) {
+                if (!c.equals(LANTERN_ID) && !c.equals(original)) {
                     candidate = id;
                     break;
                 }
             }
         }
         if (candidate == null) {
-            String why = prevEnabled ? "original keyboard did not take after " + attempts + " attempts"
+            String why = !known ? "no original keyboard known"
+                : prevEnabled ? "original keyboard did not take after " + attempts + " attempts"
                 : "original keyboard is not enabled";
             end();
-            return new Action(null, false, why + "; no other enabled keyboard");
+            return Action.giveUp(why + "; no other enabled keyboard");
         }
         fallbackTried = true;
         nextAt = nowMs + RETRY_MS;
-        return new Action(candidate, true, null);
+        return Action.switchTo(candidate, true);
     }
 
     private void end() {

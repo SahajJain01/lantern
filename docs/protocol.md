@@ -228,18 +228,31 @@ Keyboard on the link:
   keyboard, and `HIDE` otherwise (the keyboard-less fallback session). Under `HIDE` Android keeps
   the input connection on the launcher on display 0, so commits would never reach the app; under
   `LOCAL` any keyboard that draws (the phone's own) would appear inside the PC window.
-- Watchdog: when the link is lost, the IME (polling every 500 ms) switches to `ime_prev.id` once
-  5 s have passed, if the Lantern IME is still the current keyboard and the id is not `""`. A
-  link that comes back within the 5 s (a new session) cancels it, and every new link clears the
-  stored `ime_prev` (so a loss before the new session's `ime_prev` restores nothing). A link that
-  a newer one replaced does not count as lost.
+- The companion persists the last non-empty `ime_prev.id` in its device-protected storage
+  (readable before the first unlock), so it survives a reboot or battery death. An empty
+  `ime_prev` never erases it; the next non-empty one replaces it; a watchdog restore that took
+  clears it. Each new link marks the in-memory `ime_prev` stale but keeps the persisted one, so a
+  link lost before the new session's `ime_prev` still restores the previous original (checked
+  against the enabled keyboards, with the fallback below).
+- Watchdog: it arms when the link is lost, or when the Lantern IME is created while no link is up
+  (the phone rebooted or died mid-session: the setting survives, the helper and Cleanup do not,
+  and the system binds the still-selected Lantern IME). The IME (polling every 500 ms) then
+  switches to the restore target (this link's `ime_prev.id`, else the persisted one) once 5 s
+  have passed, if the Lantern IME is still the current keyboard. With no target known it goes
+  straight to the fallback below. A link that comes up within the 5 s (a new session) cancels
+  it. A link that a newer one replaced does not count as lost.
 - A watchdog switch that throws or does not take is retried every 2 s while the Lantern IME is
-  still current, up to 5 attempts. After that, or at once if `ime_prev.id` is not among the
-  enabled keyboards (`InputMethodManager.getEnabledInputMethodList()`), it switches to the first
-  enabled keyboard that is neither Lantern's nor the original, logging
+  still current, up to 5 attempts. After that, or at once if the target is not among the
+  enabled keyboards (`InputMethodManager.getEnabledInputMethodList()`) or no target is known, it
+  switches to the first enabled keyboard that is neither Lantern's nor the original, logging
   `ime_restored fallback=<id>`. A fallback that does not take, or no candidate, is logged
-  (`ime_restore gave up: <reason>`) and it stops. Once another keyboard is current after a
-  switch, it is done for that loss.
+  (`ime_restore gave up: <reason>`) and it stops; the Lantern keyboard then stays selected until
+  the next session ends or the user picks another keyboard. Once another keyboard is current
+  after a switch, it is done for that loss (`ime_restore done`, and the persisted target is
+  cleared).
+- The watchdog switches only `default_input_method` (the companion has no settings permission):
+  after a reboot mid-session, `enabled_input_methods` keeps the Lantern entry and the journal
+  stays on the phone until the next session, which restores both from it as usual.
 
 Catalogue on the link:
 

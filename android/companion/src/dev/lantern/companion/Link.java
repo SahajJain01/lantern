@@ -75,7 +75,9 @@ final class Link {
             client = c;
             linked = true;
             // A new session within the grace keeps its keyboard, and the previous session's
-            // ime_prev is dropped (this session sends its own if it selects the Lantern IME).
+            // ime_prev is marked stale (this session sends its own if it selects the Lantern IME;
+            // the persisted copy stays the restore target until then).
+            PrefsPrevStore.install(context);
             ImeState.linkUp();
             Log.i(TAG, "linked to the helper");
             // Callbacks are registered now; the catalogue is sent when the helper asks (sync).
@@ -91,8 +93,8 @@ final class Link {
             c.run(new LinkClient.Handler() {
                 @Override
                 public void imePrev(String id) {
-                    ImeState.prevIme = id;
-                    Log.i(TAG, "ime_prev stored");
+                    ImeState.imePrev(id); // persisted (device-protected) unless empty
+                    Log.i(TAG, "ime_prev stored" + (id == null || id.isEmpty() ? " (empty)" : ""));
                 }
 
                 @Override
@@ -133,7 +135,7 @@ final class Link {
                     if (linked) {
                         // Only the current link's loss counts: a link replaced by a newer one
                         // must not arm the watchdog against the new session's keyboard.
-                        ImeState.WATCHDOG.linkLost(SystemClock.elapsedRealtime(), ImeState.prevIme);
+                        ImeState.WATCHDOG.linkLost(SystemClock.elapsedRealtime(), ImeState.restoreTarget());
                         Log.i(TAG, "link lost; the keyboard is given back in "
                             + ImeWatchdog.DEFAULT_GRACE_MS + " ms unless the helper relinks");
                     }
