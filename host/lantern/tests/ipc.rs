@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt};
 use lantern::adb::{Adb, DeviceEvent};
+use lantern::clipboard::{ClipHandle, PcClipboard, PcOffer};
 use lantern::daemon::catalog::{Catalog, Dirs};
 use lantern::daemon::ipc;
 use lantern::daemon::session::{handshake, SessionConn};
@@ -193,6 +194,15 @@ fn start_daemon(port: Option<u16>) -> Daemon {
 
 /// [`start_daemon`] with a menu catalogue.
 fn start_daemon_with(port: Option<u16>, catalog: Option<Catalog>) -> Daemon {
+    start_daemon_full(port, catalog, None)
+}
+
+/// [`start_daemon_with`] plus a (fake) PC clipboard.
+fn start_daemon_full(
+    port: Option<u16>,
+    catalog: Option<Catalog>,
+    clipboard: Option<PcClipboard>,
+) -> Daemon {
     let rt = runtime_dir();
     let listener = ipc::bind(&rt).unwrap();
     let sock = ipc::socket_path_in(&rt);
@@ -212,6 +222,7 @@ fn start_daemon_with(port: Option<u16>, catalog: Option<Catalog>) -> Daemon {
     let task = tokio::spawn(serve_with_catalog(
         listener,
         catalog,
+        clipboard,
         None,
         events,
         starter,
@@ -1227,6 +1238,100 @@ async fn status_reports_companion_state() {
     assert_eq!(helper.next_session().await, 1);
     let report = status_until(&daemon.sock, |r| r.state == SessionState::Ready).await;
     assert_eq!(report.companion, None, "{report:?}");
+    daemon.shutdown().await;
+}
+
+fn pc_offer(text: &str, secret: bool) -> PcOffer {
+    PcOffer {
+        mimes: vec!["text/plain;charset=utf-8".into()],
+        text: Some(text.into()),
+        secret,
+    }
+}
+
+/// The next text the daemon put on the (fake) PC clipboard.
+async fn next_pc_set(rx: &std::sync::mpsc::Receiver<String>) -> String {
+    let deadline = Instant::now() + STEP;
+    loop {
+        if let Ok(text) = rx.try_recv() {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing was put on the PC clipboard"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// PC copies go to the phone as `clip` on stream 0, phone `clip`s land on the PC clipboard,
+/// and neither side's text is echoed back; secrets stay on the PC.
+#[tokio::test]
+async fn clipboard_syncs_both_ways_without_echo() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (handle, pc_sets) = ClipHandle::test_pair();
+    let (offers, offers_rx) = mpsc::channel(8);
+    let daemon = start_daemon_full(
+        Some(port),
+        None,
+        Some(PcClipboard {
+            handle,
+            offers: offers_rx,
+        }),
+    );
+    status_until(&daemon.sock, |r| r.state == SessionState::Ready).await;
+    helper.assert_quiet().await; // nothing is pushed at session start
+
+    offers.send(pc_offer("pc-1", false)).await.unwrap();
+    let got = helper.next().await;
+    assert_eq!(got.stream, 0);
+    assert_eq!(
+        decode(&got),
+        Control::Clip {
+            text: "pc-1".into()
+        }
+    );
+
+    helper.send(control(
+        0,
+        Control::Clip {
+            text: "phone-1".into(),
+        },
+    ));
+    assert_eq!(next_pc_set(&pc_sets).await, "phone-1");
+    // Our own selection comes back as a PC offer: not echoed to the phone.
+    offers.send(pc_offer("phone-1", false)).await.unwrap();
+    helper.assert_quiet().await;
+
+    offers.send(pc_offer("hunter2", true)).await.unwrap();
+    helper.assert_quiet().await;
+
+    offers.send(pc_offer("pc-2", false)).await.unwrap();
+    assert_eq!(
+        decode(&helper.next().await),
+        Control::Clip {
+            text: "pc-2".into()
+        }
+    );
+    daemon.shutdown().await;
+}
+
+/// A PC copy while no phone session is live goes nowhere (and is not replayed later).
+#[tokio::test]
+async fn clipboard_offer_without_session_is_dropped() {
+    let (handle, _pc_sets) = ClipHandle::test_pair();
+    let (offers, offers_rx) = mpsc::channel(8);
+    let daemon = start_daemon_full(
+        None,
+        None,
+        Some(PcClipboard {
+            handle,
+            offers: offers_rx,
+        }),
+    );
+    offers.send(pc_offer("nobody", false)).await.unwrap();
+    let report = status(&daemon.sock).await;
+    assert_eq!(report.state, SessionState::Idle);
     daemon.shutdown().await;
 }
 

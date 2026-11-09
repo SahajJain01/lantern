@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use lantern_proto::{
     read_frame_async, write_frame_async, CompanionState, Control, Frame, InputEvent, Kind,
-    SessionState, StatusReport, WindowInfo, MAX_IME_TEXT,
+    SessionState, StatusReport, WindowInfo, MAX_CLIP, MAX_IME_TEXT,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -29,6 +29,7 @@ use tokio::time::timeout;
 
 use super::catalog::{AppEntry, Catalog};
 use super::registry::{Claim, Registry};
+use crate::clipboard::{ClipHandle, ClipSync, PcOffer};
 
 /// Frames queued per client before it counts as stuck (~4 s of 60 fps video).
 pub const CLIENT_QUEUE: usize = 240;
@@ -312,6 +313,10 @@ pub struct Hub {
     catalog: Option<Catalog>,
     /// The live session's serial, for re-opening the catalogue sync window after `apps_end`.
     catalog_serial: Option<String>,
+    /// Where phone `clip`s go (the PC clipboard), if the daemon syncs it.
+    clip_out: Option<ClipHandle>,
+    /// Echo/secret/size suppression for the clipboard; reset with each session.
+    clip_sync: ClipSync,
 }
 
 impl Hub {
@@ -331,7 +336,52 @@ impl Hub {
             events,
             catalog: None,
             catalog_serial: None,
+            clip_out: None,
+            clip_sync: ClipSync::default(),
         }
+    }
+
+    /// Phone `clip`s are put on the PC clipboard through `handle`.
+    pub fn set_clipboard(&mut self, handle: ClipHandle) {
+        self.clip_out = Some(handle);
+    }
+
+    /// The PC selection changed while a session is live: its text goes to the phone as
+    /// `clip{text}` on stream 0 unless [`ClipSync::pc_changed`] suppresses it.
+    pub async fn on_pc_clip(
+        &mut self,
+        offer: PcOffer,
+        helper: &mpsc::Sender<Frame>,
+    ) -> Result<(), HelperWedged> {
+        match self.clip_sync.pc_changed(&offer) {
+            Some(text) => {
+                tracing::debug!(len = text.len(), "PC clipboard sent to the phone");
+                to_helper(helper, control(0, Control::Clip { text })).await
+            }
+            None => {
+                tracing::debug!(
+                    secret = offer.secret,
+                    len = offer.text.as_ref().map(String::len),
+                    "PC clipboard change not sent"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// A phone `clip`: onto the PC clipboard (never echoed back by [`Self::on_pc_clip`]).
+    fn on_phone_clip(&mut self, text: String) {
+        let len = text.len();
+        if text.is_empty() || len > MAX_CLIP {
+            tracing::warn!(len, "phone clip empty or over MAX_CLIP; ignored");
+            return;
+        }
+        let Some(out) = &self.clip_out else {
+            tracing::debug!(len, "phone clip ignored: no PC clipboard");
+            return;
+        };
+        tracing::debug!(len, "phone clipboard put on the PC");
+        out.set(self.clip_sync.from_phone(text));
     }
 
     /// Keeps `catalog` in step with the helper's catalogue messages.
@@ -737,6 +787,7 @@ impl Hub {
                     log_catalogue(&c);
                     self.on_catalogue(c);
                 }
+                Ok(Control::Clip { text }) => self.on_phone_clip(text),
                 // Never dump whole frames: some carry icons or clipboard text.
                 Ok(_) => tracing::debug!(
                     t = control_type(&frame.payload),
@@ -781,5 +832,6 @@ impl Hub {
         self.info.clear();
         self.registry = Registry::default();
         self.companion = None;
+        self.clip_sync = ClipSync::default();
     }
 }

@@ -194,7 +194,7 @@ final class ImeSetup {
 
         @Override
         public void clip(String text) {
-            // Task 9.
+            // Not a companion message: Main's extras send clip to ClipSync instead.
         }
     }
 }

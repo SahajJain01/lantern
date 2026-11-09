@@ -427,6 +427,51 @@ public final class RouterTest {
         }
     }
 
+    static void clipOnStream0ReachesExtras() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(recording(got)))) {
+            r.hello();
+            r.send(0, "{\"t\":\"clip\",\"text\":\"from-pc \u00e9\"}");
+            char[] max = new char[Proto.MAX_CLIP];
+            java.util.Arrays.fill(max, 'b');
+            r.send(0, "{\"t\":\"clip\",\"text\":\"" + new String(max) + "\"}"); // exactly MAX_CLIP: fine
+            Rig.await("2 clip calls", 2000, () -> got.size() == 2);
+            eq("clip from-pc \u00e9", got.get(0), "clip text");
+            eq("clip " + new String(max), got.get(1), "max-size clip");
+            r.open(1); // the session goes on
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+    }
+
+    static void clipOverLimitIsAnError() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(recording(got)))) {
+            r.hello();
+            char[] over = new char[Proto.MAX_CLIP];
+            java.util.Arrays.fill(over, 'a');
+            over[0] = '\u00e9'; // one UTF-8 byte over
+            r.send(0, "{\"t\":\"clip\",\"text\":\"" + new String(over) + "\"}");
+            Msg e = r.control(0);
+            eq("error", e.t, "error");
+            check(e.str("msg").contains("MAX_CLIP"), "msg names the limit: " + e.str("msg"));
+            check(!e.str("msg").contains("aaaa"), "msg never carries the text");
+            r.awaitExit(2000);
+            check(got.isEmpty(), "nothing reached extras");
+        }
+    }
+
+    static void clipOnWindowStreamIsAnError() throws Exception {
+        try (Rig r = new Rig()) {
+            r.hello();
+            r.open(1);
+            r.send(1, "{\"t\":\"clip\",\"text\":\"x\"}");
+            Msg e = r.control(0);
+            eq("error", e.t, "clip is stream-0 only");
+            r.awaitExit(2000);
+        }
+    }
+
     static void openThenCloseCallsFactoryAndClose() throws Exception {
         try (Rig r = new Rig()) {
             r.hello();
@@ -729,6 +774,9 @@ public final class RouterTest {
             {"imeForUnknownWindowIgnored", (Case) RouterTest::imeForUnknownWindowIgnored},
             {"imeUnknownOpIsAnError", (Case) RouterTest::imeUnknownOpIsAnError},
             {"imeTextOverLimitIsAnError", (Case) RouterTest::imeTextOverLimitIsAnError},
+            {"clipOnStream0ReachesExtras", (Case) RouterTest::clipOnStream0ReachesExtras},
+            {"clipOverLimitIsAnError", (Case) RouterTest::clipOverLimitIsAnError},
+            {"clipOnWindowStreamIsAnError", (Case) RouterTest::clipOnWindowStreamIsAnError},
             {"openThenCloseCallsFactoryAndClose", (Case) RouterTest::openThenCloseCallsFactoryAndClose},
             {"openedSaysMovedForAnExistingTask", (Case) RouterTest::openedSaysMovedForAnExistingTask},
             {"openedCarriesLabelAndWork", (Case) RouterTest::openedCarriesLabelAndWork},

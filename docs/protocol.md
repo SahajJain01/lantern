@@ -126,7 +126,23 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
   connect"`, or `"keyboard switch failed: <reason>"` when the companion linked but selecting its
   keyboard failed (the catalogue still syncs; only PC text input is missing). Without the
   companion the session still works, with no catalogue and no PC text input.
-- `clip` carries plain text only; each side suppresses echoing back the text it just received.
+- `clip` carries plain text only, on stream 0, and only changes sync: nothing is pushed when a
+  session starts. Each side remembers the text last synced either way (received, or sent) and
+  does not send a change to that same text: setting a clipboard fires its own change
+  notification, Android may fire its listener more than once per copy, and Klipper may re-own
+  the PC selection with the same text. Copying an older text again after the other side changed
+  is still sent. Neither side sends empty
+  text or text over `MAX_CLIP`; a `clip` from lanternd over `MAX_CLIP` is a protocol error on
+  the helper (checked before anything else). `clip` on a window stream is a protocol error.
+- Secrets stay put: the helper never sends a phone clip whose description has the extra
+  `android.content.extra.IS_SENSITIVE = true`; lanternd never sends a PC selection that offers
+  `x-kde-passwordManagerHint` with content `secret` (or whose hint can't be read).
+- lanternd reads the PC clipboard (the regular selection only, never the primary selection)
+  through `ext_data_control_v1` on its own thread and connection, preferring the mime types
+  `text/plain;charset=utf-8`, `UTF8_STRING`, `text/plain` in that order, and offers all three
+  when it sets the selection. Each read has a 1 s timeout and a `MAX_CLIP + 1` byte cap. The
+  helper listens for phone clipboard changes on its own `lantern-clip` Looper thread, from the
+  session-up hook until teardown. Neither side ever logs clipboard text, only its length.
 
 ## Companion link (helper ↔ companion)
 

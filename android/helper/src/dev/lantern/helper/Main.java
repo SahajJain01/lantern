@@ -171,10 +171,28 @@ public final class Main {
                 Droid::log);
             routerRef[0] = router;
             java.util.concurrent.ExecutorService imeSender = ImeSetup.Relay.executor(ImeSetup.RELAY_QUEUE);
-            router.setExtras(new ImeSetup.Relay(m -> {
+            ImeSetup.Relay ime = new ImeSetup.Relay(m -> {
                 CompanionLink l = companionRef[0];
                 return l != null && l.send(m);
-            }, Droid::log, imeSender));
+            }, Droid::log, imeSender);
+            // Clipboard sync (Task 9): phone copies go to lanternd as clip{text} on stream 0, the
+            // PC's clip{text} lands on the phone, each without echoing the other's text back.
+            PhoneClipboard phoneClip = new PhoneClipboard(Droid::log);
+            ClipSync clipSync = new ClipSync(text -> {
+                Droid.log("clip: phone copy (" + text.length() + " chars) sent to the PC");
+                router.sendSession(Msg.of("clip").put("text", text));
+            }, phoneClip::write);
+            router.setExtras(new Router.Extras() {
+                @Override
+                public void ime(String op, String text) {
+                    ime.ime(op, text);
+                }
+
+                @Override
+                public void clip(String text) {
+                    clipSync.fromHost(text);
+                }
+            });
             router.setLabels((pkg, user) -> {
                 CompanionLink l = companionRef[0];
                 return l == null ? null : l.label(pkg, user);
@@ -188,11 +206,14 @@ public final class Main {
                 if (l != null) {
                     l.startSync();
                 }
+                // Only changes sync: nothing is pushed at session start.
+                phoneClip.start(clipSync);
             });
             try {
                 router.run();
             } finally {
                 imeSender.shutdownNow();
+                phoneClip.close();
             }
         } catch (java.io.IOException e) {
             Droid.log("serve: " + e);

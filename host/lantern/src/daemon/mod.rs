@@ -20,6 +20,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::Instant;
 
 use crate::adb::{track_devices, Adb, DeviceEvent};
+use crate::clipboard::{PcClipboard, PcOffer};
 use crate::daemon::session::{start_with_companion, HandshakeError};
 
 fn select_serial(configured: Option<&str>, connected: &HashSet<String>) -> Option<String> {
@@ -88,6 +89,7 @@ fn cancel_start<F>(starting: &mut Starting<F>, why: &str) {
 pub async fn serve_with_catalog<E, S, F, D>(
     listener: UnixListener,
     catalog: Option<catalog::Catalog>,
+    clipboard: Option<PcClipboard>,
     configured: Option<String>,
     events: E,
     starter: S,
@@ -104,8 +106,12 @@ where
     if let Some(catalog) = catalog {
         hub.set_catalog(catalog);
     }
+    let offers = clipboard.map(|clipboard| {
+        hub.set_clipboard(clipboard.handle);
+        clipboard.offers
+    });
     let path = hub.socket_path();
-    let result = drive(hub, configured, events, starter, shutdown, policy).await;
+    let result = drive(hub, offers, configured, events, starter, shutdown, policy).await;
     if let Some(path) = path {
         let _ = std::fs::remove_file(path);
     }
@@ -129,6 +135,7 @@ where
 {
     drive(
         Hub::new(None),
+        None,
         configured,
         events,
         starter,
@@ -156,7 +163,7 @@ where
     D: Future<Output = &'static str>,
 {
     serve_with_catalog(
-        listener, None, configured, events, starter, shutdown, policy,
+        listener, None, None, configured, events, starter, shutdown, policy,
     )
     .await
 }
@@ -164,8 +171,10 @@ where
 /// Every branch is polled concurrently: a session start in flight never blocks shutdown, device
 /// events or clients, and helper death is noticed through `SessionConn::closed`. The live
 /// session's inbound frames are always drained (routed to window clients).
+#[allow(clippy::too_many_arguments)]
 async fn drive<E, S, F, D>(
     mut hub: Hub,
+    mut offers: Option<tokio::sync::mpsc::Receiver<PcOffer>>,
     configured: Option<String>,
     events: E,
     mut starter: S,
@@ -280,6 +289,21 @@ where
                     ended = Some("helper stopped reading");
                 }
             }
+            offer = async { offers.as_mut().expect("guarded").recv().await }, if offers.is_some() => {
+                match offer {
+                    // Only while a session is live: nothing is queued for a later session.
+                    Some(offer) => if let Some((session, _)) = active.as_ref() {
+                        let helper = session.tx.clone();
+                        if hub.on_pc_clip(offer, &helper).await.is_err() {
+                            ended = Some("helper stopped reading");
+                        }
+                    },
+                    None => {
+                        tracing::warn!("PC clipboard thread ended; clipboard sync off");
+                        offers = None;
+                    }
+                }
+            }
             inbound = async { active.as_mut().expect("guarded").0.next().await }, if active.is_some() => {
                 match inbound {
                     Inbound::Frame(frame) => {
@@ -354,9 +378,16 @@ pub async fn run() -> Result<()> {
             None
         }
     };
+    // The PC clipboard: its own Wayland thread, never on this runtime.
+    let (offer_tx, offers) = tokio::sync::mpsc::channel(16);
+    let clipboard = PcClipboard {
+        handle: crate::clipboard::wayland::spawn(offer_tx),
+        offers,
+    };
     serve_with_catalog(
         listener,
         catalog,
+        Some(clipboard),
         configured,
         track_devices(),
         move |serial| {

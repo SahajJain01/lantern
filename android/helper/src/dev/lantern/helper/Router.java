@@ -319,6 +319,9 @@ public final class Router {
                 case "error":
                     log.accept("router: host error: " + m.fields().get("msg"));
                     return false;
+                case "clip":
+                    clip(m);
+                    return true;
                 default:
                     throw new ProtocolError(m.t + " is not valid on stream 0");
             }
@@ -480,6 +483,24 @@ public final class Router {
             extras.ime(op, t);
         } catch (RuntimeException e) {
             log.accept("router: ime win=" + win + " op=" + op + " failed: " + e);
+        }
+    }
+
+    /**
+     * {@code clip{text}} on stream 0 (the PC's clipboard) goes to {@link Extras#clip}. A text over
+     * {@link Proto#MAX_CLIP} UTF-8 bytes is a protocol error (lanternd never sends one). Never logs
+     * the text.
+     */
+    private void clip(Msg m) throws ProtocolError {
+        String t = text(m, "text");
+        int bytes = utf8Length(t);
+        if (bytes > Proto.MAX_CLIP) {
+            throw new ProtocolError("clip.text of " + bytes + " bytes exceeds MAX_CLIP");
+        }
+        try {
+            extras.clip(t);
+        } catch (RuntimeException e) {
+            log.accept("router: clip of " + bytes + " bytes failed: " + e);
         }
     }
 
