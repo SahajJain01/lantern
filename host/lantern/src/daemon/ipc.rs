@@ -315,6 +315,7 @@ impl Hub {
             serial,
             helper,
             windows,
+            companion: None,
         }
     }
 

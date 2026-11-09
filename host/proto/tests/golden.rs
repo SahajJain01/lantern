@@ -18,6 +18,12 @@
 //!                     payload = {"t":"opened","display":19,"task":18475,"codec":"h264","w":1280,"h":800,"moved":true}
 //! control_focus.bin : kind=Control(1), stream=1, Control::Focus { activation_token: None }
 //!                     payload = {"t":"focus"}
+//! control_ime.bin   : kind=Control(1), stream=1, Control::Ime { op: Compose, text: "việ" }
+//!                     payload = {"t":"ime","op":"compose","text":"việ"}  (raw UTF-8, no \u escapes)
+//! control_app.bin   : kind=Control(1), stream=0,
+//!                     Control::App { pkg: "com.android.settings", user: 10, label: "Settings",
+//!                                    work: true, icon: "iVBORw0KGgo=" }
+//!                     payload = {"t":"app","pkg":"com.android.settings","user":10,"label":"Settings","work":true,"icon":"iVBORw0KGgo="}
 //! input_pointer.bin : kind=Input(3), stream=1,
 //!                     InputEvent::Pointer { action: Move(2), id: 7, x: 0.25, y: 0.75, buttons: 1, pressure: 0.5 }
 //! input_key.bin     : kind=Input(3), stream=1,
@@ -95,7 +101,26 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         ),
         ("input_key", frame_bytes(Kind::Input, 1, key.encode())),
         ("video_key", frame_bytes(Kind::Video, 1, video.encode())),
+        ("control_ime", frame_bytes(Kind::Control, 1, ime().encode())),
+        ("control_app", frame_bytes(Kind::Control, 0, app().encode())),
     ]
+}
+
+fn ime() -> Control {
+    Control::Ime {
+        op: ImeOp::Compose,
+        text: "việ".into(),
+    }
+}
+
+fn app() -> Control {
+    Control::App {
+        pkg: "com.android.settings".into(),
+        user: 10,
+        label: "Settings".into(),
+        work: true,
+        icon: "iVBORw0KGgo=".into(),
+    }
 }
 
 fn open_settings(activation_token: Option<&str>) -> Control {
@@ -117,6 +142,8 @@ fn opened(moved: bool) -> Control {
         w: 1280,
         h: 800,
         moved,
+        label: None,
+        work: false,
     }
 }
 
@@ -179,6 +206,20 @@ fn golden_files_decode() {
                 InputEvent::decode(&f.payload).unwrap();
             }
             "video_key" => assert!(VideoPacket::decode(&f.payload).unwrap().key),
+            "control_ime" => {
+                assert_eq!(
+                    f.payload,
+                    r#"{"t":"ime","op":"compose","text":"việ"}"#.as_bytes()
+                );
+                assert_eq!(Control::decode(&f.payload).unwrap(), ime());
+            }
+            "control_app" => {
+                assert_eq!(
+                    f.payload,
+                    br#"{"t":"app","pkg":"com.android.settings","user":10,"label":"Settings","work":true,"icon":"iVBORw0KGgo="}"#
+                );
+                assert_eq!(Control::decode(&f.payload).unwrap(), app());
+            }
             _ => unreachable!(),
         }
     }

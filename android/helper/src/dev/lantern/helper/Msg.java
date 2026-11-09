@@ -14,9 +14,13 @@ import java.util.Set;
  * JSON lives in a {@link ControlCodec} ({@link Control} on the device).
  */
 public final class Msg {
-    /** Every {@code t} protocol v1 defines. */
+    /**
+     * Every {@code t} protocol v1 defines between the helper and lanternd (the host-only
+     * {@code status}/{@code status_report} never reach the helper).
+     */
     public static final Set<String> TYPES = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
-        "hello", "open", "opened", "resize", "resized", "focus", "close", "closed", "error", "bye")));
+        "hello", "open", "opened", "resize", "resized", "focus", "close", "closed", "error", "bye",
+        "app", "apps_end", "app_removed", "companion", "clip", "ime")));
 
     public final String t;
     private final Map<String, Object> fields = new LinkedHashMap<>();

@@ -11,6 +11,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Largest payload accepted on either side (8 MiB).
 pub const MAX_PAYLOAD: u32 = 8 << 20;
 
+/// Largest `clip.text`, in UTF-8 bytes (1 MiB). Larger clipboard text is not sent.
+pub const MAX_CLIP: usize = 1 << 20;
+
+/// Largest `ime.text`, in UTF-8 bytes (64 KiB).
+pub const MAX_IME_TEXT: usize = 1 << 16;
+
+/// Largest icon PNG for `app.icon`, in bytes before base64 (1 MiB). A larger icon is sent as `""`.
+pub const MAX_ICON: usize = 1 << 20;
+
 /// Bytes covered by `len` that are not payload: `u8 kind` + `u32 stream`.
 const HEADER_AFTER_LEN: u32 = 5;
 
@@ -192,6 +201,12 @@ pub enum Control {
         /// wire when false, so a v1 `opened` is byte-identical.
         #[serde(default, skip_serializing_if = "is_false")]
         moved: bool,
+        /// The app's launcher label, for the window title. Absent when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// The app runs in a work (managed) profile. Absent when false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        work: bool,
     },
     Resize {
         w: u32,
@@ -226,6 +241,60 @@ pub enum Control {
     Status,
     /// Host-only: lanternd's answer to [`Control::Status`].
     StatusReport(StatusReport),
+    /// Helper -> daemon, stream 0: one launcher app of the catalogue. `icon` is a base64 PNG
+    /// (at most [`MAX_ICON`] bytes before base64) or `""`.
+    App {
+        pkg: String,
+        user: u32,
+        label: String,
+        /// Absent when false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        work: bool,
+        icon: String,
+    },
+    /// Helper -> daemon, stream 0: a full catalogue of `count` `app` messages was just sent.
+    AppsEnd {
+        count: u32,
+    },
+    /// Helper -> daemon, stream 0: the app is gone for that user.
+    AppRemoved {
+        pkg: String,
+        user: u32,
+    },
+    /// Helper -> daemon, stream 0: whether the companion app is linked.
+    Companion {
+        state: CompanionState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg: Option<String>,
+    },
+    /// Stream 0, both directions: clipboard text (at most [`MAX_CLIP`] bytes).
+    Clip {
+        text: String,
+    },
+    /// Window stream N, window -> daemon -> helper: text input (at most [`MAX_IME_TEXT`] bytes).
+    /// `finish` carries `text: ""`.
+    Ime {
+        op: ImeOp,
+        text: String,
+    },
+}
+
+/// Whether the companion app is linked to the helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionState {
+    Ready,
+    Unavailable,
+}
+
+/// `commit` inserts text; `compose` replaces the composing region (preedit); `finish` ends
+/// composition, keeping the composing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImeOp {
+    Commit,
+    Compose,
+    Finish,
 }
 
 /// The daemon's phone session, as `lantern status` reports it.
@@ -248,13 +317,16 @@ pub struct WindowInfo {
 }
 
 /// `serial` is the session's device (`null` when idle); `helper` is the live helper jar's
-/// SHA-256 (`null` unless ready). `windows` are the open windows, by id.
+/// SHA-256 (`null` unless ready). `windows` are the open windows, by id. `companion` is optional.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReport {
     pub state: SessionState,
     pub serial: Option<String>,
     pub helper: Option<String>,
     pub windows: Vec<WindowInfo>,
+    /// The companion link's state while `ready`; absent otherwise (so a v1 report is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion: Option<CompanionState>,
 }
 
 impl Control {
@@ -618,6 +690,7 @@ mod tests {
                 pkg: "com.android.settings".into(),
                 user: 0,
             }],
+            companion: None,
         });
         let json = r#"{"t":"status_report","state":"ready","serial":"20e9318","helper":"ab12","windows":[{"id":1,"pkg":"com.android.settings","user":0}]}"#;
         assert_eq!(String::from_utf8(report.encode()).unwrap(), json);
@@ -627,6 +700,7 @@ mod tests {
             serial: None,
             helper: None,
             windows: vec![],
+            companion: None,
         });
         assert_eq!(
             String::from_utf8(idle.encode()).unwrap(),
@@ -722,6 +796,8 @@ mod tests {
             w: 1280,
             h: 800,
             moved,
+            label: None,
+            work: false,
         };
         assert_eq!(serde_json::to_string(&opened(false)).unwrap(), v1);
         assert_eq!(serde_json::from_str::<Control>(v1).unwrap(), opened(false));
@@ -747,6 +823,8 @@ mod tests {
                 w: 1280,
                 h: 800,
                 moved: false,
+                label: None,
+                work: false,
             },
             Control::Opened {
                 display: 12,
@@ -755,6 +833,8 @@ mod tests {
                 w: 1280,
                 h: 800,
                 moved: true,
+                label: None,
+                work: false,
             },
             Control::Resize { w: 1, h: 2, dpi: 3 },
             Control::Resized { w: 4, h: 5 },
@@ -773,6 +853,172 @@ mod tests {
             let s = serde_json::to_string(&c).unwrap();
             assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), c);
         }
+    }
+
+    fn opened_v2(label: Option<&str>, work: bool) -> Control {
+        Control::Opened {
+            display: 12,
+            task: 7,
+            codec: "h264".into(),
+            w: 1280,
+            h: 800,
+            moved: false,
+            label: label.map(str::to_owned),
+            work,
+        }
+    }
+
+    #[test]
+    fn opened_without_label_is_v1_bytes() {
+        let v1 = r#"{"t":"opened","display":12,"task":7,"codec":"h264","w":1280,"h":800}"#;
+        assert_eq!(serde_json::to_string(&opened_v2(None, false)).unwrap(), v1);
+        assert_eq!(
+            serde_json::from_str::<Control>(v1).unwrap(),
+            opened_v2(None, false)
+        );
+        let full = opened_v2(Some("Settings"), true);
+        let s = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"opened","display":12,"task":7,"codec":"h264","w":1280,"h":800,"label":"Settings","work":true}"#
+        );
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), full);
+    }
+
+    #[test]
+    fn ime_json_shape() {
+        let c = Control::Ime {
+            op: ImeOp::Compose,
+            text: "việ".into(),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(s, r#"{"t":"ime","op":"compose","text":"việ"}"#);
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), c);
+        for (op, name) in [
+            (ImeOp::Commit, "commit"),
+            (ImeOp::Compose, "compose"),
+            (ImeOp::Finish, "finish"),
+        ] {
+            assert_eq!(serde_json::to_string(&op).unwrap(), format!("\"{name}\""));
+        }
+        assert_eq!(
+            Control::Ime {
+                op: ImeOp::Finish,
+                text: String::new()
+            }
+            .encode(),
+            br#"{"t":"ime","op":"finish","text":""}"#
+        );
+        assert!(Control::decode(br#"{"t":"ime","op":"paste","text":""}"#).is_err());
+    }
+
+    #[test]
+    fn clip_roundtrip_unicode() {
+        let text = "Grüße, việt 日本語 🎉\n\t\"quoted\" \\ \u{0}";
+        let c = Control::Clip { text: text.into() };
+        let b = c.encode();
+        assert_eq!(Control::decode(&b).unwrap(), c);
+        assert!(String::from_utf8(b)
+            .unwrap()
+            .starts_with(r#"{"t":"clip","text":""#));
+    }
+
+    #[test]
+    fn app_json_shape() {
+        let app = |work| Control::App {
+            pkg: "com.android.settings".into(),
+            user: 0,
+            label: "Settings".into(),
+            work,
+            icon: String::new(),
+        };
+        let s = serde_json::to_string(&app(false)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"app","pkg":"com.android.settings","user":0,"label":"Settings","icon":""}"#
+        );
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), app(false));
+        let s = serde_json::to_string(&app(true)).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"app","pkg":"com.android.settings","user":0,"label":"Settings","work":true,"icon":""}"#
+        );
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), app(true));
+    }
+
+    #[test]
+    fn catalogue_and_companion_shapes() {
+        let cases: Vec<(Control, &str)> = vec![
+            (
+                Control::AppsEnd { count: 42 },
+                r#"{"t":"apps_end","count":42}"#,
+            ),
+            (
+                Control::AppRemoved {
+                    pkg: "com.x".into(),
+                    user: 10,
+                },
+                r#"{"t":"app_removed","pkg":"com.x","user":10}"#,
+            ),
+            (
+                Control::Companion {
+                    state: CompanionState::Ready,
+                    msg: None,
+                },
+                r#"{"t":"companion","state":"ready"}"#,
+            ),
+            (
+                Control::Companion {
+                    state: CompanionState::Unavailable,
+                    msg: Some("not installed".into()),
+                },
+                r#"{"t":"companion","state":"unavailable","msg":"not installed"}"#,
+            ),
+        ];
+        for (c, json) in cases {
+            assert_eq!(String::from_utf8(c.encode()).unwrap(), json);
+            assert_eq!(Control::decode(json.as_bytes()).unwrap(), c);
+        }
+    }
+
+    #[test]
+    fn status_report_companion_is_optional() {
+        let mut r = StatusReport {
+            state: SessionState::Ready,
+            serial: None,
+            helper: None,
+            windows: vec![],
+            companion: None,
+        };
+        let v1 =
+            r#"{"t":"status_report","state":"ready","serial":null,"helper":null,"windows":[]}"#;
+        assert_eq!(
+            String::from_utf8(Control::StatusReport(r.clone()).encode()).unwrap(),
+            v1
+        );
+        assert_eq!(
+            Control::decode(v1.as_bytes()).unwrap(),
+            Control::StatusReport(r.clone())
+        );
+        r.companion = Some(CompanionState::Unavailable);
+        let s = String::from_utf8(Control::StatusReport(r.clone()).encode()).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"status_report","state":"ready","serial":null,"helper":null,"windows":[],"companion":"unavailable"}"#
+        );
+        assert_eq!(
+            Control::decode(s.as_bytes()).unwrap(),
+            Control::StatusReport(r)
+        );
+    }
+
+    #[test]
+    fn text_limits() {
+        assert_eq!(MAX_CLIP, 1 << 20);
+        assert_eq!(MAX_IME_TEXT, 1 << 16);
+        assert_eq!(MAX_ICON, 1 << 20);
+        // A maximal clip still fits one frame even if every byte becomes a 6-byte `\u00XX` escape.
+        const { assert!(6 * MAX_CLIP + 64 <= MAX_PAYLOAD as usize) };
     }
 
     #[test]

@@ -470,6 +470,7 @@ impl App {
                 w,
                 h,
                 moved,
+                ..
             } if self.state.win().is_none() => {
                 tracing::info!(win = stream, phone_display, task, %codec, w, h, moved, "opened");
                 if moved {

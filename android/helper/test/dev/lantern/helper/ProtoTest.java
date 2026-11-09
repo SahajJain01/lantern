@@ -81,6 +81,42 @@ public final class ProtoTest {
         check(m.fields().isEmpty(), "no fields");
     }
 
+    /** ime{op,text} from a window: raw UTF-8 text ("việ"), decoded with op and text intact. */
+    static void goldenImeMatchesRust() throws Exception {
+        Proto.Frame f = readOnly("control_ime");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(1, f.stream, "stream");
+        Msg m = new TestCodec().decode(f.payload);
+        eq("ime", m.t, "t");
+        check(Msg.TYPES.contains(m.t), "ime is a known type");
+        eq("compose", m.str("op"), "op");
+        eq("vi\u1ec7", m.str("text"), "text");
+        eq(new String(f.payload, StandardCharsets.UTF_8), new String(new TestCodec().encode(
+            Msg.of("ime").put("op", "compose").put("text", "vi\u1ec7")), StandardCharsets.UTF_8), "json");
+    }
+
+    /** The helper's app message (Task 5 builds it) encodes exactly as the Rust side expects. */
+    static void goldenAppMatchesRust() throws Exception {
+        Proto.Frame f = readOnly("control_app");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(0, f.stream, "stream");
+        Msg m = Msg.of("app").put("pkg", "com.android.settings").put("user", 10).put("label", "Settings")
+            .put("work", Boolean.TRUE).put("icon", "iVBORw0KGgo=");
+        eq(new String(f.payload, StandardCharsets.UTF_8), new String(new TestCodec().encode(m), StandardCharsets.UTF_8),
+            "json");
+        check(Msg.TYPES.contains("app"), "app is a known type");
+    }
+
+    static void newTypesAndLimits() {
+        for (String t : new String[] {"app", "apps_end", "app_removed", "companion", "clip", "ime"}) {
+            check(Msg.TYPES.contains(t), t + " in Msg.TYPES");
+        }
+        check(!Msg.TYPES.contains("ime_prev"), "ime_prev is link-only (Task 3)");
+        eq(1 << 20, Proto.MAX_CLIP, "MAX_CLIP");
+        eq(1 << 16, Proto.MAX_IME_TEXT, "MAX_IME_TEXT");
+        eq(1 << 20, Proto.MAX_ICON, "MAX_ICON");
+    }
+
     static void goldenInputPointerMatchesRust() throws IOException {
         Proto.Frame f = readOnly("input_pointer");
         eq(Proto.KIND_INPUT, f.kind, "kind");
@@ -246,6 +282,9 @@ public final class ProtoTest {
             {"goldenControlOpenWithTokenParses", (Case) ProtoTest::goldenControlOpenWithTokenParses},
             {"goldenControlOpenedMovedMatchesRust", (Case) ProtoTest::goldenControlOpenedMovedMatchesRust},
             {"goldenControlFocusMatchesRust", (Case) ProtoTest::goldenControlFocusMatchesRust},
+            {"goldenImeMatchesRust", (Case) ProtoTest::goldenImeMatchesRust},
+            {"goldenAppMatchesRust", (Case) ProtoTest::goldenAppMatchesRust},
+            {"newTypesAndLimits", (Case) ProtoTest::newTypesAndLimits},
             {"goldenInputPointerMatchesRust", (Case) ProtoTest::goldenInputPointerMatchesRust},
             {"goldenInputKeyMatchesRust", (Case) ProtoTest::goldenInputKeyMatchesRust},
             {"goldenVideoKeyMatchesRust", (Case) ProtoTest::goldenVideoKeyMatchesRust},

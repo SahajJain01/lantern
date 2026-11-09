@@ -37,7 +37,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 |---|---|
 | `hello` | `version: u32`, `token: string` |
 | `open` | `pkg: string`, `user: u32` (Android user/profile id, `0..=i32::MAX`), `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string` |
-| `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32`, optional `moved: bool` (absent = false) |
+| `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32`, optional `moved: bool` (absent = false), optional `label: string` (the app's launcher label), optional `work: bool` (absent = false; the app runs in a work profile) |
 | `resize` | `w: u32`, `h: u32`, `dpi: u32` |
 | `resized` | `w: u32`, `h: u32` |
 | `focus` | optional `activation_token: string` |
@@ -45,6 +45,12 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `closed` | `reason`: one of `"closed"`, `"app_exited"`, `"error"` |
 | `error` | `msg: string`, optional `code: string`, optional `version: u32` |
 | `bye` | none |
+| `app` | `pkg: string`, `user: u32`, `label: string`, optional `work: bool` (absent = false), `icon: string` (base64 PNG, or `""`). Helper → daemon, stream 0 |
+| `apps_end` | `count: u32` (the number of `app` messages in the full catalogue just sent). Helper → daemon, stream 0 |
+| `app_removed` | `pkg: string`, `user: u32`. Helper → daemon, stream 0 |
+| `companion` | `state`: one of `"ready"`, `"unavailable"`; optional `msg: string`. Helper → daemon, stream 0 |
+| `clip` | `text: string`. Stream 0, both directions |
+| `ime` | `op`: one of `"commit"`, `"compose"`, `"finish"`; `text: string` (`""` for `finish`). Window stream `N`, window → daemon → helper |
 
 ## Session rules (phone helper)
 
@@ -89,6 +95,64 @@ JSON objects tagged by `"t"` (snake_case). Example:
 
 Pause/resume (Plan 3) will be added within protocol v1, without a version bump: the helper jar is
 embedded in and deployed by `lanternd`, so both sides always ship together.
+
+`label` and `work` on `opened`, `work` on `app`, and `msg` on `companion` are omitted when absent
+(`work` when false), so an `opened` without them is still the v1 bytes.
+
+## Text, clipboard, catalogue rules
+
+- Size limits, in UTF-8 bytes of the JSON string value (before escaping), the same constants on
+  both sides (`lantern_proto::MAX_*`, `Proto.MAX_*`):
+  - `clip.text`: at most `MAX_CLIP = 1 << 20` (1 MiB). Larger clipboard text is not sent.
+  - `ime.text`: at most `MAX_IME_TEXT = 1 << 16` (64 KiB). Longer input is split into several
+    `commit`s on character boundaries by the window. The daemon does not forward a larger `ime`
+    (a protocol error for that client); the helper treats one as a protocol error.
+  - `app.icon`: the PNG is at most `MAX_ICON = 1 << 20` bytes (1 MiB) before base64; a larger
+    icon is sent as `""`.
+- `ime` ops: `commit` inserts `text` at the cursor (replacing any composing text); `compose` sets
+  the composing (preedit) text to `text` (`""` clears it); `finish` ends composition, keeping the
+  composing text, and carries `text: ""`.
+- `ime` is only meaningful for a live window: the helper drops (logs and ignores) an `ime` for a
+  window that is unknown, closing or already closed, like any other window frame. An unknown `op`
+  is a protocol error.
+- Catalogue: after the companion links, the helper relays a full catalogue (one `app` per launcher
+  app per profile, then `apps_end{count}`), then live `app` (added or changed) and `app_removed`
+  messages. A full catalogue whose `apps_end.count` matches the `app` messages received replaces
+  the previous one (apps missing from it are removed); a partial one (the link dropped mid-list,
+  or the count differs) removes nothing.
+- `companion{state}` is sent after the hello reply: `"ready"` when the companion linked,
+  `"unavailable"` (with a `msg`) when it did not. Without the companion the session still works,
+  with no catalogue and no PC text input.
+- `clip` carries plain text only; each side suppresses echoing back the text it just received.
+
+## Companion link (helper ↔ companion)
+
+The helper talks to the companion app (`dev.lantern.companion`, shipped inside `lantern` with the
+helper jar) over its own connection, never through lanternd. It uses the same frames as above,
+all on stream 0, with control JSON.
+
+1. The helper listens on the abstract Unix socket `lantern-c-<16 hex>` and makes a separate
+   32-hex link token (not the session token).
+2. It sends `am broadcast --user 0 -n dev.lantern.companion/.LinkReceiver -a
+   dev.lantern.companion.LINK --es socket <name> --es token <token>`. The receiver requires
+   `android.permission.DUMP`, so only the shell can send it.
+3. The companion connects and sends `hello{version:1, token}`.
+4. The helper answers `hello{version:1, token:""}`.
+5. A connection whose first frame is not a `hello` with the right version and token is closed.
+   The helper keeps accepting until its deadline. One authenticated companion is linked at a
+   time: a new authenticated one replaces the old.
+
+Messages on the link:
+
+| direction | `t` | fields |
+|---|---|---|
+| companion → helper | `app`, `apps_end`, `app_removed` | as above; the helper relays them to lanternd on stream 0 |
+| helper → companion | `ime` | `op`, `text`, as above (the helper forwards a window's `ime`) |
+| helper → companion | `ime_prev` | `id: string`: the keyboard to restore if the link is lost (the session journal's original `default_input_method`, or `""`) |
+
+`ime_prev` is link-only: it never travels between the helper and lanternd. The helper sends it
+once the session's journal exists, and again to a newly linked companion. Any other `t` from the
+companion is logged and dropped.
 
 `activation_token` is an XDG activation token used only between `lanternd` and window clients.
 It is omitted from the JSON when absent (so `{"t":"focus"}` is the plain focus), the daemon never
@@ -136,6 +200,8 @@ Host-only; the helper never sees these, and the daemon never forwards them.
   and handshake in flight; `"ready"`: live session), `serial` (the device being started or served,
   else `null`), `helper` (the live helper jar's SHA-256 when `ready`, else `null`) and `windows`:
   `[{id: u32, pkg: string, user: u32}]`, the open windows sorted by id.
+  Optional `companion` (`"ready"` or `"unavailable"`): the companion link's state, omitted when
+  unknown (so a report without it is unchanged).
 - `status` after a window's `open` (on any stream) is a protocol error for that client, like any
   other unexpected control type.
 

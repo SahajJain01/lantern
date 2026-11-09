@@ -23,6 +23,12 @@ public final class Proto {
 
     /** Largest payload accepted on either side (8 MiB). */
     public static final int MAX_PAYLOAD = 8 << 20;
+    /** Largest {@code clip.text}, in UTF-8 bytes (1 MiB). Mirrors {@code lantern_proto::MAX_CLIP}. */
+    public static final int MAX_CLIP = 1 << 20;
+    /** Largest {@code ime.text}, in UTF-8 bytes (64 KiB). Mirrors {@code lantern_proto::MAX_IME_TEXT}. */
+    public static final int MAX_IME_TEXT = 1 << 16;
+    /** Largest icon PNG for {@code app.icon}, before base64 (1 MiB); larger is sent as "". */
+    public static final int MAX_ICON = 1 << 20;
     private static final int HEADER_AFTER_LEN = 5;
 
     public static final int INPUT_POINTER = 1;
