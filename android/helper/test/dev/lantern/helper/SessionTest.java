@@ -14,7 +14,7 @@ public final class SessionTest {
     private static final String KEY = "stay_on_while_plugged_in";
 
     /** In-memory settings; absent keys are simply missing from the map. Records every write. */
-    static final class FakeSettings implements SettingsBackend {
+    static class FakeSettings implements SettingsBackend {
         final Map<String, String> values = new HashMap<>();
         final List<String> writes = new ArrayList<>();
 
@@ -33,6 +33,12 @@ public final class SessionTest {
         public void delete(String ns, String key) {
             writes.add("delete " + ns + "/" + key);
             values.remove(ns + "/" + key);
+        }
+
+        @Override
+        public void selectIme(String id) {
+            writes.add("selectIme " + id);
+            values.put("secure/default_input_method", id);
         }
     }
 
@@ -116,10 +122,13 @@ public final class SessionTest {
                 }
             });
             eq(1, armed.size(), "guard armed once before close");
-            Cleanup.Journal j = Cleanup.Journal.parse(armed.get(0));
-            eq(NS, j.ns, "ns");
-            eq(KEY, j.key, "key");
-            eq(orig, j.orig, "orig");
+            Journal j = Journal.parse(armed.get(0));
+            eq(1, j.entries().size(), "one entry");
+            Journal.Entry entry = j.entries().get(0);
+            eq(NS, entry.ns, "ns");
+            eq(KEY, entry.key, "key");
+            eq(orig, entry.orig, "orig");
+            eq("7", entry.set, "set");
             eq(session.journal().toJson(), armed.get(0), "journal json");
 
             // Cleanup applying that journal (parent died) restores the original and the panel.
@@ -284,6 +293,63 @@ public final class SessionTest {
         eq("15", s.get(NS, KEY), "value after close");
     }
 
+
+    /** Several changes: journal (all entries) armed before the first apply, then list order, wake, panel. */
+    static void changesAppliedInOrderAfterArm() throws Exception {
+        FakeSettings s = new FakeSettings();
+        s.values.put(NS + "/" + KEY, "15");
+        s.values.put("secure/default_input_method", "latin/.Ime");
+        FakePower p = new FakePower();
+        List<String> order = new ArrayList<>();
+        Session session = Session.start(s, new Power() {
+            @Override
+            public void wake() {
+                order.add("wake writes=" + s.writes.size());
+            }
+
+            @Override
+            public void setPanel(boolean on) {
+                order.add("panel(" + on + ")");
+            }
+        }, new Session.Guard() {
+            @Override
+            public void arm(String journalJson) {
+                order.add("arm writes=" + s.writes.size() + " " + journalJson);
+            }
+
+            @Override
+            public void disarm() {
+                order.add("disarm");
+            }
+        }, JournalStore.none(), java.util.Arrays.asList(Session.STAY_ON,
+            Change.setting("global", "absent_key", cur -> cur == null ? "1" : cur + "1"),
+            Change.ime("lantern/.Ime")));
+        eq("[put global/stay_on_while_plugged_in=7, put global/absent_key=1, selectIme lantern/.Ime]",
+            s.writes.toString(), "applied in list order, IME via selectIme");
+        eq("arm writes=0 {\"v\":2,\"entries\":["
+            + "{\"ns\":\"global\",\"key\":\"stay_on_while_plugged_in\",\"orig\":\"15\",\"set\":\"7\"},"
+            + "{\"ns\":\"global\",\"key\":\"absent_key\",\"orig\":null,\"set\":\"1\"},"
+            + "{\"ns\":\"secure\",\"key\":\"default_input_method\",\"orig\":\"latin/.Ime\","
+            + "\"set\":\"lantern/.Ime\"}]}", order.get(0), "whole journal armed before any write");
+        eq("wake writes=3", order.get(1), "wake after every change");
+        eq("panel(false)", order.get(2), "panel off last");
+        session.close();
+        eq("[put global/stay_on_while_plugged_in=7, put global/absent_key=1, selectIme lantern/.Ime,"
+            + " selectIme latin/.Ime, delete global/absent_key, put global/stay_on_while_plugged_in=15]",
+            s.writes.toString(), "restored in reverse order");
+        eq("disarm", order.get(order.size() - 1), "disarmed");
+    }
+
+    /** The user changed a setting during the session: close leaves it, still disarms cleanly. */
+    static void closeLeavesValueChangedDuringSession() throws Exception {
+        FakeSettings s = new FakeSettings();
+        s.values.put(NS + "/" + KEY, "15");
+        Session session = Session.start(s, new FakePower());
+        s.values.put(NS + "/" + KEY, "3");
+        session.close();
+        eq("3", s.get(NS, KEY), "user's value kept");
+    }
+
     private static void check(boolean ok, String what) {
         if (!ok) {
             throw new AssertionError(what);
@@ -312,6 +378,8 @@ public final class SessionTest {
             {"armFailsWithoutReady", (Case) SessionTest::armFailsWithoutReady},
             {"armFailsWhenChildDiesBeforeReady", (Case) SessionTest::armFailsWhenChildDiesBeforeReady},
             {"armProceedsAfterReady", (Case) SessionTest::armProceedsAfterReady},
+            {"changesAppliedInOrderAfterArm", (Case) SessionTest::changesAppliedInOrderAfterArm},
+            {"closeLeavesValueChangedDuringSession", (Case) SessionTest::closeLeavesValueChangedDuringSession},
         };
         int failed = 0;
         for (Object[] c : cases) {

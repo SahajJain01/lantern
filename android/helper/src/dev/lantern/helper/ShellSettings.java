@@ -41,6 +41,15 @@ final class ShellSettings implements SettingsBackend {
         run("settings", "delete", ns, key);
     }
 
+    /** {@code ime set <id>}; an unknown or disabled IME exits non-zero (255) and throws. */
+    @Override
+    public void selectIme(String id) {
+        if (id == null) {
+            throw new IllegalArgumentException("selectIme null");
+        }
+        run("ime", "set", id);
+    }
+
     private static String run(String... cmd) {
         try {
             Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();

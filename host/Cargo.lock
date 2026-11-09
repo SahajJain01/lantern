@@ -880,6 +880,7 @@ dependencies = [
  "pollster",
  "rand",
  "raw-window-handle",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

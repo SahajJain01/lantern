@@ -239,9 +239,12 @@ fn helper_command(remote: &str, name: &str, token: &str) -> String {
 /// restoring the phone before killing it.
 pub const PREVIOUS_HELPER_WAIT: Duration = Duration::from_secs(10);
 const PREVIOUS_HELPER_POLL: Duration = Duration::from_millis(200);
-/// Lists every live helper process (Main or Cleanup) on the phone. The bracket keeps the
-/// pattern from matching the shell running it; `true` makes "none" a success.
-const HELPER_PIDS_CMD: &str = "pgrep -f 'dev[.]lantern[.]helper'; true";
+/// Lists every live helper process (Main or Cleanup) on the phone, and nothing else (not the
+/// companion app, a logcat filter or the shell running this). Matched against the full command
+/// line, observed on the phone as `app_process / dev.lantern.helper.Main serve <name> <token>`
+/// and `app_process / dev.lantern.helper.Cleanup <journal>`. `true` makes "none" a success.
+const HELPER_PIDS_CMD: &str =
+    "pgrep -f '^app_process / dev[.]lantern[.]helper[.](Main|Cleanup)( |$)'; true";
 
 async fn helper_pids(adb: &Adb) -> Result<Vec<u32>> {
     let out = adb
@@ -358,9 +361,10 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
         let host = HostJar(write_host_jar(&helper_sha)?);
         adb.push(&host.0.to_string_lossy(), &remote).await?;
     }
-    prune_old_jars(adb, &remote).await;
     // Never overlap a previous session's helper: see wait_for_previous_helpers.
     wait_for_previous_helpers(adb, PREVIOUS_HELPER_WAIT).await?;
+    // Only now: an earlier helper or its Cleanup may still be running from an old jar.
+    prune_old_jars(adb, &remote).await;
 
     let mut token_bytes = [0u8; 16];
     OsRng.fill_bytes(&mut token_bytes);
@@ -528,7 +532,41 @@ fn helper_version_error(msg: &str, code: Option<String>, version: Option<u32>) -
 
 #[cfg(test)]
 mod tests {
-    use super::helper_command;
+    use super::{helper_command, HELPER_PIDS_CMD};
+
+    /// The pattern inside `pgrep -f '...'`, compiled as the ERE toybox pgrep uses.
+    fn helper_pids_pattern() -> regex::Regex {
+        let start = HELPER_PIDS_CMD.find('\'').expect("quoted pattern") + 1;
+        let end = start + HELPER_PIDS_CMD[start..].find('\'').expect("closing quote");
+        regex::Regex::new(&HELPER_PIDS_CMD[start..end]).expect("valid regex")
+    }
+
+    #[test]
+    fn helper_pids_cmd_is_anchored() {
+        assert!(
+            HELPER_PIDS_CMD.contains("dev[.]lantern[.]helper[.](Main|Cleanup)"),
+            "{HELPER_PIDS_CMD}"
+        );
+        let re = helper_pids_pattern();
+        for live in [
+            "app_process / dev.lantern.helper.Main serve lantern-0123abcd 0123456789abcdef0123456789abcdef",
+            "app_process / dev.lantern.helper.Cleanup {\"v\":2,\"entries\":[]}",
+        ] {
+            assert!(re.is_match(live), "must match {live:?}");
+        }
+        for other in [
+            "dev.lantern.companion",
+            "app_process / dev.lantern.companion.Ime",
+            "app_process / dev.lantern.helper.MainX serve",
+            "app_process / dev.lantern.helper.Encoder",
+            "logcat -s dev.lantern.helper.Main",
+            "sh -c app_process / dev.lantern.helper.Main serve x y",
+            // The shell running the pgrep itself.
+            &format!("sh -c {HELPER_PIDS_CMD}"),
+        ] {
+            assert!(!re.is_match(other), "must not match {other:?}");
+        }
+    }
 
     #[test]
     fn helper_command_sets_classpath_and_uses_app_process_root() {

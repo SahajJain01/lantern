@@ -1,16 +1,25 @@
 package dev.lantern.helper;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.function.Consumer;
+
 /**
- * One helper session: keep the phone awake while plugged in, wake it and turn the built-in panel
- * off. {@link #close()} undoes it in reverse order. The original state is journaled and handed to
- * a {@link Guard} (the out-of-process {@link Cleanup}) before anything is changed, so the phone is
- * restored even if this process is killed.
+ * One helper session: apply a list of setting {@link Change}s (by default only {@link #STAY_ON}),
+ * wake the phone and turn the built-in panel off. {@link #close()} undoes it in reverse order. Every
+ * change is journaled ({@link Journal}), persisted and handed to a {@link Guard} (the
+ * out-of-process {@link Cleanup}) before anything is changed, so the phone is restored even if this
+ * process is killed.
  */
 public final class Session implements AutoCloseable {
     static final String NS = "global";
     static final String KEY = "stay_on_while_plugged_in";
     /** BATTERY_PLUGGED_AC | USB | WIRELESS. */
-    static final String STAY_ON = "7";
+    static final String STAY_ON_VALUE = Journal.LEGACY_SET;
+    /** Keep the phone awake on every power source while plugged in. */
+    public static final Change STAY_ON = Change.setting(NS, KEY, current -> STAY_ON_VALUE);
 
     /** Crash-safety hook: armed with the journal before any change, disarmed after a clean restore. */
     public interface Guard {
@@ -33,18 +42,19 @@ public final class Session implements AutoCloseable {
     private final Power power;
     private final Guard guard;
     private final JournalStore store;
-    private final Cleanup.Journal journal;
+    private final Journal journal;
+    private final Consumer<String> log;
     private boolean settingWritten;
     private boolean panelOff;
     private boolean closed;
 
-    private Session(SettingsBackend settings, Power power, Guard guard, JournalStore store,
-            Cleanup.Journal journal) {
+    private Session(SettingsBackend settings, Power power, Guard guard, JournalStore store, Journal journal) {
         this.settings = settings;
         this.power = power;
         this.guard = guard;
         this.store = store;
         this.journal = journal;
+        this.log = store.log();
     }
 
     public static Session start(SettingsBackend s, Power p) {
@@ -55,29 +65,53 @@ public final class Session implements AutoCloseable {
         return start(s, p, g, JournalStore.none());
     }
 
-    /**
-     * The original value comes from the persisted journal if one exists (an earlier session died
-     * without restoring: the current value may be its STAY_ON), else from the setting itself. The
-     * journal is persisted, then the guard armed, before anything is changed.
-     */
     public static Session start(SettingsBackend s, Power p, Guard g, JournalStore store) {
-        Cleanup.Journal recovered = store.load();
-        Cleanup.Journal journal = recovered != null && NS.equals(recovered.ns) && KEY.equals(recovered.key)
-            ? recovered
-            : new Cleanup.Journal(NS, KEY, s.get(NS, KEY));
+        return start(s, p, g, store, Collections.singletonList(STAY_ON));
+    }
+
+    /**
+     * Journals every change, persists the journal, arms the guard, and only then applies the
+     * changes in list order, wakes the phone and turns the panel off.
+     *
+     * <p>An earlier session that died without restoring may have left its journal on disk. Its
+     * original for a setting is trusted only while the setting still holds the value that session
+     * wrote; if anyone changed it since, the current value is the original. Recovered entries for
+     * settings this session does not change, still holding their written value, are carried over
+     * (first, so they are restored last) and restored at the end too.
+     */
+    public static Session start(SettingsBackend s, Power p, Guard g, JournalStore store, List<Change> changes) {
+        Journal recovered = store.load();
+        List<Journal.Entry> entries = new ArrayList<>();
+        if (recovered != null) {
+            for (Journal.Entry e : recovered.entries()) {
+                if (!changes(changes, e.ns, e.key) && Objects.equals(s.get(e.ns, e.key), e.set)) {
+                    entries.add(e);
+                }
+            }
+        }
+        int first = entries.size();
+        for (Change c : changes) {
+            String current = s.get(c.ns, c.key);
+            Journal.Entry old = recovered == null ? null : recovered.find(c.ns, c.key);
+            String orig = old != null && Objects.equals(current, old.set) ? old.orig : current;
+            entries.add(new Journal.Entry(c.ns, c.key, orig, c.next(current)));
+        }
+        Journal journal = new Journal(entries);
         store.save(journal);
         Session session = new Session(s, p, g, store, journal);
         try {
-            g.arm(session.journal.toJson());
+            g.arm(journal.toJson());
         } catch (RuntimeException e) {
-            if (journal != recovered) {
-                store.clear(); // nothing changed; a recovered journal must survive, though
+            if (recovered == null) {
+                store.clear(); // nothing changed; a recovered journal (now merged) must survive, though
             }
             throw e;
         }
         try {
             session.settingWritten = true; // set first: a throwing put may still have written
-            s.put(NS, KEY, STAY_ON);
+            for (int i = 0; i < changes.size(); i++) {
+                changes.get(i).apply(s, entries.get(first + i).set);
+            }
             p.wake();
             session.panelOff = true;
             p.setPanel(false);
@@ -92,13 +126,23 @@ public final class Session implements AutoCloseable {
         return session;
     }
 
-    public Cleanup.Journal journal() {
+    private static boolean changes(List<Change> changes, String ns, String key) {
+        for (Change c : changes) {
+            if (c.ns.equals(ns) && c.key.equals(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public Journal journal() {
         return journal;
     }
 
     /**
-     * Idempotent. Panel back on, then the original setting (even if the panel call throws an
-     * Error), then the persisted journal is removed; the guard is disarmed last.
+     * Idempotent. Panel back on, then every journaled setting that still holds the value Lantern
+     * wrote (even if the panel call throws an Error), then the persisted journal is removed; the
+     * guard is disarmed last.
      */
     @Override
     public synchronized void close() {
@@ -118,7 +162,7 @@ public final class Session implements AutoCloseable {
         } finally {
             if (settingWritten) {
                 try {
-                    journal.restore(settings);
+                    journal.restore(settings, log);
                 } catch (RuntimeException e) {
                     failure = failure == null ? e : failure;
                 }

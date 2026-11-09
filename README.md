@@ -127,9 +127,10 @@ session), lanternd starts a session on the phone at once, even if no window is o
   journaled to `/data/local/tmp/lantern-session.json` before anything changes, and the file is
   deleted after a clean restore. If both helper and guard die without restoring (reboot, battery
   death, `kill -9` of both), the next session takes the original from that file rather than the
-  current value, and restores it when it ends. A new session also waits (up to 10 s) for the
-  previous session's helper processes to exit, killing any still alive after that, so two
-  sessions never overlap on the phone.
+  current value, as long as the setting still holds the value Lantern wrote, and restores it when
+  it ends. A setting you changed yourself in the meantime is never overwritten. A new session
+  also waits (up to 10 s) for the previous session's helper processes to exit, killing any still
+  alive after that, so two sessions never overlap on the phone.
 - **One virtual display per open window**, named `lantern-<id>-<package>`. Each is removed when its
   window closes, and closing a window quits its app's task (close = quit).
 - **The helper jar stays in `/data/local/tmp`** as `lantern-helper-<sha256>.jar`, and the helper

@@ -7,4 +7,7 @@ public interface SettingsBackend {
     void put(String ns, String key, String v);
 
     void delete(String ns, String key);
+
+    /** Selects input method {@code id}; this also sets {@code secure/default_input_method}. */
+    void selectIme(String id);
 }

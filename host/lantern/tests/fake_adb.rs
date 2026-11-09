@@ -423,6 +423,12 @@ async fn start_prunes_old_helper_jars() {
         calls[prune]
     );
     assert!(prune > push, "{calls:#?}");
+    // Only once no earlier helper (or its Cleanup) can still be running from an old jar.
+    let last_pgrep = calls
+        .iter()
+        .rposition(|c| c.contains(" shell pgrep"))
+        .expect("no pgrep");
+    assert!(prune > last_pgrep, "prune before the wait: {calls:#?}");
     wait_dead(fake.helper_pid()).await;
 }
 

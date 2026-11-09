@@ -8,9 +8,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -33,46 +31,7 @@ public final class Cleanup {
     private Cleanup() {
     }
 
-    /** The state to restore: one setting, {@code orig == null} meaning the key was absent. */
-    public static final class Journal {
-        public final String ns;
-        public final String key;
-        public final String orig;
-
-        public Journal(String ns, String key, String orig) {
-            this.ns = ns;
-            this.key = key;
-            this.orig = orig;
-        }
-
-        /** Puts back the original value, or deletes the key if it was absent (never writes "null"). */
-        void restore(SettingsBackend s) {
-            if (orig == null) {
-                s.delete(ns, key);
-            } else {
-                s.put(ns, key, orig);
-            }
-        }
-
-        public String toJson() {
-            return "{\"ns\":" + quote(ns) + ",\"key\":" + quote(key) + ",\"orig\":" + quote(orig) + "}";
-        }
-
-        public static Journal parse(String json) {
-            Map<String, String> m = parseFlatObject(json);
-            for (String k : new String[] {"ns", "key", "orig"}) {
-                if (!m.containsKey(k)) {
-                    throw new IllegalArgumentException("journal missing " + k + ": " + json);
-                }
-            }
-            if (m.get("ns") == null || m.get("key") == null) {
-                throw new IllegalArgumentException("journal ns/key null: " + json);
-            }
-            return new Journal(m.get("ns"), m.get("key"), m.get("orig"));
-        }
-    }
-
-    /** Restores what the parent session changed: panel on, then the original setting. */
+    /** Restores what the parent session changed: panel on, then the journaled settings. */
     public static void apply(Journal j, SettingsBackend s, Power p, Consumer<String> log) {
         apply(j, s, p, JournalStore.none(), log);
     }
@@ -88,10 +47,36 @@ public final class Cleanup {
         } catch (RuntimeException e) {
             log.accept("cleanup: panel on failed: " + e);
         } finally {
-            j.restore(s);
-            log.accept("cleanup: restored " + j.ns + "/" + j.key + " to " + (j.orig == null ? "<absent>" : j.orig));
+            j.restore(s, log);
+            log.accept("cleanup: journal restored");
             store.clear();
         }
+    }
+
+    /**
+     * {@code Main --forget} (undo-setup): restores a persisted journal (as {@link Journal#restore}:
+     * only settings still holding Lantern's value), then deletes it and every Lantern artifact in
+     * {@code dir} (helper jars, companion APKs). A failed restore throws and deletes nothing, so
+     * the journal survives for a retry.
+     *
+     * @return {@code forgot journal=restored} or {@code forgot journal=none}
+     */
+    static String forget(JournalStore store, SettingsBackend s, File dir, Consumer<String> log) {
+        Journal j = store.load();
+        if (j != null) {
+            j.restore(s, log);
+        }
+        store.clear();
+        File[] files = dir.listFiles((d, name) -> (name.startsWith("lantern-helper-") && name.endsWith(".jar"))
+            || (name.startsWith("lantern-companion-") && name.endsWith(".apk")));
+        if (files != null) {
+            for (File f : files) {
+                if (!f.delete()) {
+                    log.accept("forget: could not delete " + f);
+                }
+            }
+        }
+        return "forgot journal=" + (j != null ? "restored" : "none");
     }
 
     /** Blocks until the parent closes the pipe. False only if the parent said {@code done}. */
@@ -254,151 +239,5 @@ public final class Cleanup {
             System.exit(1);
         }
         System.exit(0);
-    }
-
-    // --- minimal JSON for the journal: a flat object of string or null values ---
-
-    static String quote(String s) {
-        if (s == null) {
-            return "null";
-        }
-        StringBuilder b = new StringBuilder("\"");
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
-                case '"':
-                    b.append("\\\"");
-                    break;
-                case '\\':
-                    b.append("\\\\");
-                    break;
-                case '\n':
-                    b.append("\\n");
-                    break;
-                case '\r':
-                    b.append("\\r");
-                    break;
-                case '\t':
-                    b.append("\\t");
-                    break;
-                default:
-                    if (c < 0x20) {
-                        b.append(String.format("\\u%04x", (int) c));
-                    } else {
-                        b.append(c);
-                    }
-            }
-        }
-        return b.append('"').toString();
-    }
-
-    static Map<String, String> parseFlatObject(String json) {
-        int[] pos = {0};
-        Map<String, String> m = new HashMap<>();
-        skipWs(json, pos);
-        expect(json, pos, '{');
-        skipWs(json, pos);
-        if (peek(json, pos) == '}') {
-            pos[0]++;
-        } else {
-            while (true) {
-                skipWs(json, pos);
-                String k = parseString(json, pos);
-                skipWs(json, pos);
-                expect(json, pos, ':');
-                skipWs(json, pos);
-                String v;
-                if (json.startsWith("null", pos[0])) {
-                    pos[0] += 4;
-                    v = null;
-                } else {
-                    v = parseString(json, pos);
-                }
-                m.put(k, v);
-                skipWs(json, pos);
-                char c = peek(json, pos);
-                pos[0]++;
-                if (c == '}') {
-                    break;
-                }
-                if (c != ',') {
-                    throw new IllegalArgumentException("bad json at " + (pos[0] - 1) + ": " + json);
-                }
-            }
-        }
-        skipWs(json, pos);
-        if (pos[0] != json.length()) {
-            throw new IllegalArgumentException("trailing json: " + json);
-        }
-        return m;
-    }
-
-    private static String parseString(String s, int[] pos) {
-        expect(s, pos, '"');
-        StringBuilder b = new StringBuilder();
-        while (true) {
-            char c = peek(s, pos);
-            pos[0]++;
-            if (c == '"') {
-                return b.toString();
-            }
-            if (c != '\\') {
-                b.append(c);
-                continue;
-            }
-            char e = peek(s, pos);
-            pos[0]++;
-            switch (e) {
-                case '"':
-                case '\\':
-                case '/':
-                    b.append(e);
-                    break;
-                case 'n':
-                    b.append('\n');
-                    break;
-                case 'r':
-                    b.append('\r');
-                    break;
-                case 't':
-                    b.append('\t');
-                    break;
-                case 'b':
-                    b.append('\b');
-                    break;
-                case 'f':
-                    b.append('\f');
-                    break;
-                case 'u':
-                    if (pos[0] + 4 > s.length()) {
-                        throw new IllegalArgumentException("bad \\u escape: " + s);
-                    }
-                    b.append((char) Integer.parseInt(s.substring(pos[0], pos[0] + 4), 16));
-                    pos[0] += 4;
-                    break;
-                default:
-                    throw new IllegalArgumentException("bad escape \\" + e + ": " + s);
-            }
-        }
-    }
-
-    private static char peek(String s, int[] pos) {
-        if (pos[0] >= s.length()) {
-            throw new IllegalArgumentException("truncated json: " + s);
-        }
-        return s.charAt(pos[0]);
-    }
-
-    private static void expect(String s, int[] pos, char c) {
-        if (peek(s, pos) != c) {
-            throw new IllegalArgumentException("expected '" + c + "' at " + pos[0] + ": " + s);
-        }
-        pos[0]++;
-    }
-
-    private static void skipWs(String s, int[] pos) {
-        while (pos[0] < s.length() && Character.isWhitespace(s.charAt(pos[0]))) {
-            pos[0]++;
-        }
     }
 }

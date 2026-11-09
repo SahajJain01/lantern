@@ -16,6 +16,12 @@ public final class Main {
             case "--ping":
                 System.out.println("pong");
                 return;
+            case "--forget":
+                if (args.length != 1) {
+                    break;
+                }
+                System.exit(forget());
+                return;
             case "--session-test":
                 if (args.length != 2) {
                     break;
@@ -40,8 +46,24 @@ public final class Main {
                 break;
         }
         System.err.println("usage: dev.lantern.helper.Main serve <socket-name> <token: 32 hex>"
-            + " | --version | --ping | --session-test <seconds> | --display-test <pkg> [--recreate]");
+            + " | --version | --ping | --forget | --session-test <seconds> | --display-test <pkg> [--recreate]");
         System.exit(2);
+    }
+
+    /**
+     * Undo-setup: restores a journal an earlier session left behind (only settings still holding
+     * Lantern's value), then deletes it and Lantern's jars and APKs from {@code /data/local/tmp}.
+     * Prints {@code forgot journal=<restored|none>}; exits 1 (journal kept) if the restore fails.
+     */
+    static int forget() {
+        try {
+            System.out.println(Cleanup.forget(JournalStore.device(Droid::log), new ShellSettings(),
+                new java.io.File(JournalStore.PATH).getParentFile(), Droid::log));
+            return 0;
+        } catch (RuntimeException e) {
+            System.err.println("forget failed: " + e);
+            return 1;
+        }
     }
 
     /** A helper nobody connects to must not linger. */
