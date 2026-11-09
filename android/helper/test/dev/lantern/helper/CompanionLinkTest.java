@@ -349,6 +349,49 @@ public final class CompanionLinkTest {
         }
     }
 
+    /**
+     * A companion that stops reading jams writes to it, but only for the writers: alive(),
+     * setPrevIme/startSync callers that queue behind the jam, and close() stay bounded, and close
+     * releases the jammed writers.
+     */
+    static void undrainedPeerDoesNotBlockClose() throws Exception {
+        Rig r = new Rig();
+        Companion c = linked(r); // never reads again
+        String big = new String(new char[Proto.MAX_IME_TEXT]).replace('\0', 'x');
+        Thread flood = new Thread(() -> {
+            while (r.link.send(Msg.of("ime").put("op", "commit").put("text", big))) {
+                // until the write fails (closed)
+            }
+        }, "fake-ime-flood");
+        flood.setDaemon(true);
+        flood.start();
+        Thread.sleep(500); // socket buffers full: flood is blocked in a write
+        check(flood.isAlive(), "the flood is jammed");
+        Thread prev = new Thread(() -> r.link.setPrevIme("com.example/.Keyboard"), "fake-prev");
+        prev.setDaemon(true);
+        prev.start();
+        Thread sync = new Thread(r.link::startSync, "fake-sync");
+        sync.setDaemon(true);
+        sync.start();
+        Thread.sleep(200); // both now wait on the jammed peer
+        long t0 = System.nanoTime();
+        Thread probe = new Thread(() -> {
+            r.link.alive();
+            r.link.close();
+        }, "fake-close");
+        probe.setDaemon(true);
+        probe.start();
+        probe.join(1000);
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        check(!probe.isAlive(), "alive() and close() returned within 1 s despite the jam (" + ms + " ms)");
+        flood.join(2000);
+        prev.join(2000);
+        sync.join(2000);
+        check(!flood.isAlive() && !prev.isAlive() && !sync.isAlive(), "close released the jammed writers");
+        check(!r.link.alive(), "not alive after close");
+        c.close();
+    }
+
     static void handoffListenerQueuesAndCloses() throws Exception {
         HandoffListener l = new HandoffListener();
         List<String> closed = Collections.synchronizedList(new ArrayList<>());
@@ -425,6 +468,7 @@ public final class CompanionLinkTest {
             {"labelsTrackAppAndRemoved", (Case) CompanionLinkTest::labelsTrackAppAndRemoved},
             {"syncSentOnSessionUpAndToLateCompanion", (Case) CompanionLinkTest::syncSentOnSessionUpAndToLateCompanion},
             {"linkLossIsNotAlive", (Case) CompanionLinkTest::linkLossIsNotAlive},
+            {"undrainedPeerDoesNotBlockClose", (Case) CompanionLinkTest::undrainedPeerDoesNotBlockClose},
             {"handoffListenerQueuesAndCloses", (Case) CompanionLinkTest::handoffListenerQueuesAndCloses},
         };
         int failed = 0;

@@ -336,6 +336,9 @@ public final class Router {
             case "close":
                 close(stream);
                 break;
+            case "ime":
+                ime(stream, m);
+                break;
             default:
                 throw new ProtocolError(m.t + " is not valid from the host");
         }
@@ -449,6 +452,54 @@ public final class Router {
         if (wn != null) {
             closeWindow(wn, "closed", null);
         }
+    }
+
+    /** The {@code ime} ops (docs/protocol.md, "Text, clipboard, catalogue rules"). */
+    static final java.util.Set<String> IME_OPS = java.util.Collections.unmodifiableSet(
+        new java.util.HashSet<>(java.util.Arrays.asList("commit", "compose", "finish")));
+
+    /**
+     * {@code ime{op, text}} for a live window goes to {@link Extras#ime}; for an unknown or closing
+     * window it is dropped. An unknown op or a text over {@link Proto#MAX_IME_TEXT} UTF-8 bytes is a
+     * protocol error. Never logs the text.
+     */
+    private void ime(int win, Msg m) throws ProtocolError {
+        String op = text(m, "op");
+        if (!IME_OPS.contains(op)) {
+            throw new ProtocolError("ime.op=" + op + " is not commit, compose or finish");
+        }
+        String t = text(m, "text");
+        int bytes = utf8Length(t);
+        if (bytes > Proto.MAX_IME_TEXT) {
+            throw new ProtocolError("ime.text of " + bytes + " bytes exceeds MAX_IME_TEXT");
+        }
+        if (live(win, "ime") == null) {
+            return;
+        }
+        try {
+            extras.ime(op, t);
+        } catch (RuntimeException e) {
+            log.accept("router: ime win=" + win + " op=" + op + " failed: " + e);
+        }
+    }
+
+    /** UTF-8 length of {@code s} without encoding it; an unpaired surrogate counts as 3 bytes (an over-estimate). */
+    static int utf8Length(String s) {
+        int n = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x80) {
+                n += 1;
+            } else if (c < 0x800) {
+                n += 2;
+            } else if (Character.isHighSurrogate(c) && i + 1 < s.length() && Character.isLowSurrogate(s.charAt(i + 1))) {
+                n += 4;
+                i++;
+            } else {
+                n += 3;
+            }
+        }
+        return n;
     }
 
     private void input(int win, byte[] payload) throws ProtocolError {

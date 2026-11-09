@@ -35,6 +35,11 @@ import java.util.function.IntPredicate;
  *
  * <p>Threads: one accept thread, one reader thread per connection, one timer that closes
  * connections that stay silent past {@value #HELLO_TIMEOUT_MS} ms.
+ *
+ * <p>Locking: the link lock guards state only and is never held while writing. Writes to a peer
+ * are serialized on that peer's stream ({@link Proto#write} locks it), so a companion that stops
+ * reading blocks only its writers, never {@link #close}, {@link #alive} or {@link #connect}; close
+ * releases them.
  */
 public final class CompanionLink implements Closeable {
     /** How long an accepted connection may take to send its hello. */
@@ -159,11 +164,13 @@ public final class CompanionLink implements Closeable {
      * the catalogue is never held in the router's pre-session buffer.
      */
     public void startSync() {
+        Peer p;
         synchronized (lock) {
             syncWanted = true;
-            if (current != null) {
-                current.write(Msg.of("sync"));
-            }
+            p = current;
+        }
+        if (p != null) {
+            p.write(Msg.of("sync")); // outside the lock: a jammed companion blocks only this caller
         }
     }
 
@@ -214,11 +221,15 @@ public final class CompanionLink implements Closeable {
      * linked companion; a companion that links later gets it right after its hello reply.
      */
     public void setPrevIme(String id) {
+        Peer p;
+        Msg m;
         synchronized (lock) {
             prevIme = id == null ? "" : id;
-            if (current != null) {
-                current.write(imePrev());
-            }
+            p = current;
+            m = imePrev();
+        }
+        if (p != null) {
+            p.write(m); // outside the lock: a jammed companion blocks only this caller
         }
     }
 
@@ -327,29 +338,39 @@ public final class CompanionLink implements Closeable {
                 return;
             }
             Peer old;
-            synchronized (lock) {
-                if (closed || !pending.remove(p)) {
-                    p.close(); // closed, or the hello timer already dropped it
-                    return;
+            boolean greeted;
+            // p's write lock (Proto.write locks the stream too) is held from before p becomes
+            // current until its greeting is written, so no other message can precede the hello
+            // reply, ime_prev and sync. The link lock is never held while writing: a companion
+            // that stops reading must not block close(), alive() or connect().
+            synchronized (p.out) {
+                Msg prev;
+                boolean sync;
+                synchronized (lock) {
+                    if (closed || !pending.remove(p)) {
+                        p.close(); // closed, or the hello timer already dropped it
+                        return;
+                    }
+                    prev = prevIme != null ? imePrev() : null;
+                    sync = syncWanted;
+                    old = current;
+                    current = p;
+                    lock.notifyAll();
                 }
-                // Under the lock, so no other message can precede the hello reply and ime_prev.
-                if (!p.write(Msg.of("hello").put("version", Proto.VERSION).put("token", ""))) {
-                    p.close();
-                    return;
+                greeted = p.write(Msg.of("hello").put("version", Proto.VERSION).put("token", ""));
+                if (greeted && prev != null) {
+                    greeted = p.write(prev);
                 }
-                if (prevIme != null) {
-                    p.write(imePrev());
+                if (greeted && sync) {
+                    greeted = p.write(Msg.of("sync"));
                 }
-                if (syncWanted) {
-                    p.write(Msg.of("sync"));
-                }
-                old = current;
-                current = p;
-                lock.notifyAll();
             }
             if (old != null) {
                 log.accept("companion: replaced by a new link");
                 old.close();
+            }
+            if (!greeted) {
+                return; // the finally unlinks and closes it
             }
             log.accept("companion linked");
             readLoop(p);

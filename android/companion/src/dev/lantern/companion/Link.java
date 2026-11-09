@@ -1,6 +1,7 @@
 package dev.lantern.companion;
 
 import android.content.Context;
+import android.os.SystemClock;
 import android.util.Log;
 
 import dev.lantern.helper.Control;
@@ -25,6 +26,8 @@ final class Link {
     private final String token;
     private volatile boolean stopped;
     private volatile LinkClient client;
+    /** Set once the hello succeeded (only a link that was up can be lost). */
+    private volatile boolean linked;
 
     private Link(Context context, InputStream in, OutputStream out, String token) {
         this.context = context;
@@ -70,6 +73,8 @@ final class Link {
             LinkClient c = new LinkClient(in, out, Control.codec(LinkClient.LINK_TYPES), msg -> Log.i(TAG, msg));
             c.handshake(token);
             client = c;
+            linked = true;
+            ImeState.WATCHDOG.linkUp(); // a new session within the grace keeps its keyboard
             Log.i(TAG, "linked to the helper");
             // Callbacks are registered now; the catalogue is sent when the helper asks (sync).
             // Without it (LauncherApps refused) the link still serves the IME.
@@ -90,7 +95,13 @@ final class Link {
 
                 @Override
                 public void ime(String op, String text) {
-                    Log.i(TAG, "ime " + op + " ignored (no IME yet)"); // Task 7; never log text
+                    LanternIme ime = ImeState.ime;
+                    if (ime == null) {
+                        // Not the selected keyboard (or not created yet): nowhere to type.
+                        Log.i(TAG, ImeOps.logLine(op, false, text)); // never the text itself
+                        return;
+                    }
+                    ime.post(op, text);
                 }
 
                 @Override
@@ -117,6 +128,13 @@ final class Link {
             synchronized (Link.class) {
                 if (running == this) {
                     running = null;
+                    if (linked) {
+                        // Only the current link's loss counts: a link replaced by a newer one
+                        // must not arm the watchdog against the new session's keyboard.
+                        ImeState.WATCHDOG.linkLost(SystemClock.elapsedRealtime(), ImeState.prevIme);
+                        Log.i(TAG, "link lost; the keyboard is given back in "
+                            + ImeWatchdog.DEFAULT_GRACE_MS + " ms unless the helper relinks");
+                    }
                 }
             }
         }

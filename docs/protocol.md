@@ -114,7 +114,8 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
   composing text, and carries `text: ""`.
 - `ime` is only meaningful for a live window: the helper drops (logs and ignores) an `ime` for a
   window that is unknown, closing or already closed, like any other window frame. An unknown `op`
-  is a protocol error.
+  or a `text` over `MAX_IME_TEXT` is a protocol error (checked before the window lookup).
+  `ime` on stream 0 is a protocol error.
 - Catalogue: once the session is up and the companion is linked, the helper relays a full
   catalogue (one `app` per launcher app per profile, then `apps_end{count}`), then live `app`
   (added or changed) and `app_removed` messages. A full catalogue whose `apps_end.count` matches
@@ -176,6 +177,28 @@ Messages on the link:
 `ime_prev` and `sync` are link-only: they never travel between the helper and lanternd. The
 helper sends `ime_prev` once the session's journal exists, and again to a newly linked companion.
 Any other `t` from the companion is logged and dropped.
+
+Keyboard on the link:
+
+- When the companion linked, the session's journaled changes are `stay_on_while_plugged_in`,
+  then `secure/enabled_input_methods` with `dev.lantern.companion/.LanternIme` appended (unless
+  an entry's component already is it; subtypes kept), then `default_input_method` set to it
+  (`ime set`). They are restored in reverse at the end, by Cleanup if the helper dies, each only
+  while it still holds Lantern's value. Without the companion only `stay_on_while_plugged_in`
+  changes. `ime_prev.id` is the journal's original `default_input_method`, or `""` when it was
+  absent or is Lantern's own.
+- The helper forwards a live window's `ime` in order from its own sender thread, so a companion
+  that stops reading never stalls the session; at most 256 wait, newer ones are dropped. An `ime`
+  that arrives while no companion is linked is dropped. Each dropping stretch is logged once,
+  never per frame, and never with the text. Writes to a companion never hold the link's lock, so
+  a jammed companion cannot block the link's close or a new link.
+- The companion's `LanternIme` draws nothing (no input view, never fullscreen) and lets hardware
+  keys pass. `commit` is `commitText(text, 1)`, `compose` is `setComposingText(text, 1)`,
+  `finish` is `finishComposingText()`. It logs only `ime op=<op> ok=<bool> len=<n>`.
+- Watchdog: when the link is lost, the IME (polling every 500 ms) switches to `ime_prev.id` once
+  5 s have passed, if the Lantern IME is still the current keyboard and the id is not `""`; at
+  most once per loss. A link that comes back within the 5 s (a new session) cancels it. A link
+  that a newer one replaced does not count as lost.
 
 Catalogue on the link:
 

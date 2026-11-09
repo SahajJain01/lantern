@@ -338,6 +338,95 @@ public final class RouterTest {
         }
     }
 
+    /** Extras that record {@code "op text"} (test-only: the real relay never logs text). */
+    static Router.Extras recording(List<String> got) {
+        return new Router.Extras() {
+            @Override
+            public void ime(String op, String text) {
+                got.add(op + " " + text);
+            }
+
+            @Override
+            public void clip(String text) {
+                got.add("clip " + text);
+            }
+        };
+    }
+
+    static void imeOnLiveWindowReachesExtras() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(recording(got)))) {
+            r.hello();
+            r.open(2);
+            r.send(2, "{\"t\":\"ime\",\"op\":\"compose\",\"text\":\"vi\u1ec7\"}");
+            r.send(2, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"vi\u1ec7t\"}");
+            r.send(2, "{\"t\":\"ime\",\"op\":\"finish\",\"text\":\"\"}");
+            // A whole MAX_IME_TEXT is still fine.
+            char[] max = new char[Proto.MAX_IME_TEXT];
+            java.util.Arrays.fill(max, 'a');
+            r.send(2, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"" + new String(max) + "\"}");
+            Rig.await("4 ime calls", 2000, () -> got.size() == 4);
+            eq("compose vi\u1ec7", got.get(0), "compose");
+            eq("commit vi\u1ec7t", got.get(1), "commit");
+            eq("finish ", got.get(2), "finish");
+            eq("commit " + new String(max), got.get(3), "max-size commit");
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+    }
+
+    static void imeForUnknownWindowIgnored() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(recording(got)))) {
+            r.hello();
+            r.send(7, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"lost\"}"); // never opened
+            r.open(1);
+            r.send(1, "{\"t\":\"close\"}");
+            eq("closed", r.control(1).t, "closed");
+            r.send(1, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"late\"}"); // already closed
+            r.open(3); // the session survives both
+            r.send(3, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"ok\"}");
+            Rig.await("the live window's ime", 2000, () -> got.size() == 1);
+            Thread.sleep(100);
+            eq(Collections.singletonList("commit ok"), new ArrayList<>(got), "only the live window's ime");
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+        }
+    }
+
+    static void imeUnknownOpIsAnError() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(recording(got)))) {
+            r.hello();
+            r.open(1);
+            r.send(1, "{\"t\":\"ime\",\"op\":\"delete\",\"text\":\"\"}");
+            Msg e = r.control(0);
+            eq("error", e.t, "error");
+            check(e.str("msg").contains("op"), "msg names the op: " + e.str("msg"));
+            r.awaitExit(2000);
+            check(got.isEmpty(), "nothing reached extras: " + got);
+        }
+    }
+
+    static void imeTextOverLimitIsAnError() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(recording(got)))) {
+            r.hello();
+            r.open(1);
+            // MAX_IME_TEXT - 1 ASCII bytes plus one 2-byte char: one UTF-8 byte over the limit,
+            // although only MAX_IME_TEXT chars long.
+            char[] over = new char[Proto.MAX_IME_TEXT];
+            java.util.Arrays.fill(over, 'a');
+            over[0] = '\u00e9';
+            r.send(1, "{\"t\":\"ime\",\"op\":\"commit\",\"text\":\"" + new String(over) + "\"}");
+            Msg e = r.control(0);
+            eq("error", e.t, "error");
+            check(e.str("msg").contains("MAX_IME_TEXT") || e.str("msg").contains("text"), "msg: " + e.str("msg"));
+            r.awaitExit(2000);
+            check(got.isEmpty(), "nothing reached extras");
+        }
+    }
+
     static void openThenCloseCallsFactoryAndClose() throws Exception {
         try (Rig r = new Rig()) {
             r.hello();
@@ -636,6 +725,10 @@ public final class RouterTest {
             {"helloStartsSessionAndReplies", (Case) RouterTest::helloStartsSessionAndReplies},
             {"onSessionUpRunsAfterHelloReply", (Case) RouterTest::onSessionUpRunsAfterHelloReply},
             {"setExtrasAcceptsHandler", (Case) RouterTest::setExtrasAcceptsHandler},
+            {"imeOnLiveWindowReachesExtras", (Case) RouterTest::imeOnLiveWindowReachesExtras},
+            {"imeForUnknownWindowIgnored", (Case) RouterTest::imeForUnknownWindowIgnored},
+            {"imeUnknownOpIsAnError", (Case) RouterTest::imeUnknownOpIsAnError},
+            {"imeTextOverLimitIsAnError", (Case) RouterTest::imeTextOverLimitIsAnError},
             {"openThenCloseCallsFactoryAndClose", (Case) RouterTest::openThenCloseCallsFactoryAndClose},
             {"openedSaysMovedForAnExistingTask", (Case) RouterTest::openedSaysMovedForAnExistingTask},
             {"openedCarriesLabelAndWork", (Case) RouterTest::openedCarriesLabelAndWork},

@@ -121,14 +121,23 @@ public final class Main {
                 () -> {
                     // After a valid hello only: an unauthenticated client never reaches the companion.
                     linked[0] = linkCompanion(routerRef, linkRef, companionRef);
-                    // Task 7 adds the IME changes here when linked.
+                    // With the companion linked, the session also enables and selects the Lantern
+                    // keyboard (journaled: restored at the end, by Cleanup, or by its watchdog).
+                    java.util.List<Change> changes = new java.util.ArrayList<>();
+                    changes.add(Session.STAY_ON);
+                    if (linked[0]) {
+                        changes.addAll(ImeSetup.changes());
+                    }
                     Session session;
                     try {
                         session = Session.start(new ShellSettings(), new DevicePower(), Cleanup.spawnGuard(Droid::log),
-                            JournalStore.device(Droid::log));
+                            JournalStore.device(Droid::log), changes);
                     } catch (RuntimeException e) {
                         closeLink(linkRef[0]);
                         throw e;
+                    }
+                    if (linked[0]) {
+                        companionRef[0].setPrevIme(ImeSetup.prevIme(session.journal()));
                     }
                     return () -> {
                         try {
@@ -154,6 +163,11 @@ public final class Main {
                 },
                 Droid::log);
             routerRef[0] = router;
+            java.util.concurrent.ExecutorService imeSender = ImeSetup.Relay.executor(ImeSetup.RELAY_QUEUE);
+            router.setExtras(new ImeSetup.Relay(m -> {
+                CompanionLink l = companionRef[0];
+                return l != null && l.send(m);
+            }, Droid::log, imeSender));
             router.setLabels((pkg, user) -> {
                 CompanionLink l = companionRef[0];
                 return l == null ? null : l.label(pkg, user);
@@ -170,7 +184,11 @@ public final class Main {
                     l.startSync();
                 }
             });
-            router.run();
+            try {
+                router.run();
+            } finally {
+                imeSender.shutdownNow();
+            }
         } catch (java.io.IOException e) {
             Droid.log("serve: " + e);
             return 1;
