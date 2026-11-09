@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use futures_util::stream::{self, StreamExt};
 use lantern::adb::{Adb, DeviceEvent};
+use lantern::daemon::catalog::{Catalog, Dirs};
 use lantern::daemon::ipc;
 use lantern::daemon::session::{handshake, SessionConn};
-use lantern::daemon::{serve, RetryPolicy};
+use lantern::daemon::{serve, serve_with_catalog, RetryPolicy};
 use lantern_proto::{
     read_frame_async, write_frame_async, CloseReason, CompanionState, Control, Frame, Kind,
     SessionState, StatusReport, WindowInfo,
@@ -187,6 +188,11 @@ struct Daemon {
 /// Starts `serve` on a private runtime dir. With `phone`, a device is online and every session
 /// goes to the fake helper on `port`; without, no device ever appears.
 fn start_daemon(port: Option<u16>) -> Daemon {
+    start_daemon_with(port, None)
+}
+
+/// [`start_daemon`] with a menu catalogue.
+fn start_daemon_with(port: Option<u16>, catalog: Option<Catalog>) -> Daemon {
     let rt = runtime_dir();
     let listener = ipc::bind(&rt).unwrap();
     let sock = ipc::socket_path_in(&rt);
@@ -203,8 +209,9 @@ fn start_daemon(port: Option<u16>) -> Daemon {
         Ok(SessionConn::attach(stream, Adb::new(serial), "sha"))
     };
     let (stop, stop_rx) = oneshot::channel::<()>();
-    let task = tokio::spawn(serve(
+    let task = tokio::spawn(serve_with_catalog(
         listener,
+        catalog,
         None,
         events,
         starter,
@@ -1146,4 +1153,120 @@ async fn status_reports_companion_state() {
     let report = status_until(&daemon.sock, |r| r.state == SessionState::Ready).await;
     assert_eq!(report.companion, None, "{report:?}");
     daemon.shutdown().await;
+}
+
+/// A catalogue in a private temp tree that never runs kbuildsycoca6.
+fn temp_catalog() -> (PathBuf, Dirs, Catalog) {
+    let root = runtime_dir();
+    let dirs = Dirs {
+        applications: root.join("applications"),
+        icons: root.join("icons"),
+        menus: root.join("menus"),
+        directories: root.join("directories"),
+        exe: PathBuf::from("/usr/bin/lantern"),
+    };
+    let catalog = Catalog::with_rebuild(dirs.clone(), std::sync::Arc::new(|| {}));
+    (root, dirs, catalog)
+}
+
+fn app(pkg: &str, user: u32, label: &str, icon: &str) -> Frame {
+    control(
+        0,
+        Control::App {
+            pkg: pkg.into(),
+            user,
+            label: label.into(),
+            work: user != 0,
+            icon: icon.into(),
+        },
+    )
+}
+
+/// Waits until `pred` holds for the file names in `dir`.
+async fn wait_files(dir: &Path, what: &str, pred: impl Fn(&[String]) -> bool) {
+    let deadline = Instant::now() + STEP;
+    loop {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        if pred(&names) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: files are {names:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn catalogue_from_helper_becomes_menu_entries() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (root, dirs, catalog) = temp_catalog();
+    let daemon = start_daemon_with(Some(port), Some(catalog));
+    helper.next_session().await;
+    // "iVBORw0KGgo=" is the 8-byte PNG signature.
+    helper.send(app("com.a", 0, "Alpha", "iVBORw0KGgo="));
+    helper.send(app("com.b", 0, "Beta", "not base64!"));
+    helper.send(app("com.w", 10, "Work", ""));
+    helper.send(control(0, Control::AppsEnd { count: 3 }));
+    let apps = dirs.applications.clone();
+    wait_files(&apps, "first sync", |n| {
+        n == [
+            "lantern.com.a.desktop",
+            "lantern.com.b.desktop",
+            "lantern.com.w-u10.desktop",
+        ]
+    })
+    .await;
+    let a = std::fs::read_to_string(apps.join("lantern.com.a.desktop")).unwrap();
+    assert!(
+        a.contains("Name=Alpha\n") && a.contains("X-Lantern-Serial=dev\n"),
+        "{a}"
+    );
+    assert!(dirs.icons.join("lantern.com.a.png").exists());
+    assert!(!dirs.icons.join("lantern.com.b.png").exists());
+    let w = std::fs::read_to_string(apps.join("lantern.com.w-u10.desktop")).unwrap();
+    assert!(w.contains("Name=Work (work)\n"), "{w}");
+
+    // A live removal outside a full sync is applied at once.
+    helper.send(control(
+        0,
+        Control::AppRemoved {
+            pkg: "com.b".into(),
+            user: 0,
+        },
+    ));
+    wait_files(&apps, "live removal", |n| {
+        !n.iter().any(|f| f == "lantern.com.b.desktop")
+    })
+    .await;
+
+    // The next full sync prunes what is gone (the removal above ended up in the window that
+    // AppsEnd opened, so this sync is a mismatch...).
+    helper.send(app("com.c", 0, "Gamma", ""));
+    helper.send(control(0, Control::AppsEnd { count: 1 }));
+    wait_files(&apps, "mismatched sync", |n| n.len() == 3).await;
+    // ...and the one after it matches: com.a goes, the work profile (user 10) sent nothing and
+    // keeps its entry.
+    helper.send(app("com.c", 0, "Gamma", ""));
+    helper.send(control(0, Control::AppsEnd { count: 1 }));
+    wait_files(&apps, "full sync", |n| {
+        n == ["lantern.com.c.desktop", "lantern.com.w-u10.desktop"]
+    })
+    .await;
+    assert!(!dirs.icons.join("lantern.com.a.png").exists());
+
+    // A partial sync prunes nothing.
+    helper.send(app("com.d", 0, "Delta", ""));
+    helper.send(control(0, Control::AppsEnd { count: 7 }));
+    wait_files(&apps, "partial sync", |n| n.len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_files(&apps, "partial sync kept", |n| n.len() == 3).await;
+
+    daemon.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
 }

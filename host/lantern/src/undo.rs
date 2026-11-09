@@ -5,7 +5,7 @@
 //!    Lantern file in `/data/local/tmp`. `--forget` deletes the jar it runs from, so the
 //!    embedded jar is pushed first whenever it is missing.
 //! 2. `pm uninstall --user 0 dev.lantern.companion` (not installed is fine).
-//! 3. The serial's catalogue entries (see [`remove_catalogue_entries`]).
+//! 3. The serial's menu entries and icons (see [`remove_catalogue_entries`]).
 //! 4. The device record, only if the phone steps succeeded (it stays true otherwise).
 
 use std::io::Write;
@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use crate::adb::{parse_device_list, Adb, ADB_CALL_TIMEOUT};
+use crate::daemon::catalog::{self, Catalog, Dirs};
 use crate::daemon::{companion, ipc, session};
 
 /// Why undo-setup refuses while lanternd runs.
@@ -68,10 +69,21 @@ pub fn resolve_serial(
     }
 }
 
-/// Removes `serial`'s entries from the app catalogue and returns how many there were.
-/// Task 6 replaces this no-op with `Catalog::remove_serial`.
-pub fn remove_catalogue_entries(_state_dir: &Path, _serial: &str) -> Result<usize> {
-    Ok(0)
+/// Removes `serial`'s menu entries and icons (and the Phone submenu once no Lantern entry is
+/// left), then rebuilds the KDE menu cache. Returns how many entries there were.
+pub fn remove_catalogue_entries(serial: &str) -> Result<usize> {
+    let dirs = Dirs::from_env()?;
+    remove_catalogue_entries_with(dirs, serial, std::sync::Arc::new(catalog::run_kbuildsycoca))
+}
+
+/// [`remove_catalogue_entries`] under `dirs`, with `rebuild` instead of kbuildsycoca6.
+pub fn remove_catalogue_entries_with(
+    dirs: Dirs,
+    serial: &str,
+    rebuild: catalog::Rebuild,
+) -> Result<usize> {
+    // Dropping the catalogue runs its pending rebuild before returning.
+    Catalog::with_rebuild(dirs, rebuild).remove_serial(serial)
 }
 
 async fn forget(adb: &Adb) -> Result<String> {
@@ -135,7 +147,7 @@ pub async fn run(adb: &Adb, sock: &Path, state_dir: &Path, out: &mut dyn Write) 
         }
     }
     let mut ok = phone_ok;
-    match remove_catalogue_entries(state_dir, &serial) {
+    match remove_catalogue_entries(&serial) {
         Ok(n) => writeln!(out, "catalogue: removed {n} entries")?,
         Err(error) => {
             ok = false;
@@ -167,6 +179,39 @@ pub async fn run(adb: &Adb, sock: &Path, state_dir: &Path, out: &mut dyn Write) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalogue_entries_of_the_serial_are_removed() {
+        use crate::daemon::catalog::{AppEntry, Catalog, Dirs};
+        let root = std::env::temp_dir().join(format!("lantern-undo-cat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = Dirs {
+            applications: root.join("applications"),
+            icons: root.join("icons"),
+            menus: root.join("menus"),
+            directories: root.join("directories"),
+            exe: "/usr/bin/lantern".into(),
+        };
+        let mut cat = Catalog::with_rebuild(dirs.clone(), std::sync::Arc::new(|| {}));
+        for (serial, pkg) in [("mine", "com.a"), ("mine", "com.b"), ("other", "com.c")] {
+            cat.begin_sync(serial);
+            cat.upsert(&AppEntry {
+                pkg: pkg.into(),
+                user: 0,
+                label: pkg.into(),
+                work: false,
+                icon_png: Vec::new(),
+            })
+            .unwrap();
+        }
+        drop(cat);
+        let removed =
+            remove_catalogue_entries_with(dirs.clone(), "mine", std::sync::Arc::new(|| {}));
+        let left = std::fs::read_dir(&dirs.applications).unwrap().count();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(removed.unwrap(), 2);
+        assert_eq!(left, 1);
+    }
 
     #[test]
     fn no_daemon_does_not_block() {

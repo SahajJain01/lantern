@@ -27,6 +27,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
+use super::catalog::{AppEntry, Catalog};
 use super::registry::{Claim, Registry};
 
 /// Frames queued per client before it counts as stuck (~4 s of 60 fps video).
@@ -262,6 +263,30 @@ async fn to_helper(helper: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), Hel
     }
 }
 
+/// The `t` (message type) of a control payload, for logs that must not dump the payload.
+fn control_type(payload: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+/// One debug line per catalogue message: type, pkg, user, label and icon size, never the icon.
+fn log_catalogue(c: &Control) {
+    match c {
+        Control::App {
+            pkg,
+            user,
+            label,
+            work,
+            icon,
+        } => tracing::debug!(pkg, user, label, work, icon_len = icon.len(), "helper app"),
+        Control::AppsEnd { count } => tracing::debug!(count, "helper apps_end"),
+        Control::AppRemoved { pkg, user } => tracing::debug!(pkg, user, "helper app_removed"),
+        _ => {}
+    }
+}
+
 /// Routes frames between window clients and the current helper session.
 pub struct Hub {
     listener: Option<UnixListener>,
@@ -277,6 +302,10 @@ pub struct Hub {
     next_cid: u64,
     events_tx: mpsc::Sender<ClientEvent>,
     events: mpsc::Receiver<ClientEvent>,
+    /// The phone's launcher apps as menu entries, if the daemon keeps them.
+    catalog: Option<Catalog>,
+    /// The live session's serial, for re-opening the catalogue sync window after `apps_end`.
+    catalog_serial: Option<String>,
 }
 
 impl Hub {
@@ -294,6 +323,71 @@ impl Hub {
             next_cid: 0,
             events_tx,
             events,
+            catalog: None,
+            catalog_serial: None,
+        }
+    }
+
+    /// Keeps `catalog` in step with the helper's catalogue messages.
+    pub fn set_catalog(&mut self, catalog: Catalog) {
+        self.catalog = Some(catalog);
+    }
+
+    /// A session with `serial` is up: the first catalogue sync window opens.
+    pub fn session_started(&mut self, serial: &str) {
+        self.catalog_serial = Some(serial.to_owned());
+        if let Some(catalog) = self.catalog.as_mut() {
+            catalog.begin_sync(serial);
+        }
+    }
+
+    /// `app`/`apps_end`/`app_removed` from the helper. Catalogue file writes are small and
+    /// synchronous; kbuildsycoca6 runs off this loop.
+    fn on_catalogue(&mut self, c: Control) {
+        let Some(catalog) = self.catalog.as_mut() else {
+            return;
+        };
+        match c {
+            Control::App {
+                pkg,
+                user,
+                label,
+                work,
+                icon,
+            } => {
+                let entry = AppEntry::from_message(pkg, user, label, work, &icon);
+                if let Err(error) = catalog.upsert(&entry) {
+                    tracing::warn!(
+                        pkg = entry.pkg,
+                        user,
+                        error = format!("{error:#}"),
+                        "catalogue entry not written"
+                    );
+                }
+            }
+            Control::AppRemoved { pkg, user } => {
+                if let Err(error) = catalog.remove(&pkg, user) {
+                    tracing::warn!(
+                        pkg,
+                        user,
+                        error = format!("{error:#}"),
+                        "catalogue removal failed"
+                    );
+                }
+            }
+            Control::AppsEnd { count } => {
+                match catalog.end_sync(count) {
+                    Ok(removed) => tracing::info!(count, removed, "catalogue synced"),
+                    Err(error) => {
+                        tracing::warn!(error = format!("{error:#}"), "catalogue prune failed")
+                    }
+                }
+                // The next full sync (a companion relink, a profile change) gets its own window.
+                if let Some(serial) = &self.catalog_serial {
+                    catalog.begin_sync(serial);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -630,7 +724,22 @@ impl Hub {
                     }
                     self.companion = Some(state);
                 }
-                other => tracing::debug!(?other, "helper stream-0 frame"),
+                Ok(
+                    c
+                    @ (Control::App { .. } | Control::AppsEnd { .. } | Control::AppRemoved { .. }),
+                ) => {
+                    log_catalogue(&c);
+                    self.on_catalogue(c);
+                }
+                // Never dump whole frames: some carry icons or clipboard text.
+                Ok(_) => tracing::debug!(
+                    t = control_type(&frame.payload),
+                    len = frame.payload.len(),
+                    "helper stream-0 frame"
+                ),
+                Err(error) => {
+                    tracing::debug!(%error, len = frame.payload.len(), "undecodable helper stream-0 frame")
+                }
             }
             return Ok(());
         }

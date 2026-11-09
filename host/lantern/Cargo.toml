@@ -6,6 +6,7 @@ description = "Lantern host daemon"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.23"
 async-stream = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"

@@ -77,6 +77,12 @@ impl OpenState {
         }
     }
 
+    /// Whether `error{msg}` on `stream` is the daemon refusing our open because no phone is
+    /// connected, which gets a "Connect your phone" notification.
+    pub fn connect_notice(&self, stream: u32, msg: &str) -> bool {
+        stream == 0 && self.win.is_none() && msg == crate::daemon::ipc::NOT_CONNECTED
+    }
+
     fn failure(&self, fallback: &str) -> Exit {
         Exit {
             code: 1,
@@ -87,6 +93,15 @@ impl OpenState {
             ),
         }
     }
+}
+
+/// Whether failing to connect to lanternd's socket means nobody is serving it (not running or a
+/// stale socket), which for the user is the same as no phone being connected.
+pub fn daemon_unreachable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 #[cfg(test)]
@@ -162,6 +177,29 @@ mod tests {
         );
         assert_eq!(s.on_error(2, "encoder died".into()), None);
         assert_eq!(s.on_closed(2, CloseReason::Error), failed("encoder died"));
+    }
+
+    #[test]
+    fn connect_notice_only_for_a_refused_open_without_phone() {
+        let s = OpenState::default();
+        assert!(s.connect_notice(0, "phone not connected"));
+        assert!(!s.connect_notice(0, "open out of range: user=..."));
+        assert!(!s.connect_notice(3, "phone not connected"));
+        let mut opened = OpenState::default();
+        opened.opened(1);
+        assert!(!opened.connect_notice(0, "phone not connected"));
+    }
+
+    #[test]
+    fn unreachable_daemon_means_no_phone() {
+        use std::io::{Error, ErrorKind};
+        assert!(daemon_unreachable(&Error::from(ErrorKind::NotFound)));
+        assert!(daemon_unreachable(&Error::from(
+            ErrorKind::ConnectionRefused
+        )));
+        assert!(!daemon_unreachable(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
     }
 
     #[test]

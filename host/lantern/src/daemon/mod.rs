@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod companion;
 pub mod ipc;
 pub mod registry;
@@ -81,6 +82,36 @@ fn cancel_start<F>(starting: &mut Starting<F>, why: &str) {
     }
 }
 
+/// [`serve`] that also keeps `catalog` (the phone's apps as menu entries) in step with the
+/// helper's `app`/`apps_end`/`app_removed` messages.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_catalog<E, S, F, D>(
+    listener: UnixListener,
+    catalog: Option<catalog::Catalog>,
+    configured: Option<String>,
+    events: E,
+    starter: S,
+    shutdown: D,
+    policy: RetryPolicy,
+) -> Result<()>
+where
+    E: Stream<Item = DeviceEvent>,
+    S: FnMut(String) -> F,
+    F: Future<Output = Result<SessionConn>>,
+    D: Future<Output = &'static str>,
+{
+    let mut hub = Hub::new(Some(listener));
+    if let Some(catalog) = catalog {
+        hub.set_catalog(catalog);
+    }
+    let path = hub.socket_path();
+    let result = drive(hub, configured, events, starter, shutdown, policy).await;
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
 /// The daemon's state machine without a window socket: helper frames are drained and dropped.
 /// See [`serve`].
 pub async fn run_loop<E, S, F, D>(
@@ -124,13 +155,10 @@ where
     F: Future<Output = Result<SessionConn>>,
     D: Future<Output = &'static str>,
 {
-    let hub = Hub::new(Some(listener));
-    let path = hub.socket_path();
-    let result = drive(hub, configured, events, starter, shutdown, policy).await;
-    if let Some(path) = path {
-        let _ = std::fs::remove_file(path);
-    }
-    result
+    serve_with_catalog(
+        listener, None, configured, events, starter, shutdown, policy,
+    )
+    .await
 }
 
 /// Every branch is polled concurrently: a session start in flight never blocks shutdown, device
@@ -228,6 +256,7 @@ where
                 match result {
                     Ok(session) => {
                         tracing::info!(serial, helper = session.helper_sha(), "session ready");
+                        hub.session_started(&serial);
                         active = Some((session, Instant::now()));
                     }
                     Err(error) if HandshakeError::find(&error).is_some() => {
@@ -315,8 +344,19 @@ pub async fn run() -> Result<()> {
     };
     // Shared by every session start: the companion-failure notice is once per daemon run.
     let setup = std::sync::Arc::new(companion::Setup::desktop());
-    serve(
+    let catalog = match catalog::Dirs::from_env() {
+        Ok(dirs) => Some(catalog::Catalog::new(dirs)),
+        Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "no menu entries for phone apps"
+            );
+            None
+        }
+    };
+    serve_with_catalog(
         listener,
+        catalog,
         configured,
         track_devices(),
         move |serial| {

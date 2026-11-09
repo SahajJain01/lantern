@@ -10,6 +10,28 @@ pub struct Identity {
 
 pub const MAX_USER: u32 = i32::MAX as u32;
 
+/// Wayland app_id (and `.desktop` file stem / `StartupWMClass`) of `pkg` in Android user `user`.
+/// User 0 keeps `lantern.<pkg>`; another user gets `lantern.<pkg>-u<N>`. `-` never occurs in an
+/// Android package name, so no package can produce another user's id.
+pub fn app_id(pkg: &str, user: u32) -> String {
+    match user {
+        0 => format!("lantern.{pkg}"),
+        n => format!("lantern.{pkg}-u{n}"),
+    }
+}
+
+/// Longest label (in chars) Lantern shows in a title or menu entry.
+pub const MAX_LABEL: usize = 200;
+
+/// ` (work)` for a work-profile app, ` (user N)` for another non-owner user, else nothing.
+pub fn profile_suffix(user: u32, work: bool) -> String {
+    match (work, user) {
+        (true, _) => " (work)".to_owned(),
+        (false, 0) => String::new(),
+        (false, n) => format!(" (user {n})"),
+    }
+}
+
 impl Identity {
     /// Parses the arguments after `open`: `[--user N | --user=N] <pkg>`. `Err` is a usage error.
     pub fn parse_args(args: &[&str]) -> Result<Self, String> {
@@ -58,20 +80,25 @@ impl Identity {
         })
     }
 
-    /// Wayland app_id. User 0 keeps `lantern.<pkg>`; another user gets `lantern.<pkg>-u<N>`.
-    /// `-` never occurs in an Android package name, so no package can produce another user's id.
+    /// Wayland app_id: see [`app_id`].
     pub fn app_id(&self) -> String {
-        match self.user {
-            0 => format!("lantern.{}", self.pkg),
-            n => format!("lantern.{}-u{n}", self.pkg),
-        }
+        app_id(&self.pkg, self.user)
     }
 
-    pub fn title(&self) -> String {
-        match self.user {
-            0 => self.pkg.clone(),
-            n => format!("{} (user {n})", self.pkg),
-        }
+    /// Window title: the app's launcher label (control characters dropped, capped so the whole
+    /// title is at most [`MAX_LABEL`] chars), or the package when the label is unknown or empty,
+    /// plus [`profile_suffix`].
+    pub fn title(&self, label: Option<&str>, work: bool) -> String {
+        let suffix = profile_suffix(self.user, work);
+        let room = MAX_LABEL.saturating_sub(suffix.chars().count());
+        let clean: String = label
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(room)
+            .collect();
+        let name = if clean.is_empty() { &self.pkg } else { &clean };
+        format!("{name}{suffix}")
     }
 
     /// One stderr line when the phone moved an already-open task into this window (`opened.moved`).
@@ -100,6 +127,35 @@ mod tests {
             pkg: pkg.into(),
             user,
         }
+    }
+
+    #[test]
+    fn title_uses_label_and_suffixes() {
+        assert_eq!(id("com.a", 0).title(Some("Settings"), false), "Settings");
+        assert_eq!(id("com.a", 10).title(Some("Files"), true), "Files (work)");
+        assert_eq!(
+            id("com.a", 11).title(Some("Files"), false),
+            "Files (user 11)"
+        );
+        assert_eq!(id("com.a", 0).title(Some("Files"), true), "Files (work)");
+        // Empty (or control-only) labels are unknown: the package stands in.
+        assert_eq!(id("com.a", 0).title(Some(""), false), "com.a");
+        assert_eq!(id("com.a", 10).title(Some(""), true), "com.a (work)");
+        assert_eq!(id("com.a", 10).title(None, false), "com.a (user 10)");
+        // Control characters are dropped and the label is capped.
+        assert_eq!(id("com.a", 0).title(Some("A\nB\u{7}"), false), "AB");
+        let long = "z".repeat(1000);
+        assert!(id("com.a", 0).title(Some(&long), false).chars().count() <= 200);
+    }
+
+    #[test]
+    fn app_id_is_shared() {
+        assert_eq!(app_id("com.a", 0), id("com.a", 0).app_id());
+        assert_eq!(app_id("com.a", 10), "lantern.com.a-u10");
+        assert_eq!(
+            crate::daemon::catalog::app_id("com.a", 10),
+            "lantern.com.a-u10"
+        );
     }
 
     #[test]
@@ -166,7 +222,7 @@ mod tests {
     fn user_zero_names_are_unchanged() {
         let i = id("com.android.settings", 0);
         assert_eq!(i.app_id(), "lantern.com.android.settings");
-        assert_eq!(i.title(), "com.android.settings");
+        assert_eq!(i.title(None, false), "com.android.settings");
         assert_eq!(i.size_key(), "com.android.settings");
     }
 
@@ -174,7 +230,7 @@ mod tests {
     fn other_users_get_distinct_names() {
         let i = id("com.android.settings", 10);
         assert_eq!(i.app_id(), "lantern.com.android.settings-u10");
-        assert_eq!(i.title(), "com.android.settings (user 10)");
+        assert_eq!(i.title(None, false), "com.android.settings (user 10)");
         assert_eq!(i.size_key(), "com.android.settings:10");
         // No package (letters, digits, `_`, `.`) can make user 0's app_id equal another user's.
         assert_ne!(id("com.a.u10", 0).app_id(), id("com.a", 10).app_id());

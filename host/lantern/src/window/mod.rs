@@ -349,10 +349,10 @@ impl App {
         geometry::video_rect((size.width, size.height), video)
     }
 
-    fn create_window(&mut self, el: &ActiveEventLoop) -> Result<()> {
+    fn create_window(&mut self, el: &ActiveEventLoop, title: String) -> Result<()> {
         let (lw, lh) = self.logical;
         let mut attrs = Window::default_attributes()
-            .with_title(self.id.title())
+            .with_title(title)
             .with_name(self.id.app_id(), "")
             .with_inner_size(LogicalSize::new(lw, lh))
             .with_min_inner_size(LogicalSize::new(200, 150));
@@ -452,6 +452,9 @@ impl App {
         match c {
             Control::Error { msg, .. } => {
                 tracing::error!(stream, msg, "error from phone");
+                if self.state.connect_notice(stream, &msg) {
+                    notify_connect_phone(&self.id);
+                }
                 if let Some(exit) = self.state.on_error(stream, msg) {
                     self.finish(el, exit);
                 }
@@ -470,15 +473,17 @@ impl App {
                 w,
                 h,
                 moved,
-                ..
+                label,
+                work,
             } if self.state.win().is_none() => {
-                tracing::info!(win = stream, phone_display, task, %codec, w, h, moved, "opened");
+                tracing::info!(win = stream, phone_display, task, %codec, w, h, moved, work, "opened");
                 if moved {
                     eprintln!("{}", self.id.moved_notice());
                 }
                 self.state.opened(stream);
                 self.display = (w, h);
-                if let Err(error) = self.create_window(el) {
+                let title = self.id.title(label.as_deref(), work);
+                if let Err(error) = self.create_window(el, title) {
                     eprintln!("lantern: {error:#}");
                     self.exit(el, 1);
                     return;
@@ -753,6 +758,20 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// "Connect your phone": the app (named as in its menu entry, with its icon) opens once a
+/// phone is plugged in. The exit status is unaffected.
+fn notify_connect_phone(id: &identity::Identity) {
+    let (summary, body, icon) = match crate::daemon::catalog::Dirs::from_env() {
+        Ok(dirs) => crate::daemon::catalog::connect_notice(&dirs, &id.pkg, id.user),
+        Err(_) => (
+            "Connect your phone".to_owned(),
+            format!("{} opens when your phone is connected by USB.", id.pkg),
+            None,
+        ),
+    };
+    crate::notify::send(&summary, &body, icon.as_deref());
+}
+
 /// Runs `lantern open [--user N] <pkg>`; returns the process exit code.
 pub fn run(id: &identity::Identity) -> Result<i32> {
     // Our launch token goes to the daemon (for an already-open window) and to our own window;
@@ -764,12 +783,20 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
     std::env::remove_var("DESKTOP_STARTUP_ID");
 
     let sock_path = ipc::socket_path_in(&ipc::runtime_dir()?);
-    let sock = UnixStream::connect(&sock_path).with_context(|| {
-        format!(
-            "lanternd is not running (cannot connect to {})",
-            sock_path.display()
-        )
-    })?;
+    let sock = match UnixStream::connect(&sock_path) {
+        Ok(sock) => sock,
+        Err(error) => {
+            if outcome::daemon_unreachable(&error) {
+                notify_connect_phone(id);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "lanternd is not running (cannot connect to {})",
+                    sock_path.display()
+                )
+            });
+        }
+    };
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
