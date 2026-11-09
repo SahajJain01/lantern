@@ -185,7 +185,8 @@ The companion's `LinkReceiver` (also DUMP-only) takes one test-only command, `am
 true|false`, which enables its `TestActivity` or returns it to disabled. The shell may not
 `pm enable` another package's component (only a testOnly package's), so device tests use this.
 `TestActivity` is one EditText that logs `text=<content>` with tag `LanternTest` on every change;
-it is disabled outside tests.
+it is disabled outside tests. On every new link the companion returns it to disabled if it was
+left enabled (a test run killed before its cleanup); no device test spans a relink.
 
 Messages on the link:
 

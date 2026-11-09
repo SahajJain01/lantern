@@ -36,4 +36,23 @@ public final class LinkReceiver extends BroadcastReceiver {
         Log.i(Link.TAG, "test activity " + (on ? "enabled" : "back to disabled"));
         setResultCode(1);
     }
+
+    /**
+     * Returns {@link TestActivity} to its manifest state (disabled) if a device test left it
+     * enabled (e.g. the suite was SIGKILLed): it is an exported launcher entry that logs typed
+     * text. {@link Link} calls this on every new link; no device test spans a relink. Never throws.
+     */
+    static void resetTestActivity(Context context) {
+        try {
+            PackageManager pm = context.getPackageManager();
+            ComponentName c = new ComponentName(context, TestActivity.class);
+            if (pm.getComponentEnabledSetting(c) != PackageManager.COMPONENT_ENABLED_STATE_DEFAULT) {
+                pm.setComponentEnabledSetting(c, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT,
+                    PackageManager.DONT_KILL_APP);
+                Log.i(Link.TAG, "test activity was left enabled; back to disabled");
+            }
+        } catch (RuntimeException e) {
+            Log.w(Link.TAG, "test activity reset failed: " + e);
+        }
+    }
 }
