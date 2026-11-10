@@ -870,11 +870,24 @@ impl ApplicationHandler<UserEvent> for App {
 
 /// "Connect your …": the app (named as in its menu entry, with its icon) opens once a phone
 /// that has it is plugged in, named from the device records. For [`Notice::NotOnThisPhone`]
-/// the connected phone comes from `lantern status` (none if that fails). The exit status is
-/// unaffected.
+/// the connected phone comes from `lantern status` (none if that fails). [`Notice::Paused`]
+/// gets "Lantern is disconnected" instead. The exit status is unaffected.
 fn notify_connect_phone(id: &identity::Identity, notice: Notice) {
+    if notice == Notice::Paused {
+        let (summary, body, icon) = match crate::daemon::catalog::Dirs::from_env() {
+            Ok(dirs) => crate::daemon::catalog::paused_notice(&dirs, &id.pkg, id.user),
+            Err(_) => (
+                "Lantern is disconnected".to_owned(),
+                format!("Click Connect in Lantern's tray menu to open {}.", id.pkg),
+                None,
+            ),
+        };
+        tracing::info!("paused notice: {summary}");
+        crate::notify::send(&summary, &body, icon.as_deref());
+        return;
+    }
     let here = match notice {
-        Notice::NoPhone => None,
+        Notice::NoPhone | Notice::Paused => None,
         Notice::NotOnThisPhone => ipc::runtime_dir()
             .and_then(|dir| ipc::query_status(&ipc::socket_path_in(&dir)))
             .ok()

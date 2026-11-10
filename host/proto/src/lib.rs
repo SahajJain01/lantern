@@ -254,6 +254,11 @@ pub enum Control {
     Status,
     /// Host-only: lanternd's answer to [`Control::Status`].
     StatusReport(StatusReport),
+    /// Host-only (`lantern connect|disconnect` -> lanternd, stream 0, first frame): queue `cmd`.
+    /// lanternd answers with its current `status_report` and closes. Never sent to the helper.
+    Daemon {
+        cmd: DaemonCmd,
+    },
     /// Helper -> daemon, stream 0: one launcher app of the catalogue. `icon` is a base64 PNG
     /// (at most [`MAX_ICON`] bytes before base64) or `""`.
     App {
@@ -292,6 +297,16 @@ pub enum Control {
     },
 }
 
+/// What `lantern connect|disconnect` asks lanternd to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonCmd {
+    /// Serve the phone again after a disconnect (and retry a backed-off start now).
+    Connect,
+    /// End the session and leave the phone alone until it is replugged or connected again.
+    Disconnect,
+}
+
 /// Whether the companion app is linked to the helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -320,6 +335,9 @@ pub enum SessionState {
     Starting,
     /// A helper session is live; windows can open.
     Ready,
+    /// Host-only: the user disconnected the phone in Lantern (or it is undoing its setup);
+    /// nothing starts until it is replugged or connected again. `serial` is that phone.
+    Paused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -936,7 +954,10 @@ mod tests {
     #[test]
     fn hello_keyboard_false_json_shape() {
         let s = serde_json::to_string(&hello(false)).unwrap();
-        assert_eq!(s, r#"{"t":"hello","version":1,"token":"t","keyboard":false}"#);
+        assert_eq!(
+            s,
+            r#"{"t":"hello","version":1,"token":"t","keyboard":false}"#
+        );
         assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), hello(false));
     }
 
@@ -1099,6 +1120,41 @@ mod tests {
             Control::decode(s.as_bytes()).unwrap(),
             Control::StatusReport(r)
         );
+    }
+
+    #[test]
+    fn session_state_paused_json() {
+        assert_eq!(
+            serde_json::to_string(&SessionState::Paused).unwrap(),
+            r#""paused""#
+        );
+        let report = Control::StatusReport(StatusReport {
+            state: SessionState::Paused,
+            serial: Some("20e9318".into()),
+            helper: None,
+            windows: vec![],
+            companion: None,
+        });
+        let json = r#"{"t":"status_report","state":"paused","serial":"20e9318","helper":null,"windows":[]}"#;
+        assert_eq!(String::from_utf8(report.encode()).unwrap(), json);
+        assert_eq!(Control::decode(json.as_bytes()).unwrap(), report);
+    }
+
+    #[test]
+    fn daemon_cmd_json_shape() {
+        for (cmd, json) in [
+            (DaemonCmd::Connect, r#"{"t":"daemon","cmd":"connect"}"#),
+            (
+                DaemonCmd::Disconnect,
+                r#"{"t":"daemon","cmd":"disconnect"}"#,
+            ),
+        ] {
+            let c = Control::Daemon { cmd };
+            assert_eq!(String::from_utf8(c.encode()).unwrap(), json);
+            assert_eq!(Control::decode(json.as_bytes()).unwrap(), c);
+        }
+        assert!(Control::decode(br#"{"t":"daemon","cmd":"quit"}"#).is_err());
+        assert!(Control::decode(br#"{"t":"daemon"}"#).is_err());
     }
 
     #[test]

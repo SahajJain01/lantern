@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use lantern_proto::{
-    read_frame_async, write_frame_async, CompanionState, Control, Frame, InputEvent, Kind,
-    SessionState, StatusReport, WindowInfo, MAX_CLIP, MAX_IME_TEXT,
+    read_frame_async, write_frame_async, CompanionState, Control, DaemonCmd, Frame, InputEvent,
+    Kind, SessionState, StatusReport, WindowInfo, MAX_CLIP, MAX_IME_TEXT,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::error::TrySendError;
@@ -45,6 +45,8 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const NOT_CONNECTED: &str = "phone not connected";
 /// The open's app is in the menu for other phones only (known once this phone has synced).
 pub const NOT_ON_THIS_PHONE: &str = "app not on this phone";
+/// The user disconnected the phone in Lantern (tray or `lantern disconnect`).
+pub const PAUSED: &str = "phone disconnected in Lantern";
 
 pub fn socket_path_in(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("lantern").join("daemon.sock")
@@ -145,6 +147,17 @@ pub fn bind(runtime_dir: &Path) -> Result<UnixListener> {
 
 /// `lantern status`: asks the daemon listening on `sock` for its [`StatusReport`]. Blocking.
 pub fn query_status(sock: &Path) -> Result<StatusReport> {
+    request_report(sock, Control::Status, "status")
+}
+
+/// `lantern connect|disconnect`: queues `cmd` in the daemon listening on `sock` and returns its
+/// [`StatusReport`] from before the command applies. Blocking.
+pub fn send_daemon_cmd(sock: &Path, cmd: DaemonCmd) -> Result<StatusReport> {
+    request_report(sock, Control::Daemon { cmd }, "daemon command")
+}
+
+/// Sends `request` as the first frame and reads the `status_report` it gets.
+fn request_report(sock: &Path, request: Control, what: &str) -> Result<StatusReport> {
     let mut stream = std::os::unix::net::UnixStream::connect(sock).with_context(|| {
         format!(
             "lanternd is not running (cannot connect to {})",
@@ -153,15 +166,15 @@ pub fn query_status(sock: &Path) -> Result<StatusReport> {
     })?;
     stream.set_read_timeout(Some(OPEN_TIMEOUT))?;
     stream.set_write_timeout(Some(OPEN_TIMEOUT))?;
-    lantern_proto::write_frame(&mut stream, &control(0, Control::Status))
-        .context("send status request")?;
+    lantern_proto::write_frame(&mut stream, &control(0, request))
+        .with_context(|| format!("send {what} request"))?;
     let reply = lantern_proto::read_frame(&mut stream)
-        .context("read status reply")?
-        .context("lanternd closed the connection without a status reply")?;
+        .with_context(|| format!("read {what} reply"))?
+        .with_context(|| format!("lanternd closed the connection without a {what} reply"))?;
     match (reply.kind, Control::decode(&reply.payload)) {
         (Kind::Control, Ok(Control::StatusReport(report))) => Ok(report),
         (Kind::Control, Ok(Control::Error { msg, .. })) => bail!("lanternd: {msg}"),
-        (kind, other) => bail!("unexpected status reply: {kind:?} {other:?}"),
+        (kind, other) => bail!("unexpected {what} reply: {kind:?} {other:?}"),
     }
 }
 
@@ -322,6 +335,8 @@ pub struct Hub {
     settings: Option<watch::Receiver<Settings>>,
     /// `clipboard_sync` as of the last clipboard event, to reset `clip_sync` when it turns on.
     clip_was_on: bool,
+    /// `lantern connect|disconnect` commands not yet taken by the run loop.
+    commands: Vec<DaemonCmd>,
 }
 
 impl Hub {
@@ -344,7 +359,13 @@ impl Hub {
             clip_sync: ClipSync::default(),
             settings: None,
             clip_was_on: true,
+            commands: Vec::new(),
         }
+    }
+
+    /// The `lantern connect|disconnect` commands received since the last call, oldest first.
+    pub fn take_commands(&mut self) -> Vec<DaemonCmd> {
+        std::mem::take(&mut self.commands)
     }
 
     /// Follows the user's settings: while `clipboard_sync` is false nothing crosses either way.
@@ -692,6 +713,13 @@ impl Hub {
             self.reply_and_finish(cid, control(0, report));
             return Ok(());
         }
+        if let Some(Control::Daemon { cmd }) = open {
+            tracing::info!(cid, ?cmd, "daemon command");
+            self.commands.push(cmd);
+            let report = Control::StatusReport(self.status());
+            self.reply_and_finish(cid, control(0, report));
+            return Ok(());
+        }
         let Some(Control::Open {
             pkg,
             user,
@@ -718,7 +746,11 @@ impl Hub {
             return Ok(());
         }
         let Some(helper) = helper else {
-            self.reply_and_finish(cid, control(0, Control::error(NOT_CONNECTED)));
+            let msg = match self.session.0 {
+                SessionState::Paused => PAUSED,
+                _ => NOT_CONNECTED,
+            };
+            self.reply_and_finish(cid, control(0, Control::error(msg)));
             return Ok(());
         };
         if self.not_on_this_phone(&pkg, user) {

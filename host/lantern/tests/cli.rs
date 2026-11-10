@@ -89,6 +89,32 @@ fn status_with_arguments_is_a_usage_error() {
 }
 
 #[test]
+fn connect_and_disconnect_without_a_daemon_exit_1() {
+    for cmd in ["connect", "disconnect"] {
+        let dir = scratch("cmd-none");
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .arg(cmd)
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{cmd} stderr: {stderr}");
+        assert!(
+            stderr.contains("lanternd is not running"),
+            "stderr: {stderr}"
+        );
+        let usage = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .args([cmd, "extra"])
+            .output()
+            .unwrap();
+        assert_eq!(usage.status.code(), Some(2), "{cmd} extra");
+        let text = String::from_utf8(usage.stderr).unwrap();
+        assert!(text.contains(&format!("lantern {cmd}")), "usage: {text}");
+    }
+}
+
+#[test]
 fn daemon_runtime_failure_exits_1() {
     // No XDG_RUNTIME_DIR: the daemon cannot place its socket. That is a runtime failure, not
     // a usage error (2) and not a protocol mismatch (3).
@@ -138,9 +164,18 @@ fn status_prints_the_running_daemons_state_as_json() {
         .env("XDG_RUNTIME_DIR", &dir)
         .output()
         .unwrap();
+    // `lantern disconnect` with nothing live: the report, exit 0, still idle.
+    let disconnect = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .arg("disconnect")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .output()
+        .unwrap();
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let exit = daemon.wait().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(disconnect.status.code(), Some(0));
+    let reply: serde_json::Value = serde_json::from_slice(&disconnect.stdout).unwrap();
+    assert_eq!(reply["state"], "idle");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(
         output.status.code(),
@@ -400,7 +435,7 @@ fn undo_setup_refuses_live_session() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.contains("stop lanternd first: systemctl --user stop lanternd"),
+        stderr.contains(lantern::undo::STOP_FIRST),
         "stderr: {stderr}"
     );
     // undo-setup itself made no adb call (the daemon's own calls may continue meanwhile).
@@ -473,7 +508,7 @@ fn undo_setup_refuses_idle_daemon() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.contains("stop lanternd first: systemctl --user stop lanternd"),
+        stderr.contains(lantern::undo::STOP_FIRST),
         "stderr: {stderr}"
     );
     let new_calls = &calls_after[calls_before.len().min(calls_after.len())..];

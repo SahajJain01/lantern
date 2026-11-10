@@ -763,6 +763,23 @@ pub fn connect_notice(
     user: u32,
     here: Option<&str>,
 ) -> (String, String, Option<PathBuf>) {
+    let (app, owned, icon) = app_of_entry(dirs, pkg, user);
+    notice_for_phones(names, app, owned, here, icon)
+}
+
+/// "Lantern is disconnected": the open was refused because the user disconnected the phone in
+/// Lantern. The app is named (with its icon) as in its menu entry.
+pub fn paused_notice(dirs: &Dirs, pkg: &str, user: u32) -> (String, String, Option<PathBuf>) {
+    let (app, _, icon) = app_of_entry(dirs, pkg, user);
+    (
+        "Lantern is disconnected".to_owned(),
+        format!("Click Connect in Lantern's tray menu to open {app}."),
+        icon,
+    )
+}
+
+/// The app's name from its menu entry (else `pkg`), the entry itself, and its icon file.
+fn app_of_entry(dirs: &Dirs, pkg: &str, user: u32) -> (String, Option<Owned>, Option<PathBuf>) {
     let (owned, icon) = if check_pkg(pkg).is_ok() {
         let owned = read_owned(&dirs.desktop_path(pkg, user)).ok().flatten();
         let icon = Some(dirs.icon_path(pkg, user)).filter(|p| p.is_file());
@@ -775,6 +792,16 @@ pub fn connect_notice(
         .and_then(|o| o.name.clone())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| pkg.to_owned());
+    (app, owned, icon)
+}
+
+fn notice_for_phones(
+    names: &dyn Fn(&str) -> Option<String>,
+    app: String,
+    owned: Option<Owned>,
+    here: Option<&str>,
+    icon: Option<PathBuf>,
+) -> (String, String, Option<PathBuf>) {
     let n = |serial: &str| names(serial).unwrap_or_else(|| serial.to_owned());
     let phones: &[String] = owned.as_ref().map_or(&[], |o| &o.serials);
     let (summary, body) = match phones {
@@ -1612,6 +1639,29 @@ mod tests {
         let dirs = cat.dirs();
         let (_, body, icon) = connect_notice(dirs, &|_| None, "com.a", 0, None);
         assert_eq!(body, "Sett\\ings opens when your s is connected by USB.");
+        assert_eq!(icon, Some(icons.join("lantern.com.a.png")));
+    }
+
+    #[test]
+    fn paused_notice_names_the_app() {
+        let (_t, dirs) = tmp();
+        let (s, body, icon) = paused_notice(&dirs, "com.a", 0);
+        assert_eq!(s, "Lantern is disconnected");
+        assert_eq!(body, "Click Connect in Lantern's tray menu to open com.a.");
+        assert_eq!(icon, None);
+        let icons = dirs.icons.clone();
+        let (mut cat, _) = quiet(Dirs { ..dirs });
+        cat.start_session("s");
+        cat.upsert(&AppEntry {
+            label: "Settings".into(),
+            ..entry("com.a", 0)
+        })
+        .unwrap();
+        let (_, body, icon) = paused_notice(cat.dirs(), "com.a", 0);
+        assert_eq!(
+            body,
+            "Click Connect in Lantern's tray menu to open Settings."
+        );
         assert_eq!(icon, Some(icons.join("lantern.com.a.png")));
     }
 }

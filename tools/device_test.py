@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-18
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-19
     python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
@@ -13,7 +13,8 @@ Klipper's D-Bus (items 13, 17). Opens only com.android.settings, org.lineageos.j
 companion's test screen (enabled only during items 10, 12, 13 and 17), each for a few seconds,
 and touches no other window. Items 13 and 17 save the PC clipboard's text and put it back
 afterwards; items 17 and 18 also save ~/.config/lantern/settings.toml and restore it (or remove it
-if it was absent); item 18 restarts lanternd with the keyboard off and back on.
+if it was absent); item 18 restarts lanternd with the keyboard off and back on; item 19
+disconnects the phone in Lantern for ~15 s and connects it again.
 Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
 The window items (2-6, 11-13, 17) need frames from the compositor, which a locked Plasma session
@@ -115,6 +116,14 @@ def status():
     if r.returncode != 0:
         raise Fail(f"lantern status -> {r.returncode}: {r.stderr.strip()}")
     return json.loads(r.stdout)
+
+
+def lantern_cmd(cmd):
+    """`lantern connect|disconnect`: the status report lanternd answered with (as JSON)."""
+    r = subprocess.run([LANTERN, cmd], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise Fail(f"lantern {cmd} -> {r.returncode}: {r.stderr.strip()}")
+    return r.stdout.strip()
 
 
 def systemctl(*args, check_rc=True):
@@ -1185,6 +1194,39 @@ class Suite:
                     ("disable the test screen", lambda: test_activity(False)))
 
 
+    def disconnect_and_connect(self):
+        """`lantern disconnect` ends the session and the helper restores the phone within 5 s;
+        lanternd then stays `paused` (no restart) for 15 s. `lantern connect` makes it ready
+        again within 15 s."""
+        base = baseline()  # 1. the originals, read with lanternd stopped
+        note(f"originals: stay_on={base['stay_on']} ime={base['ime']} imes={base['imes']}")
+        connected = False
+        try:
+            # 2. Disconnect: restored, and paused for 15 s.
+            note(f"lantern disconnect: {lantern_cmd('disconnect')}")
+            st, secs = wait_until("phone restored", 5,
+                                  lambda: restored(s := phone_state()) and s, interval=0.2)
+            note(f"restored {secs:.1f} s after disconnect: {st}")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                now = status()
+                check(now["state"] == "paused" and now["serial"] == SERIAL,
+                      f"not paused after disconnect: {json.dumps(now)}")
+                check(not phone_state()["helper_pids"], "a helper started while paused")
+                time.sleep(1)
+            note(f"paused for 15 s: {json.dumps(status())}")
+            # 3. Connect: ready again.
+            note(f"lantern connect: {lantern_cmd('connect')}")
+            _, secs = wait_ready(15)
+            connected = True
+            note(f"ready {secs:.1f} s after connect")
+        finally:
+            # 4. Leave lanternd ready, whatever failed.
+            if not connected:
+                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect")),
+                        ("lanternd ready", lambda: wait_ready(15)))
+
+
 ITEMS = [
     "session_starts_on_plug",
     "open_settings_creates_one_display",
@@ -1204,6 +1246,7 @@ ITEMS = [
     "not_on_this_phone_notice",
     "clipboard_setting_off",
     "keyboard_setting_off",
+    "disconnect_and_connect",
 ]
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
 

@@ -934,3 +934,32 @@ async fn undo_setup_failure_exits_nonzero_and_keeps_going() {
     assert_eq!(out.lines().count(), 4, "one line per step: {out}");
     let _ = std::fs::remove_dir_all(&state);
 }
+
+#[tokio::test]
+async fn undo_run_steps_keeps_record_when_forget_fails() {
+    let fake = FakeAdb::new("undo-steps", "0");
+    fake.installed(&companion::companion_sha());
+    fake.write("forget_fail", "");
+    let state = state_dir("undo-steps");
+    assert!(record_setup(&state, "fake-serial", Install::Installed).unwrap());
+    let removed = std::sync::Mutex::new(Vec::<String>::new());
+    let remove_entries = |serial: &str| -> anyhow::Result<usize> {
+        removed.lock().unwrap().push(serial.to_owned());
+        Ok(3)
+    };
+    let mut out = Vec::new();
+    let ok = undo::run_steps(&fake.adb(), &state, &remove_entries, &mut out)
+        .await
+        .unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(!ok, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 4, "{out}");
+    assert!(lines[0].starts_with("helper --forget: FAILED"), "{out}");
+    assert!(lines[1].starts_with("companion:"), "{out}");
+    assert_eq!(lines[2], "catalogue: removed 3 entries", "{out}");
+    assert!(lines[3].starts_with("device record: kept"), "{out}");
+    assert_eq!(*removed.lock().unwrap(), ["fake-serial"]);
+    assert!(state.join("devices/fake-serial.json").exists());
+    let _ = std::fs::remove_dir_all(&state);
+}

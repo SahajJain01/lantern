@@ -338,8 +338,10 @@ Host-only; the helper never sees these, and the daemon never forwards them.
 - A client whose first frame is `{"t":"status"}` on stream 0 gets one `status_report` on stream 0
   and is closed. It works with or without a phone session.
 - `status_report`: `state` (`"idle"`: no session and none starting; `"starting"`: helper deploy
-  and handshake in flight; `"ready"`: live session), `serial` (the device being started or served,
-  else `null`), `helper` (the live helper jar's SHA-256 when `ready`, else `null`) and `windows`:
+  and handshake in flight; `"ready"`: live session; `"paused"`: the user disconnected the phone in
+  Lantern, or it is undoing its setup, and nothing starts for it until it is replugged or
+  connected again), `serial` (the device being started, served or paused, else `null`), `helper`
+  (the live helper jar's SHA-256 when `ready`, else `null`) and `windows`:
   `[{id: u32, pkg: string, user: u32}]`, the open windows sorted by id.
   Optional `companion` (`"ready"` or `"unavailable"`): the companion link's state, omitted when
   unknown (so a report without it is unchanged).
@@ -348,6 +350,23 @@ Host-only; the helper never sees these, and the daemon never forwards them.
 
 `lantern status` prints the report without `t`, e.g.
 `{"state":"ready","serial":"20e9318","helper":"ae30…","windows":[{"id":1,"pkg":"com.android.settings","user":0}],"companion":"ready"}`.
+
+### Daemon commands (`lantern connect|disconnect`)
+
+Host-only, like `status`.
+
+- A client whose first frame is `{"t":"daemon","cmd":"connect"|"disconnect"}` on stream 0 gets
+  one `status_report` (the state before the command applies) on stream 0 and is closed. The
+  daemon queues the command. As anything but the first frame it is a protocol error.
+- `disconnect`: the phone being served, started or retried is paused: the session ends with
+  `bye` (the helper restores the phone) and nothing restarts it until the phone is replugged or
+  gets `connect`. With nothing live it does nothing.
+- `connect`: clears the pause; an online target phone is started now (a backoff is skipped).
+- While paused, an `open` gets `error{msg:"phone disconnected in Lantern"}` on stream 0, then
+  close.
+
+`lantern connect` and `lantern disconnect` print the report like `lantern status` and exit 0
+(1 if lanternd is unreachable).
 
 ### Exit statuses (`lantern`)
 

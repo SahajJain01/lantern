@@ -18,7 +18,8 @@ use crate::daemon::catalog::{self, Catalog, Dirs};
 use crate::daemon::{companion, ipc, session};
 
 /// Why undo-setup refuses while lanternd runs.
-pub const STOP_FIRST: &str = "stop lanternd first: systemctl --user stop lanternd";
+pub const STOP_FIRST: &str = "stop lanternd first (systemctl --user stop lanternd), or use \
+     \"Undo phone setup…\" in Lantern's tray menu";
 
 /// True if `error` (from [`ipc::query_status`]) means no lanternd is listening.
 fn daemon_absent(error: &anyhow::Error) -> bool {
@@ -127,9 +128,27 @@ fn first_line(error: &anyhow::Error) -> String {
 
 /// Runs undo-setup for `adb`'s serial, printing one line per step to `out`. `Err` means it
 /// refused (lanternd running) or could not check; otherwise `Ok(all steps ok)`.
-pub async fn run(adb: &Adb, sock: &Path, state_dir: &Path, out: &mut dyn Write) -> Result<bool> {
-    let serial = adb.serial().to_owned();
+pub async fn run(
+    adb: &Adb,
+    sock: &Path,
+    state_dir: &Path,
+    out: &mut (dyn Write + Send),
+) -> Result<bool> {
     check_daemon(sock)?;
+    run_steps(adb, state_dir, &remove_catalogue_entries, out).await
+}
+
+/// Steps 1–4 for `adb`'s serial, one line each to `out` (see the module doc); `remove_entries`
+/// removes the serial's menu entries. lanternd runs this itself (tray "Undo phone setup…")
+/// once its session on the phone is closed. `Err` only if writing to `out` fails; otherwise
+/// `Ok(all steps ok)`. (`Sync`/`Send` so lanternd can run it on its multi-threaded runtime.)
+pub async fn run_steps(
+    adb: &Adb,
+    state_dir: &Path,
+    remove_entries: &(dyn Fn(&str) -> Result<usize> + Sync),
+    out: &mut (dyn Write + Send),
+) -> Result<bool> {
+    let serial = adb.serial().to_owned();
     let mut phone_ok = true;
 
     match forget(adb).await {
@@ -147,7 +166,7 @@ pub async fn run(adb: &Adb, sock: &Path, state_dir: &Path, out: &mut dyn Write) 
         }
     }
     let mut ok = phone_ok;
-    match remove_catalogue_entries(&serial) {
+    match remove_entries(&serial) {
         Ok(n) => writeln!(out, "catalogue: removed {n} entries")?,
         Err(error) => {
             ok = false;
@@ -224,6 +243,14 @@ mod tests {
         // The shared entry stays, listing only the other phone.
         assert_eq!(left, ["lantern.com.c.desktop", "lantern.com.s.desktop"]);
         assert_eq!(shared, ["other"]);
+    }
+
+    #[test]
+    fn stop_first_points_at_the_tray() {
+        assert_eq!(
+            STOP_FIRST,
+            "stop lanternd first (systemctl --user stop lanternd), or use \"Undo phone setup…\" in Lantern's tray menu"
+        );
     }
 
     #[test]

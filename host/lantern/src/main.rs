@@ -2,7 +2,8 @@ use anyhow::{bail, Result};
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "usage: lantern daemon | lantern open [--user <android-user>] <package> \
-     | lantern status | lantern undo-setup [--serial <serial>]";
+     | lantern status | lantern connect | lantern disconnect \
+     | lantern undo-setup [--serial <serial>]";
 
 /// Exit statuses: 0 ok, 1 runtime failure, 2 usage error, 3 (`daemon` only) helper protocol
 /// mismatch, which `lanternd.service` does not restart.
@@ -63,6 +64,21 @@ fn cli() -> Result<u8> {
             };
             Ok(runtime(run(), |_| 1))
         }
+        [cmd @ ("connect" | "disconnect")] => {
+            use lantern::daemon::ipc;
+            use lantern_proto::DaemonCmd;
+            let cmd = match *cmd {
+                "connect" => DaemonCmd::Connect,
+                _ => DaemonCmd::Disconnect,
+            };
+            let run = || -> Result<u8> {
+                let sock = ipc::socket_path_in(&ipc::runtime_dir()?);
+                let report = ipc::send_daemon_cmd(&sock, cmd)?;
+                println!("{}", serde_json::to_string(&report)?);
+                Ok(0)
+            };
+            Ok(runtime(run(), |_| 1))
+        }
         ["undo-setup", rest @ ..] => {
             let explicit = match rest {
                 [] => None,
@@ -75,7 +91,7 @@ fn cli() -> Result<u8> {
             }
             Ok(runtime(undo_setup(explicit), |_| 1))
         }
-        ["daemon", ..] | ["status", ..] => bail!("{USAGE}"),
+        ["daemon", ..] | ["status", ..] | ["connect", ..] | ["disconnect", ..] => bail!("{USAGE}"),
         [other, ..] => bail!("unknown subcommand {other:?}; {USAGE}"),
         [] => bail!("{USAGE}"),
     }
