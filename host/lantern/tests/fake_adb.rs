@@ -223,7 +223,7 @@ fn has_forward(calls: &[String]) -> bool {
 /// the future, as SIGINT or an Offline would. Panics if start finishes first.
 async fn cancel_start_after_forward(fake: &FakeAdb, grace: Duration) {
     let adb = fake.adb();
-    let fut = start(&adb);
+    let fut = start(&adb, true);
     tokio::pin!(fut);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -276,7 +276,7 @@ async fn cancel_while_adb_forward_runs_still_removes_it() {
 async fn failed_start_cleans_up_too() {
     let fake = FakeAdb::new("fail", "0");
     let t0 = Instant::now();
-    let error = start(&fake.adb())
+    let error = start(&fake.adb(), true)
         .await
         .err()
         .expect("no helper behind the forward");
@@ -304,7 +304,7 @@ async fn start_removes_stale_lantern_forwards_of_its_serial() {
          fake-serial tcp:4444 localabstract:lantern-feedface\n",
     )
     .unwrap();
-    let _ = start(&fake.adb()).await;
+    let _ = start(&fake.adb(), true).await;
     let calls = fake.calls();
     let pos = |needle: &str| calls.iter().position(|c| c == needle);
     let stale_1 = pos("-s fake-serial forward --remove tcp:1111");
@@ -383,7 +383,7 @@ async fn start_waits_for_previous_helpers_to_exit() {
     let fake = FakeAdb::new("wait", "0");
     std::fs::write(fake.dir.join("helpers"), "4242\n4243\n").unwrap();
     std::fs::write(fake.dir.join("polls"), "3").unwrap();
-    let _ = start(&fake.adb()).await;
+    let _ = start(&fake.adb(), true).await;
     let calls = fake.calls();
     let polls: Vec<usize> = calls
         .iter()
@@ -446,7 +446,7 @@ async fn no_previous_helpers_means_one_poll() {
 #[tokio::test]
 async fn start_prunes_old_helper_jars() {
     let fake = FakeAdb::new("prune", "0");
-    let _ = start(&fake.adb()).await;
+    let _ = start(&fake.adb(), true).await;
     let calls = fake.calls();
     let push = position(&calls, |c| c.contains(" push ")).expect("no push");
     let remote = calls[push].split_whitespace().last().unwrap().to_owned();
@@ -479,7 +479,7 @@ async fn concurrent_starts_use_distinct_host_jar_paths() {
         .collect();
     let starts = fakes.iter().map(|f| {
         let adb = f.adb();
-        async move { start(&adb).await.err().map(|e| format!("{e:#}")) }
+        async move { start(&adb, true).await.err().map(|e| format!("{e:#}")) }
     });
     let results = futures_util::future::join_all(starts).await;
     let mut locals = Vec::new();
@@ -779,7 +779,7 @@ async fn start_with_companion_waits_for_previous_helpers_before_the_companion_up
     std::fs::write(fake.dir.join("polls"), "2").unwrap();
     let state = state_dir("order");
     let (setup, _notes) = recording_setup(&state);
-    let _ = start_with_companion(&fake.adb(), &setup).await;
+    let _ = start_with_companion(&fake.adb(), &setup, true).await;
     let calls = fake.calls();
     let first_pm = position(&calls, |c| c.contains(" shell pm "))
         .unwrap_or_else(|| panic!("companion never prepared: {calls:#?}"));

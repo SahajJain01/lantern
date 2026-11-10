@@ -29,9 +29,11 @@ async fn answer_hello_raw(socket: &mut TcpStream, token: &str, payload: Vec<u8>)
         Control::Hello {
             version,
             token: got,
+            keyboard,
         } => {
             assert_eq!(version, 1, "daemon must always send v1");
             assert_eq!(got, token);
+            assert!(keyboard, "these sessions use the Lantern keyboard");
         }
         other => panic!("expected Hello, got {other:?}"),
     }
@@ -51,6 +53,7 @@ fn hello(version: u32, token: &str) -> Control {
     Control::Hello {
         version,
         token: token.to_owned(),
+        keyboard: true,
     }
 }
 
@@ -71,7 +74,7 @@ async fn fake_helper_raw(payload: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>)
 async fn fake_handshake_error(reply: Control) -> String {
     let (port, helper) = fake_helper(reply).await;
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let error = handshake(stream, TOKEN).await.unwrap_err().to_string();
+    let error = handshake(stream, TOKEN, true).await.unwrap_err().to_string();
     helper.await.unwrap();
     error
 }
@@ -80,7 +83,7 @@ async fn fake_handshake_error(reply: Control) -> String {
 async fn session_handshake_against_fake_helper() {
     let (port, helper) = fake_helper(hello(1, "")).await;
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    handshake(stream, TOKEN).await.unwrap();
+    handshake(stream, TOKEN, true).await.unwrap();
     helper.await.unwrap();
 }
 
@@ -107,7 +110,7 @@ async fn session_handshake_rejects_token_in_echo() {
 async fn handshake_error(reply: Control) -> anyhow::Error {
     let (port, helper) = fake_helper(reply).await;
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let error = handshake(stream, TOKEN).await.unwrap_err();
+    let error = handshake(stream, TOKEN, true).await.unwrap_err();
     helper.await.unwrap();
     error
 }
@@ -155,7 +158,7 @@ async fn run_loop_against_raw(reply: Vec<u8>) -> (anyhow::Result<()>, usize) {
             async move {
                 let stream = TcpStream::connect(("127.0.0.1", port)).await?;
                 // Extra context on top, as callers may add: the type must survive it.
-                let stream = handshake(stream, TOKEN)
+                let stream = handshake(stream, TOKEN, true)
                     .await
                     .map_err(|error| error.context("start session"))?;
                 Ok(SessionConn::attach(stream, Adb::new(serial), "sha"))
@@ -222,6 +225,7 @@ async fn session_notices_helper_death() {
     let stream = handshake(
         TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
         TOKEN,
+        true,
     )
     .await
     .unwrap();
@@ -297,7 +301,7 @@ async fn daemon_restarts_session_after_helper_death() {
             let ready_tx = ready_tx.clone();
             async move {
                 let stream = TcpStream::connect(("127.0.0.1", port)).await?;
-                let stream = handshake(stream, TOKEN).await?;
+                let stream = handshake(stream, TOKEN, true).await?;
                 let _ = ready_tx.send(n).await;
                 Ok(SessionConn::attach(stream, Adb::new(serial), "sha"))
             }
@@ -368,7 +372,7 @@ async fn daemon_retries_failed_start_with_backoff() {
                     return Err(anyhow!("simulated start failure {attempt}"));
                 }
                 let stream = TcpStream::connect(("127.0.0.1", port)).await?;
-                let stream = handshake(stream, TOKEN).await?;
+                let stream = handshake(stream, TOKEN, true).await?;
                 if let Some(tx) = ready_tx.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
@@ -529,7 +533,7 @@ async fn java_helper_version_error_is_a_version_mismatch() {
     for reply in [JAVA_V2_MISMATCH, JAVA_LEGACY_MISMATCH] {
         let (port, helper) = fake_helper_raw(reply.as_bytes().to_vec()).await;
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let error = handshake(stream, TOKEN).await.unwrap_err();
+        let error = handshake(stream, TOKEN, true).await.unwrap_err();
         helper.await.unwrap();
         assert_eq!(
             HandshakeError::find(&error),

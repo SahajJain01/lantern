@@ -74,6 +74,8 @@ public final class Router {
         return t;
     });
     private AutoCloseable session;
+    /** The hello's {@code keyboard} (absent means true); set before the session starter runs. */
+    private volatile boolean keyboardWanted = true;
     private volatile boolean stopping;
     private volatile Runnable onSessionUp = () -> { };
     private volatile Extras extras = NO_EXTRAS;
@@ -128,6 +130,14 @@ public final class Router {
         this.sessionStarter = sessionStarter;
         this.transport = transport;
         this.log = log;
+    }
+
+    /**
+     * Whether lanternd wants the Lantern keyboard for this session (the hello's optional
+     * {@code keyboard}, true when absent). Valid from the session starter on.
+     */
+    public boolean keyboardWanted() {
+        return keyboardWanted;
     }
 
     /**
@@ -263,6 +273,12 @@ public final class Router {
         if (!MessageDigest.isEqual(got.getBytes(StandardCharsets.UTF_8), token.getBytes(StandardCharsets.UTF_8))) {
             throw new ProtocolError("bad session token: this helper was started by another lanternd");
         }
+        // Before the starter: it decides whether the session switches the keyboard.
+        Object keyboard = m.fields().get("keyboard");
+        if (keyboard != null && !(keyboard instanceof Boolean)) {
+            throw new ProtocolError("hello.keyboard: want boolean, got " + keyboard);
+        }
+        keyboardWanted = keyboard == null || (Boolean) keyboard;
         try {
             session = sessionStarter.call();
         } catch (Exception e) {

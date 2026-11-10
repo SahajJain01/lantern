@@ -172,12 +172,25 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Control {
     Hello {
         version: u32,
         token: String,
+        /// Whether the session switches the phone to the Lantern keyboard. False gives the
+        /// stay-awake-only session (no keyboard setting touched). Absent on the wire when true,
+        /// so every v1 `hello` is byte-identical; a missing field decodes as true.
+        #[serde(default = "yes", skip_serializing_if = "is_true")]
+        keyboard: bool,
     },
     Open {
         pkg: String,
@@ -845,6 +858,12 @@ mod tests {
             Control::Hello {
                 version: 1,
                 token: "abc".into(),
+                keyboard: true,
+            },
+            Control::Hello {
+                version: 1,
+                token: "abc".into(),
+                keyboard: false,
             },
             Control::Opened {
                 display: 12,
@@ -896,6 +915,46 @@ mod tests {
             label: label.map(str::to_owned),
             work,
         }
+    }
+
+    fn hello(keyboard: bool) -> Control {
+        Control::Hello {
+            version: 1,
+            token: "t".into(),
+            keyboard,
+        }
+    }
+
+    #[test]
+    fn hello_without_keyboard_is_v1_bytes() {
+        // keyboard defaults to true and is omitted then, so every existing hello is unchanged.
+        let v1 = r#"{"t":"hello","version":1,"token":"t"}"#;
+        assert_eq!(serde_json::to_string(&hello(true)).unwrap(), v1);
+        assert_eq!(hello(true).encode(), v1.as_bytes());
+    }
+
+    #[test]
+    fn hello_keyboard_false_json_shape() {
+        let s = serde_json::to_string(&hello(false)).unwrap();
+        assert_eq!(s, r#"{"t":"hello","version":1,"token":"t","keyboard":false}"#);
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), hello(false));
+    }
+
+    #[test]
+    fn hello_missing_keyboard_decodes_true() {
+        assert_eq!(
+            serde_json::from_str::<Control>(r#"{"t":"hello","version":1,"token":"t"}"#).unwrap(),
+            hello(true)
+        );
+        // The helper's echo (empty token) also decodes with the default.
+        assert_eq!(
+            Control::decode(br#"{"t":"hello","version":1,"token":""}"#).unwrap(),
+            Control::Hello {
+                version: 1,
+                token: String::new(),
+                keyboard: true,
+            }
+        );
     }
 
     #[test]

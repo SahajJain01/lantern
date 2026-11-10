@@ -8,6 +8,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
@@ -113,10 +114,16 @@ final class ImeSetup {
         }
     }
 
-    /** The {@code companion} message for lanternd once the session is up. */
-    static Msg companionState(boolean linked, String imeFailure) {
+    /**
+     * The {@code companion} message for lanternd once the session is up. Linked with the keyboard
+     * turned off in Lantern's settings ({@code keyboardWanted} false) is ready, with that as msg.
+     */
+    static Msg companionState(boolean linked, String imeFailure, boolean keyboardWanted) {
         if (!linked) {
             return Msg.of("companion").put("state", "unavailable").put("msg", "companion did not connect");
+        }
+        if (!keyboardWanted) {
+            return Msg.of("companion").put("state", "ready").put("msg", "keyboard off in Lantern settings");
         }
         if (imeFailure != null) {
             return Msg.of("companion").put("state", "unavailable").put("msg", imeFailure);
@@ -132,10 +139,13 @@ final class ImeSetup {
      * order, from its own thread, so the router's control thread never waits on a companion that
      * stopped reading. A message is dropped while the companion is not linked, or when
      * {@link #RELAY_QUEUE} are already waiting; each such stretch is logged once (not once per
-     * frame). Never logs the text.
+     * frame). Also dropped while the Lantern keyboard is not selected in this session (keyboard
+     * off in Lantern's settings, or the switch failed): only that keyboard applies them. Never
+     * logs the text.
      */
     static final class Relay implements Router.Extras {
         private final Predicate<Msg> send;
+        private final BooleanSupplier keyboardSelected;
         private final Consumer<String> log;
         private final Executor exec;
         /** Guarded by this: a drop was already logged since the last delivered message. */
@@ -155,7 +165,13 @@ final class ImeSetup {
          * @param exec runs the sends in order (on the device {@link #executor}{@code (RELAY_QUEUE)})
          */
         Relay(Predicate<Msg> send, Consumer<String> log, Executor exec) {
+            this(send, () -> true, log, exec);
+        }
+
+        /** @param keyboardSelected whether the Lantern keyboard is selected now; false drops */
+        Relay(Predicate<Msg> send, BooleanSupplier keyboardSelected, Consumer<String> log, Executor exec) {
             this.send = send;
+            this.keyboardSelected = keyboardSelected;
             this.log = log;
             this.exec = exec;
         }
@@ -166,6 +182,10 @@ final class ImeSetup {
          */
         @Override
         public void ime(int display, String op, String text) {
+            if (!keyboardSelected.getAsBoolean()) {
+                dropped(false, "ime dropped: the Lantern keyboard is not selected");
+                return;
+            }
             Msg m = Msg.of("ime").put("op", op).put("text", text).put("display", display);
             try {
                 exec.execute(() -> {
@@ -175,14 +195,15 @@ final class ImeSetup {
                     } catch (RuntimeException e) {
                         ok = false;
                     }
-                    dropped(ok, "companion not linked, dropping ime messages until it is");
+                    dropped(ok, "ime: companion not linked, dropping ime messages until it is");
                 });
             } catch (RejectedExecutionException e) {
-                dropped(false, "companion is not keeping up (or the session is ending), dropping ime messages");
+                dropped(false, "ime: companion is not keeping up (or the session is ending), dropping ime messages");
             }
         }
 
-        private void dropped(boolean delivered, String why) {
+        /** {@code line} is logged once per dropping stretch (until a message is delivered). */
+        private void dropped(boolean delivered, String line) {
             synchronized (this) {
                 if (delivered) {
                     dropLogged = false;
@@ -193,7 +214,7 @@ final class ImeSetup {
                 }
                 dropLogged = true;
             }
-            log.accept("ime: " + why);
+            log.accept(line);
         }
 
         @Override

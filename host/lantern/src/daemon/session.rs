@@ -351,16 +351,22 @@ pub async fn deploy_helper(adb: &Adb) -> Result<(String, String)> {
 /// updates the companion (see [`companion::Setup::prepare`]; failures only notify and log), then
 /// starts a helper session. What `lanternd` runs for every session start. The wait comes first:
 /// a companion update kills the companion's process, and a previous helper or its Cleanup may
-/// still be restoring the keyboard while the companion's watchdog is armed.
-pub async fn start_with_companion(adb: &Adb, setup: &companion::Setup) -> Result<SessionConn> {
+/// still be restoring the keyboard while the companion's watchdog is armed. `keyboard` is the
+/// user's `lantern_keyboard` setting (see [`start`]).
+pub async fn start_with_companion(
+    adb: &Adb,
+    setup: &companion::Setup,
+    keyboard: bool,
+) -> Result<SessionConn> {
     wait_for_previous_helpers(adb, PREVIOUS_HELPER_WAIT).await?;
     setup.prepare(adb).await;
-    start(adb).await
+    start(adb, keyboard).await
 }
 
 /// Starts a helper session. Every await is bounded, and the future is cancel-safe: dropping it
-/// at any point kills the helper and removes any forward it created.
-pub async fn start(adb: &Adb) -> Result<SessionConn> {
+/// at any point kills the helper and removes any forward it created. Without `keyboard` the
+/// helper leaves the phone's keyboard alone (a stay-awake-only session).
+pub async fn start(adb: &Adb, keyboard: bool) -> Result<SessionConn> {
     // One daemon owns a serial, so every lantern forward of it that exists now is a leftover
     // of a daemon that died without cleaning up.
     adb.remove_stale_lantern_forwards().await;
@@ -420,7 +426,7 @@ pub async fn start(adb: &Adb) -> Result<SessionConn> {
             Err(error) => return Err(error).context("connect to helper for 3 s"),
         }
     };
-    let stream = handshake(stream, &token).await?;
+    let stream = handshake(stream, &token, keyboard).await?;
 
     let child = pending.child.take();
     let forward = pending.forward.take();
@@ -465,12 +471,14 @@ impl HandshakeError {
     }
 }
 
-/// Sends `Hello{PROTOCOL_VERSION, token}` and requires the helper's `Hello{PROTOCOL_VERSION, ""}`
-/// echo.
-pub async fn handshake(mut stream: TcpStream, token: &str) -> Result<TcpStream> {
+/// Sends `Hello{PROTOCOL_VERSION, token, keyboard}` and requires the helper's
+/// `Hello{PROTOCOL_VERSION, ""}` echo. `keyboard` is on the wire only when false, so a session
+/// with the Lantern keyboard sends the v1 bytes.
+pub async fn handshake(mut stream: TcpStream, token: &str, keyboard: bool) -> Result<TcpStream> {
     let hello = Control::Hello {
         version: PROTOCOL_VERSION,
         token: token.to_owned(),
+        keyboard,
     };
     write_frame_async(
         &mut stream,
@@ -492,7 +500,7 @@ pub async fn handshake(mut stream: TcpStream, token: &str) -> Result<TcpStream> 
         bail!("expected hello reply in a control frame on stream 0");
     }
     match Control::decode(&reply.payload).context("decode hello reply")? {
-        Control::Hello { version, token } if version == PROTOCOL_VERSION => {
+        Control::Hello { version, token, .. } if version == PROTOCOL_VERSION => {
             if token.is_empty() {
                 Ok(stream)
             } else {
@@ -580,6 +588,52 @@ mod tests {
         assert_eq!(
             super::HELLO_REPLY_TIMEOUT,
             std::time::Duration::from_secs(20)
+        );
+    }
+
+    /// Runs `handshake(.., keyboard)` against a local fake helper and returns the hello payload
+    /// it sent.
+    async fn sent_hello(keyboard: bool) -> Vec<u8> {
+        use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, Kind};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let helper = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let hello = read_frame_async(&mut s).await.unwrap().unwrap();
+            let reply = Control::Hello {
+                version: super::PROTOCOL_VERSION,
+                token: String::new(),
+                keyboard: true,
+            };
+            write_frame_async(
+                &mut s,
+                &Frame {
+                    kind: Kind::Control,
+                    stream: 0,
+                    payload: reply.encode(),
+                },
+            )
+            .await
+            .unwrap();
+            hello.payload
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        super::handshake(stream, "abc", keyboard).await.unwrap();
+        helper.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn handshake_sends_keyboard_only_when_off() {
+        assert_eq!(
+            sent_hello(true).await,
+            br#"{"t":"hello","version":1,"token":"abc"}"#,
+            "keyboard on: the v1 bytes"
+        );
+        assert_eq!(
+            sent_hello(false).await,
+            br#"{"t":"hello","version":1,"token":"abc","keyboard":false}"#
         );
     }
 

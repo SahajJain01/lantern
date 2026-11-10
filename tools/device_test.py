@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-17
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-18
     python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
@@ -12,8 +12,8 @@ Needs: lanternd installed as the systemd user unit (tools/build.py install), the
 Klipper's D-Bus (items 13, 17). Opens only com.android.settings, org.lineageos.jelly and the
 companion's test screen (enabled only during items 10, 12, 13 and 17), each for a few seconds,
 and touches no other window. Items 13 and 17 save the PC clipboard's text and put it back
-afterwards; item 17 also saves ~/.config/lantern/settings.toml and restores it (or removes it if
-it was absent).
+afterwards; items 17 and 18 also save ~/.config/lantern/settings.toml and restore it (or remove it
+if it was absent); item 18 restarts lanternd with the keyboard off and back on.
 Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
 The window items (2-6, 11-13, 17) need frames from the compositor, which a locked Plasma session
@@ -30,6 +30,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1027,6 +1028,99 @@ class Suite:
             cleanup(ok, ("remove the planted entry", lambda: entry.unlink(missing_ok=True)),
                     ("remove the planted device record", lambda: record.unlink(missing_ok=True)))
 
+    def keyboard_setting_off(self):
+        """`lantern_keyboard = false` gives a stay-awake-only session at the next connection:
+        the phone's keyboard settings stay its own, the companion is still ready. Back on, the
+        Lantern keyboard is selected again; and with lanternd stopped (item 7's path) all three
+        settings are the originals."""
+        base = baseline()  # the originals, read with lanternd stopped
+        note(f"originals: default_input_method={base['ime']} "
+             f"enabled_input_methods={base['imes']} stay_on_while_plugged_in={base['stay_on']}")
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+
+        def restore_file():
+            if saved_file is None:
+                path.unlink(missing_ok=True)
+                note(f"removed {path} (it was absent)")
+            else:
+                path.write_bytes(saved_file)
+                note(f"restored {path}")
+
+        def restart_ready(what):
+            systemctl("restart", UNIT)
+            _, secs = wait_ready(15)
+            st, csecs = wait_until("companion ready", 10,
+                                   lambda: (s := status()).get("companion") == "ready" and s)
+            note(f"{what}: ready {secs:.1f} s after the restart, companion ready {csecs:.1f} s "
+                 f"after: {json.dumps(st)}")
+
+        ok = False
+        try:
+            # 2. Every other line kept; lantern_keyboard replaced.
+            old = saved_file.decode("utf-8", "replace") if saved_file is not None else ""
+            lines = [l for l in old.splitlines()
+                     if not l.strip().startswith("lantern_keyboard")]
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.write_text("\n".join(lines + ["lantern_keyboard = false"]) + "\n")
+            since = phone_now()
+            restart_ready("keyboard off")
+            # 3. The phone's keyboard is untouched; only stay-awake is Lantern's.
+            ph = phone_state()
+            note(f"during the session: ime={ph['ime']} imes={ph['imes']} stay_on={ph['stay_on']}")
+            check(ph["ime"] == base["ime"], f"default_input_method {ph['ime']}, want {base['ime']}")
+            check(ph["imes"] == base["imes"],
+                  f"enabled_input_methods {ph['imes']}, want {base['imes']}")
+            check(ph["stay_on"] == STAY_ON_SESSION, f"stay_on {ph['stay_on']}")
+            off, _ = wait_until("'keyboard off in Lantern settings' in logcat", 5, lambda: [
+                m for _, m in logcat_since(since, ["lantern"])
+                if "keyboard off in Lantern settings" in m], interval=0.3)
+            note(f"helper: {off[-1]}")
+            # 4. Back on: the next session selects the Lantern keyboard again.
+            restore_file()
+            restart_ready("keyboard back on")
+            ime, secs = wait_until("the Lantern keyboard selected", 10,
+                                   lambda: (i := phone_state()["ime"]) == LANTERN_IME and i,
+                                   interval=0.3)
+            note(f"default_input_method {ime} {secs:.1f} s after ready")
+            ok = True
+        finally:
+            # The settings file first, then 5. the phone's settings with lanternd stopped.
+            cleanup(ok, ("restore settings.toml", restore_file),
+                    ("phone settings are the originals with lanternd stopped",
+                     lambda: self._keyboard_originals_after_stop(base)))
+
+    def _keyboard_originals_after_stop(self, base):
+        """Stops lanternd as item 7 does (`systemctl kill`, wait for the phone to be released),
+        checks the three settings equal `base`, restores any that don't by hand (and fails),
+        then starts lanternd again."""
+        keys = [("secure", "default_input_method", "ime"),
+                ("secure", "enabled_input_methods", "imes"),
+                ("global", "stay_on_while_plugged_in", "stay_on")]
+        try:
+            systemctl("kill", UNIT)
+            st, secs = wait_until("phone released after kill", 10,
+                                  lambda: released(s := phone_state()) and not s["journal"] and s,
+                                  interval=0.2)
+            note(f"released {secs:.1f} s after kill: ime={st['ime']} imes={st['imes']} "
+                 f"stay_on={st['stay_on']}")
+            wrong = [(ns, key, st[f], base[f]) for ns, key, f in keys if st[f] != base[f]]
+            for ns, key, got, want in wrong:
+                if want in (None, "null"):
+                    adb("shell", f"settings delete {ns} {key}")
+                else:
+                    adb("shell", f"settings put {ns} {key} {shlex.quote(want)}")
+                note(f"restored {ns}/{key} by hand: {got} -> {want}")
+            check(not wrong, "not the originals with lanternd stopped: " +
+                  ", ".join(f"{key}={got} (want {want})" for _, key, got, want in wrong))
+        finally:
+            if systemctl("is-active", UNIT, check_rc=False).strip() != "active":
+                systemctl("start", UNIT)
+        _, secs = wait_ready(15)
+        note(f"ready again after {secs:.1f} s")
+
     def clipboard_setting_off(self):
         """A hand edit `clipboard_sync = false` in settings.toml applies live (within 2 s): a
         phone copy made through the test screen never reaches Klipper."""
@@ -1109,6 +1203,7 @@ ITEMS = [
     "phones_keep_their_entries",
     "not_on_this_phone_notice",
     "clipboard_setting_off",
+    "keyboard_setting_off",
 ]
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
 

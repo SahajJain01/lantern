@@ -118,6 +118,7 @@ public final class Main {
             final CompanionLink[] companionRef = {null};
             final boolean[] linked = {false};
             final String[] imeFailure = {null};
+            final boolean[] keyboardWanted = {true};
             // Set once the session is up: each display's IME policy follows it (AppDisplay.Policy.imePolicy).
             final java.util.concurrent.atomic.AtomicBoolean lanternIme =
                 new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -130,10 +131,16 @@ public final class Main {
                     // With the companion linked, the session also enables and selects the Lantern
                     // keyboard (journaled: restored at the end, by Cleanup, or by its watchdog). If
                     // that fails, the session goes on with STAY_ON only (Ruling 15); the link stays
-                    // open for the catalogue. Each attempt spawns its own Cleanup guard.
+                    // open for the catalogue. Each attempt spawns its own Cleanup guard. With the
+                    // keyboard off in Lantern's settings (hello.keyboard=false) it is STAY_ON only
+                    // from the start: no keyboard setting is touched and no ime_prev is sent.
+                    keyboardWanted[0] = routerRef[0].keyboardWanted();
+                    if (!keyboardWanted[0]) {
+                        Droid.log("serve: keyboard off in Lantern settings, session without the Lantern keyboard");
+                    }
                     ImeSetup.Started started;
                     try {
-                        started = ImeSetup.start(linked[0], changes -> Session.start(new ShellSettings(),
+                        started = ImeSetup.start(linked[0] && keyboardWanted[0], changes -> Session.start(new ShellSettings(),
                             new DevicePower(), Cleanup.spawnGuard(Droid::log), JournalStore.device(Droid::log),
                             changes), Droid::log);
                     } catch (RuntimeException e) {
@@ -174,7 +181,7 @@ public final class Main {
             ImeSetup.Relay ime = new ImeSetup.Relay(m -> {
                 CompanionLink l = companionRef[0];
                 return l != null && l.send(m);
-            }, Droid::log, imeSender);
+            }, lanternIme::get, Droid::log, imeSender);
             // Clipboard sync (Task 9): phone copies go to lanternd as clip{text} on stream 0, the
             // PC's clip{text} lands on the phone, each without echoing the other's text back.
             PhoneClipboard phoneClip = new PhoneClipboard(Droid::log);
@@ -198,7 +205,7 @@ public final class Main {
                 return l == null ? null : l.label(pkg, user);
             });
             router.setOnSessionUp(() -> {
-                router.sendSession(ImeSetup.companionState(linked[0], imeFailure[0]));
+                router.sendSession(ImeSetup.companionState(linked[0], imeFailure[0], keyboardWanted[0]));
                 // Only now (after the hello reply) is the catalogue asked for, so it goes straight
                 // to lanternd instead of piling up in the router's pre-session buffer. A companion
                 // that links later is asked right after its own hello.

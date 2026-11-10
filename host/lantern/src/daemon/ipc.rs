@@ -307,8 +307,8 @@ pub struct Hub {
     registry: Registry,
     /// The session part of `lantern status`, kept current by the run loop.
     session: (SessionState, Option<String>, Option<String>),
-    /// The live session's last `companion` state; cleared when the session ends.
-    companion: Option<CompanionState>,
+    /// The live session's last `companion` state and its `msg`; cleared when the session ends.
+    companion: Option<(CompanionState, Option<String>)>,
     next_cid: u64,
     events_tx: mpsc::Sender<ClientEvent>,
     events: mpsc::Receiver<ClientEvent>,
@@ -494,7 +494,11 @@ impl Hub {
         let mut windows: Vec<WindowInfo> = self.info.values().cloned().collect();
         windows.sort_by_key(|w| w.id);
         let (state, serial, helper) = self.session.clone();
-        let companion = self.companion.filter(|_| state == SessionState::Ready);
+        let companion = self
+            .companion
+            .as_ref()
+            .map(|(companion, _)| *companion)
+            .filter(|_| state == SessionState::Ready);
         StatusReport {
             state,
             serial,
@@ -502,6 +506,12 @@ impl Hub {
             windows,
             companion,
         }
+    }
+
+    /// The live session's last `companion` state with its `msg` (e.g. "keyboard off in Lantern
+    /// settings"), if the helper sent one.
+    pub fn companion(&self) -> Option<(CompanionState, Option<String>)> {
+        self.companion.clone()
     }
 
     /// Forgets window `win` (registry and status).
@@ -828,7 +838,7 @@ impl Hub {
                             )
                         }
                     }
-                    self.companion = Some(state);
+                    self.companion = Some((state, msg));
                 }
                 Ok(
                     c
@@ -883,5 +893,43 @@ impl Hub {
         self.registry = Registry::default();
         self.companion = None;
         self.clip_sync = ClipSync::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn companion(state: CompanionState, msg: Option<&str>) -> Frame {
+        Frame {
+            kind: Kind::Control,
+            stream: 0,
+            payload: Control::Companion {
+                state,
+                msg: msg.map(str::to_owned),
+            }
+            .encode(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_keeps_the_companion_msg() {
+        let mut hub = Hub::new(None);
+        let (helper, _rx) = mpsc::channel(4);
+        assert_eq!(hub.companion(), None);
+        let off = "keyboard off in Lantern settings";
+        hub.on_helper(companion(CompanionState::Ready, Some(off)), &helper)
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.companion(),
+            Some((CompanionState::Ready, Some(off.to_owned())))
+        );
+        hub.on_helper(companion(CompanionState::Ready, None), &helper)
+            .await
+            .unwrap();
+        assert_eq!(hub.companion(), Some((CompanionState::Ready, None)));
+        hub.reset();
+        assert_eq!(hub.companion(), None, "cleared when the session ends");
     }
 }

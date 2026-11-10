@@ -133,6 +133,8 @@ public final class RouterTest {
         /** The router's log lines. */
         final List<String> logs = Collections.synchronizedList(new ArrayList<>());
         volatile boolean failOnCloseNext;
+        /** {@link Router#keyboardWanted()} as the session starter saw it; null before it ran. */
+        volatile Boolean keyboardAtStart;
 
         Rig() throws IOException {
             this(r -> { });
@@ -173,9 +175,11 @@ public final class RouterTest {
                     event("focus task=" + taskId);
                 }
             };
+            Router[] self = {null};
             Router r = new Router(new DataInputStream(server.getInputStream()),
                 new DataOutputStream(server.getOutputStream()), factory, injector, CODEC, TOKEN,
                 () -> {
+                    keyboardAtStart = self[0].keyboardWanted();
                     event("session start");
                     return () -> event("session close");
                 },
@@ -184,6 +188,7 @@ public final class RouterTest {
                     server.close();
                 },
                 logs::add);
+            self[0] = r;
             setup.accept(r);
             thread = new Thread(r::run, "router");
             thread.start();
@@ -279,6 +284,35 @@ public final class RouterTest {
             eq("[msg, code, version]", m.fields().keySet().toString(), "field order");
             r.awaitExit(2000);
             check(!r.events.contains("session start"), "session must not start: " + r.events);
+        }
+    }
+
+    static void helloKeyboardFalseReachesStarter() throws Exception {
+        try (Rig r = new Rig()) {
+            r.send(0, "{\"t\":\"hello\",\"version\":1,\"token\":\"" + TOKEN + "\",\"keyboard\":false}");
+            Msg m = r.control(0);
+            eq("hello", m.t, "hello reply");
+            eq(Boolean.FALSE, r.keyboardAtStart, "the starter sees keyboard=false");
+        }
+    }
+
+    static void helloKeyboardAbsentIsTrue() throws Exception {
+        try (Rig r = new Rig()) {
+            r.hello();
+            eq(Boolean.TRUE, r.keyboardAtStart, "absent keyboard means true");
+        }
+    }
+
+    static void helloKeyboardNotBooleanIsProtocolError() throws Exception {
+        for (String bad : new String[] {"1", "\"false\""}) {
+            try (Rig r = new Rig()) {
+                r.send(0, "{\"t\":\"hello\",\"version\":1,\"token\":\"" + TOKEN + "\",\"keyboard\":" + bad + "}");
+                Msg m = r.control(0);
+                eq("error", m.t, "reply to keyboard=" + bad);
+                check(m.str("msg").contains("keyboard"), "msg names keyboard: " + m.str("msg"));
+                r.awaitExit(2000);
+                check(!r.events.contains("session start"), "session must not start: " + r.events);
+            }
         }
     }
 
@@ -816,6 +850,9 @@ public final class RouterTest {
             {"rejectsWrongToken", (Case) RouterTest::rejectsWrongToken},
             {"rejectsWrongVersion", (Case) RouterTest::rejectsWrongVersion},
             {"requiresHelloFirst", (Case) RouterTest::requiresHelloFirst},
+            {"helloKeyboardFalseReachesStarter", (Case) RouterTest::helloKeyboardFalseReachesStarter},
+            {"helloKeyboardAbsentIsTrue", (Case) RouterTest::helloKeyboardAbsentIsTrue},
+            {"helloKeyboardNotBooleanIsProtocolError", (Case) RouterTest::helloKeyboardNotBooleanIsProtocolError},
             {"helloStartsSessionAndReplies", (Case) RouterTest::helloStartsSessionAndReplies},
             {"onSessionUpRunsAfterHelloReply", (Case) RouterTest::onSessionUpRunsAfterHelloReply},
             {"setExtrasAcceptsHandler", (Case) RouterTest::setExtrasAcceptsHandler},

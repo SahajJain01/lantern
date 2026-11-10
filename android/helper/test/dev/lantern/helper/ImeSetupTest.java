@@ -196,16 +196,49 @@ public final class ImeSetupTest {
     }
 
     static void companionStateMessages() throws Exception {
-        Msg ready = ImeSetup.companionState(true, null);
+        Msg ready = ImeSetup.companionState(true, null, true);
         eq("companion", ready.t, "type");
         eq("ready", ready.str("state"), "ready");
         eq(1, ready.fields().size(), "no msg when ready");
-        Msg kb = ImeSetup.companionState(true, "keyboard switch failed: x");
+        Msg kb = ImeSetup.companionState(true, "keyboard switch failed: x", true);
         eq("unavailable", kb.str("state"), "keyboard failed");
         eq("keyboard switch failed: x", kb.str("msg"), "keyboard msg");
-        Msg none = ImeSetup.companionState(false, null);
+        Msg none = ImeSetup.companionState(false, null, true);
         eq("unavailable", none.str("state"), "not linked");
         eq("companion did not connect", none.str("msg"), "not linked msg");
+    }
+
+    /** Keyboard off in Lantern's settings: linked and ready, with the reason as msg. */
+    static void companionStateKeyboardOff() throws Exception {
+        Msg off = ImeSetup.companionState(true, null, false);
+        eq("companion", off.t, "type");
+        eq("ready", off.str("state"), "linked, keyboard off: ready");
+        eq("keyboard off in Lantern settings", off.str("msg"), "msg");
+        eq(2, off.fields().size(), "state and msg only");
+        Msg none = ImeSetup.companionState(false, null, false);
+        eq("unavailable", none.str("state"), "not linked stays unavailable");
+        eq("companion did not connect", none.str("msg"), "not linked msg");
+    }
+
+    /** While the Lantern keyboard is not selected, ime is dropped, logged once per stretch, never the text. */
+    static void relayDropsWhileKeyboardNotSelected() {
+        List<String> logs = new ArrayList<>();
+        List<Msg> sent = new ArrayList<>();
+        boolean[] selected = {false};
+        ImeSetup.Relay relay = new ImeSetup.Relay(m -> {
+            sent.add(m);
+            return true;
+        }, () -> selected[0], logs::add, Runnable::run);
+        relay.ime(11, "commit", "secret text");
+        relay.ime(11, "compose", "more secret");
+        eq(0, sent.size(), "nothing reaches the companion");
+        eq("[ime dropped: the Lantern keyboard is not selected]", logs.toString(), "one line, no text");
+        selected[0] = true;
+        relay.ime(11, "commit", "hi");
+        eq(1, sent.size(), "delivered once selected");
+        selected[0] = false;
+        relay.ime(11, "finish", "");
+        eq(2, logs.size(), "a new dropping stretch logs once more: " + logs);
     }
 
     static void relayDropsAndLogsOnceWhileUnlinked() {
@@ -302,6 +335,8 @@ public final class ImeSetupTest {
             {"imeSelectedWhenItWorks", (Case) ImeSetupTest::imeSelectedWhenItWorks},
             {"notLinkedIsStayOnOnly", (Case) ImeSetupTest::notLinkedIsStayOnOnly},
             {"companionStateMessages", (Case) ImeSetupTest::companionStateMessages},
+            {"companionStateKeyboardOff", (Case) ImeSetupTest::companionStateKeyboardOff},
+            {"relayDropsWhileKeyboardNotSelected", (Case) ImeSetupTest::relayDropsWhileKeyboardNotSelected},
         };
         int failed = 0;
         for (Object[] c : cases) {

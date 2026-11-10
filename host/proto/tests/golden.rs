@@ -24,6 +24,10 @@
 //!                     Control::App { pkg: "com.android.settings", user: 10, label: "Settings",
 //!                                    work: true, icon: "iVBORw0KGgo=" }
 //!                     payload = {"t":"app","pkg":"com.android.settings","user":10,"label":"Settings","work":true,"icon":"iVBORw0KGgo="}
+//! control_hello_keyboard_off.bin : kind=Control(1), stream=0,
+//!                     Control::Hello { version: 1, token: "t", keyboard: false }
+//!                     payload = {"t":"hello","version":1,"token":"t","keyboard":false}
+//!                     (keyboard: true is omitted, so every other hello keeps its v1 bytes)
 //! input_pointer.bin : kind=Input(3), stream=1,
 //!                     InputEvent::Pointer { action: Move(2), id: 7, x: 0.25, y: 0.75, buttons: 1, pressure: 0.5 }
 //! input_key.bin     : kind=Input(3), stream=1,
@@ -103,6 +107,10 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         ("video_key", frame_bytes(Kind::Video, 1, video.encode())),
         ("control_ime", frame_bytes(Kind::Control, 1, ime().encode())),
         ("control_app", frame_bytes(Kind::Control, 0, app().encode())),
+        (
+            "control_hello_keyboard_off",
+            frame_bytes(Kind::Control, 0, hello_keyboard_off().encode()),
+        ),
     ]
 }
 
@@ -110,6 +118,14 @@ fn ime() -> Control {
     Control::Ime {
         op: ImeOp::Compose,
         text: "việ".into(),
+    }
+}
+
+fn hello_keyboard_off() -> Control {
+    Control::Hello {
+        version: 1,
+        token: "t".into(),
+        keyboard: false,
     }
 }
 
@@ -219,6 +235,13 @@ fn golden_files_decode() {
                     br#"{"t":"app","pkg":"com.android.settings","user":10,"label":"Settings","work":true,"icon":"iVBORw0KGgo="}"#
                 );
                 assert_eq!(Control::decode(&f.payload).unwrap(), app());
+            }
+            "control_hello_keyboard_off" => {
+                assert_eq!(
+                    f.payload,
+                    br#"{"t":"hello","version":1,"token":"t","keyboard":false}"#
+                );
+                assert_eq!(Control::decode(&f.payload).unwrap(), hello_keyboard_off());
             }
             _ => unreachable!(),
         }

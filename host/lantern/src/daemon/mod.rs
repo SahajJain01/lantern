@@ -422,6 +422,7 @@ pub async fn run() -> Result<()> {
     let settings = SettingsHandle::new(settings::default_path());
     // Runs for the daemon's lifetime; the runtime ends it.
     settings.spawn_poll();
+    let session_settings = settings.clone();
     serve_with(
         listener,
         Parts {
@@ -433,7 +434,9 @@ pub async fn run() -> Result<()> {
         track_devices(),
         move |serial| {
             let setup = setup.clone();
-            async move { start_with_companion(&Adb::new(serial), &setup).await }
+            // Read at each session start: a changed `lantern_keyboard` applies from the next one.
+            let keyboard = session_settings.get().lantern_keyboard;
+            async move { start_with_companion(&Adb::new(serial), &setup, keyboard).await }
         },
         shutdown,
         RetryPolicy::default(),

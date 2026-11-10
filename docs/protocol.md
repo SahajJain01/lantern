@@ -35,7 +35,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 
 | `t` | fields |
 |---|---|
-| `hello` | `version: u32`, `token: string` |
+| `hello` | `version: u32`, `token: string`, optional `keyboard: bool` (absent = true; lanternd → helper only) |
 | `open` | `pkg: string`, `user: u32` (Android user/profile id, `0..=i32::MAX`), `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string` |
 | `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32`, optional `moved: bool` (absent = false), optional `label: string` (the app's launcher label), optional `work: bool` (absent = false; the app runs in a work profile) |
 | `resize` | `w: u32`, `h: u32`, `dpi: u32` |
@@ -60,6 +60,12 @@ JSON objects tagged by `"t"` (snake_case). Example:
   `error{msg, code:"version", version:<the helper's own version>}` instead (the helper never
   answers `hello` with another version). Phone state (stay-awake, keyboard, panel) only changes
   after a valid hello.
+- lanternd sends `keyboard:false` when the user turned the Lantern keyboard off
+  (`lantern_keyboard = false` in settings.toml, read at each session start); it is omitted when
+  true, so that `hello` keeps its v1 bytes. The helper reads it before it starts the session; a
+  non-boolean `keyboard` is a protocol error. With `keyboard:false` the session is stay-awake
+  only: no keyboard setting is touched, no `ime_prev` goes to the companion, and `ime` from a
+  window is dropped (logged once per stretch, never the text).
 - `lanternd` treats a handshake `error` with `code:"version"` (or, from a helper predating
   `code`, a `msg` starting `protocol version mismatch`) as a version mismatch and exits 3 (see
   Exit statuses); any other handshake `error` is retried with backoff.
@@ -122,8 +128,9 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
   the `app` messages received replaces the previous one (apps missing from it are removed); a
   partial one (the link dropped mid-list, or the count differs) removes nothing.
 - `companion{state}` is sent after the hello reply: `"ready"` when the companion linked and the
-  Lantern keyboard is selected, `"unavailable"` (with a `msg`) otherwise: `"companion did not
-  connect"`, or `"keyboard switch failed: <reason>"` when the companion linked but selecting its
+  Lantern keyboard is selected, `"ready"` with `msg:"keyboard off in Lantern settings"` when it
+  linked and the hello said `keyboard:false`, `"unavailable"` (with a `msg`) otherwise:
+  `"companion did not connect"`, or `"keyboard switch failed: <reason>"` when the companion linked but selecting its
   keyboard failed (the catalogue still syncs; only PC text input is missing). Without the
   companion the session still works, with no catalogue and no PC text input.
 - `clip` carries plain text only, on stream 0, and only changes sync: nothing is pushed when a

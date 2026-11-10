@@ -102,6 +102,7 @@ impl FakeHelper {
                     Control::Hello {
                         version: 1,
                         token: String::new(),
+                        keyboard: true,
                     },
                 );
                 write_frame_async(&mut wr, &reply).await.unwrap();
@@ -228,7 +229,7 @@ fn start_daemon_parts(port: Option<u16>, parts: Parts) -> Daemon {
     let starter = move |serial: String| async move {
         let port = port.expect("no phone in this test");
         let stream = TcpStream::connect(("127.0.0.1", port)).await?;
-        let stream = handshake(stream, TOKEN).await?;
+        let stream = handshake(stream, TOKEN, true).await?;
         Ok(SessionConn::attach(stream, Adb::new(serial), "sha"))
     };
     let (stop, stop_rx) = oneshot::channel::<()>();

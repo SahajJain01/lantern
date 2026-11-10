@@ -107,6 +107,20 @@ public final class ProtoTest {
         check(Msg.TYPES.contains("app"), "app is a known type");
     }
 
+    /** hello with keyboard:false (the Lantern keyboard is off): the Rust bytes, read as a boolean. */
+    static void goldenHelloKeyboardOff() throws Exception {
+        Proto.Frame f = readOnly("control_hello_keyboard_off");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(0, f.stream, "stream");
+        eq("{\"t\":\"hello\",\"version\":1,\"token\":\"t\",\"keyboard\":false}",
+            new String(f.payload, StandardCharsets.UTF_8), "json");
+        Msg m = new TestCodec().decode(f.payload);
+        eq("hello", m.t, "t");
+        eq(1L, m.num("version"), "version");
+        eq("t", m.str("token"), "token");
+        eq(Boolean.FALSE, m.fields().get("keyboard"), "keyboard");
+    }
+
     static void newTypesAndLimits() {
         for (String t : new String[] {"app", "apps_end", "app_removed", "companion", "clip", "ime"}) {
             check(Msg.TYPES.contains(t), t + " in Msg.TYPES");
@@ -284,6 +298,7 @@ public final class ProtoTest {
             {"goldenControlFocusMatchesRust", (Case) ProtoTest::goldenControlFocusMatchesRust},
             {"goldenImeMatchesRust", (Case) ProtoTest::goldenImeMatchesRust},
             {"goldenAppMatchesRust", (Case) ProtoTest::goldenAppMatchesRust},
+            {"goldenHelloKeyboardOff", (Case) ProtoTest::goldenHelloKeyboardOff},
             {"newTypesAndLimits", (Case) ProtoTest::newTypesAndLimits},
             {"goldenInputPointerMatchesRust", (Case) ProtoTest::goldenInputPointerMatchesRust},
             {"goldenInputKeyMatchesRust", (Case) ProtoTest::goldenInputKeyMatchesRust},
