@@ -11,10 +11,9 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   pending the deferred device checks below**. Each of the 10 tasks passed its own review (Tasks 3,
   4, 7, 8 and 9 after one fix round each); the final whole-branch review then found 1 critical, 4
   important and 5 minor issues, all fixed in one wave (`final-findings.md` and
-  `final-fix-report.md`). The work is on branch `plan2-desktop-integration` (worktree
-  `.worktrees/plan2`); the re-review of that fix wave and the merge into `main` are still to do.
-  The SDD ledger and per-task reports are in
-  `.superpowers/sdd/2026-11-10-lantern-desktop-integration/`.
+  `final-fix-report.md`). Branch `plan2-desktop-integration` was fast-forward merged into `main`
+  (at `c151d37`) and its worktree removed; the SDD ledger and per-task reports went with the
+  worktree. No record survives of a separate re-review of the fix wave (`f33642d..3050bf9`).
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
 Lantern is **installed and running** on the PC from the Plan 2 build: `~/.local/bin/lantern`, user
@@ -40,11 +39,13 @@ attached.
   `ime op=commit dropped len=4: typed for display A, the keyboard is on display B`), a
   left-enabled TestActivity disabled on relink, and lanternd waiting for the previous helper
   before the companion update.
+- Real desktop, unlocked (2026-11-10, after the merge): `python3 tools/build.py install &&
+  python3 tools/device_test.py` **12/12 PASS without `--nested`**. Item 12 read
+  `text=Tiếng Việt 👍việ` through real window focus; item 13 got the phone's copy into Klipper
+  0.077 s after Ctrl+C; item 7 restored the phone 0.9 s after the kill.
 
 **Deferred checks, with the commands to run:**
-1. Real desktop, unlocked, Sahaj at the PC:
-   `python3 tools/build.py install && python3 tools/device_test.py` (expect 12/12 without
-   `--nested`; items 12 and 13 then use real window focus instead of the `focus` debug step).
+1. ~~Real desktop, unlocked~~ — done, see above.
 2. With Sahaj, cable in hand: `python3 tools/device_test.py --manual --only 8 14`.
 3. Motorola edge 50 pro (work profile, user 10): with only it attached (or `LANTERN_SERIAL=<its
    serial>`), check the menu has "Files (work)" with the badged icon, open it from the menu
@@ -183,8 +184,8 @@ attached.
 ## Next: Plan 3 (not yet written)
 
 Write it with superpowers:writing-plans, using the spec as the authority, then run it with
-superpowers:subagent-driven-development, as Plans 1 and 2 were. Finish Plan 2's deferred checks
-and the merge first.
+superpowers:subagent-driven-development, as Plans 1 and 2 were. Plan 2 is merged; its remaining
+deferred checks need Sahaj or another phone and don't block Plan 3.
 
 - **Menu entries for every phone, not just the last one (do this early; Sahaj switches phones).**
   Today a full sync from phone B prunes every entry of phone A (Ruling 11 in Plan 2), so each switch
