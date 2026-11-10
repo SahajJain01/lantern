@@ -42,6 +42,8 @@ const HELPER_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const NOT_CONNECTED: &str = "phone not connected";
+/// The open's app is in the menu for other phones only (known once this phone has synced).
+pub const NOT_ON_THIS_PHONE: &str = "app not on this phone";
 
 pub fn socket_path_in(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("lantern").join("daemon.sock")
@@ -671,6 +673,11 @@ impl Hub {
             self.reply_and_finish(cid, control(0, Control::error(NOT_CONNECTED)));
             return Ok(());
         };
+        if self.not_on_this_phone(&pkg, user) {
+            tracing::info!(cid, pkg, user, "app not on this phone; refusing the open");
+            self.reply_and_finish(cid, control(0, Control::error(NOT_ON_THIS_PHONE)));
+            return Ok(());
+        }
         let key = format!("{pkg}:{user}");
         let mut claim = self.registry.claim(&key);
         if let Claim::Existing(win) = claim {
@@ -728,6 +735,20 @@ impl Hub {
                 Ok(())
             }
         }
+    }
+
+    /// Whether `pkg` for `user` is known to be only on other phones: this phone's full
+    /// catalogue has arrived, the app has a menu entry, and the entry does not list the
+    /// session's phone. Before the first sync nothing is refused.
+    fn not_on_this_phone(&self, pkg: &str, user: u32) -> bool {
+        let (Some(catalog), Some(serial)) = (&self.catalog, &self.session.1) else {
+            return false;
+        };
+        if !catalog.synced() {
+            return false;
+        }
+        let phones = catalog.phones(pkg, user);
+        !phones.is_empty() && !phones.iter().any(|s| s == serial)
     }
 
     /// Queues `frame` for a window client; one that cannot keep up is dropped.

@@ -752,26 +752,54 @@ impl Catalog {
     }
 }
 
-/// The "Connect your phone" notification for `lantern open [--user N] <pkg>` without a phone:
-/// (summary, body, icon). The body names the app by its menu entry's Name when there is one.
-pub fn connect_notice(dirs: &Dirs, pkg: &str, user: u32) -> (String, String, Option<PathBuf>) {
-    let (name, icon) = if check_pkg(pkg).is_ok() {
-        let name = read_owned(&dirs.desktop_path(pkg, user))
-            .ok()
-            .flatten()
-            .and_then(|o| o.name)
-            .filter(|n| !n.is_empty());
+/// The "Connect your …" notification for `lantern open [--user N] <pkg>` refused for want of
+/// the right phone: (summary, body, icon). The app is named by its menu entry's Name (else the
+/// package) and the phones its entry lists by `names` (else their serials). `here` is the
+/// connected phone that lacks the app, if any.
+pub fn connect_notice(
+    dirs: &Dirs,
+    names: &dyn Fn(&str) -> Option<String>,
+    pkg: &str,
+    user: u32,
+    here: Option<&str>,
+) -> (String, String, Option<PathBuf>) {
+    let (owned, icon) = if check_pkg(pkg).is_ok() {
+        let owned = read_owned(&dirs.desktop_path(pkg, user)).ok().flatten();
         let icon = Some(dirs.icon_path(pkg, user)).filter(|p| p.is_file());
-        (name, icon)
+        (owned, icon)
     } else {
         (None, None)
     };
-    let name = name.unwrap_or_else(|| pkg.to_owned());
-    (
-        "Connect your phone".to_owned(),
-        format!("{name} opens when your phone is connected by USB."),
-        icon,
-    )
+    let app = owned
+        .as_ref()
+        .and_then(|o| o.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| pkg.to_owned());
+    let n = |serial: &str| names(serial).unwrap_or_else(|| serial.to_owned());
+    let phones: &[String] = owned.as_ref().map_or(&[], |o| &o.serials);
+    let (summary, body) = match phones {
+        [] => (
+            "Connect your phone".to_owned(),
+            format!("{app} opens when your phone is connected by USB."),
+        ),
+        [a] => {
+            let a = n(a);
+            let body = match here {
+                Some(h) => format!("{app} is on your {a}, not on {}.", n(h)),
+                None => format!("{app} opens when your {a} is connected by USB."),
+            };
+            (format!("Connect your {a}"), body)
+        }
+        [a, b] => (
+            format!("Connect {} or {}", n(a), n(b)),
+            format!("{app} opens when one of them is connected by USB."),
+        ),
+        [a, b, rest @ ..] => (
+            "Connect one of your phones".to_owned(),
+            format!("{app} is on {}, {} and {} more.", n(a), n(b), rest.len()),
+        ),
+    };
+    (summary, body, icon)
 }
 
 #[cfg(test)]
@@ -1456,10 +1484,120 @@ mod tests {
         assert_eq!(d.menus, Path::new("/h/.config/menus/applications-merged"));
     }
 
+    /// Names for "A" and "B" only; any other serial has none.
+    fn names(serial: &str) -> Option<String> {
+        match serial {
+            "A" => Some("Phone A".into()),
+            "B" => Some("Phone B".into()),
+            "H" => Some("Phone H".into()),
+            _ => None,
+        }
+    }
+
+    /// Plants `com.a`'s entry, labelled "Alpha", listing `serials`.
+    fn plant(dirs: &Dirs, serials: &[&str]) {
+        let serials: Vec<String> = serials.iter().map(|s| s.to_string()).collect();
+        let e = AppEntry {
+            label: "Alpha".into(),
+            ..entry("com.a", 0)
+        };
+        let path = desktop(dirs, "com.a", 0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = desktop_file(&e, &serials[0], &serials, &dirs.exe, None);
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn notice(dirs: &Dirs, here: Option<&str>) -> (String, String) {
+        let (s, b, _) = connect_notice(dirs, &names, "com.a", 0, here);
+        (s, b)
+    }
+
+    #[test]
+    fn connect_notice_without_entry_is_unchanged() {
+        let (_t, dirs) = tmp();
+        assert_eq!(
+            notice(&dirs, None),
+            (
+                "Connect your phone".into(),
+                "com.a opens when your phone is connected by USB.".into()
+            )
+        );
+        assert_eq!(notice(&dirs, Some("H")).0, "Connect your phone");
+    }
+
+    #[test]
+    fn connect_notice_one_phone() {
+        let (_t, dirs) = tmp();
+        plant(&dirs, &["A"]);
+        assert_eq!(
+            notice(&dirs, None),
+            (
+                "Connect your Phone A".into(),
+                "Alpha opens when your Phone A is connected by USB.".into()
+            )
+        );
+        // A serial without a recorded name stands for itself.
+        plant(&dirs, &["s1"]);
+        assert_eq!(
+            notice(&dirs, None),
+            (
+                "Connect your s1".into(),
+                "Alpha opens when your s1 is connected by USB.".into()
+            )
+        );
+    }
+
+    #[test]
+    fn connect_notice_one_phone_while_another_is_here() {
+        let (_t, dirs) = tmp();
+        plant(&dirs, &["A"]);
+        assert_eq!(
+            notice(&dirs, Some("H")),
+            (
+                "Connect your Phone A".into(),
+                "Alpha is on your Phone A, not on Phone H.".into()
+            )
+        );
+        assert_eq!(
+            notice(&dirs, Some("h2")).1,
+            "Alpha is on your Phone A, not on h2."
+        );
+    }
+
+    #[test]
+    fn connect_notice_two_phones() {
+        let (_t, dirs) = tmp();
+        plant(&dirs, &["A", "B"]);
+        let want = (
+            "Connect Phone A or Phone B".to_owned(),
+            "Alpha opens when one of them is connected by USB.".to_owned(),
+        );
+        assert_eq!(notice(&dirs, None), want);
+        assert_eq!(notice(&dirs, Some("H")), want);
+    }
+
+    #[test]
+    fn connect_notice_three_or_more_phones() {
+        let (_t, dirs) = tmp();
+        plant(&dirs, &["A", "B", "c"]);
+        assert_eq!(
+            notice(&dirs, Some("H")),
+            (
+                "Connect one of your phones".into(),
+                "Alpha is on Phone A, Phone B and 1 more.".into()
+            )
+        );
+        plant(&dirs, &["A", "B", "c", "d", "e"]);
+        assert_eq!(
+            notice(&dirs, None).1,
+            "Alpha is on Phone A, Phone B and 3 more."
+        );
+    }
+
     #[test]
     fn connect_notice_uses_entry_name_and_icon() {
         let (_t, dirs) = tmp();
-        let (s, body, icon) = connect_notice(&dirs, "com.a", 0);
+        let (s, body, icon) = connect_notice(&dirs, &|_| None, "com.a", 0, None);
         assert_eq!(s, "Connect your phone");
         assert_eq!(body, "com.a opens when your phone is connected by USB.");
         assert_eq!(icon, None);
@@ -1472,11 +1610,8 @@ mod tests {
         })
         .unwrap();
         let dirs = cat.dirs();
-        let (_, body, icon) = connect_notice(dirs, "com.a", 0);
-        assert_eq!(
-            body,
-            "Sett\\ings opens when your phone is connected by USB."
-        );
+        let (_, body, icon) = connect_notice(dirs, &|_| None, "com.a", 0, None);
+        assert_eq!(body, "Sett\\ings opens when your s is connected by USB.");
         assert_eq!(icon, Some(icons.join("lantern.com.a.png")));
     }
 }

@@ -21,6 +21,9 @@ use tokio::time::Instant;
 /// output), `forward_delay` (seconds `forward` sleeps), `helpers` (pids `pgrep` reports) and
 /// `polls` (after that many `pgrep`s the helpers are gone; absent = never).
 ///
+/// Phone name files: `device_name` (`settings get global device_name`; absent = `null`) and
+/// `prop_<name>` (`getprop <name>`; absent = empty).
+///
 /// Companion / undo-setup files: `pm_path` (`pm path` output; absent = not installed, exit 1),
 /// `apk_sha` (`sha256sum` output for a `/data/app/` path), `jar_sha` (`sha256sum` output for
 /// any other path; absent = exit 1), `install_results` (one line consumed per `pm install`:
@@ -59,6 +62,8 @@ case "$1" in
             echo Success; exit 0 ;;
         esac
         exit 0 ;;
+      settings) cat "$d/device_name" 2>/dev/null || echo null; exit 0 ;;
+      getprop) cat "$d/prop_$3" 2>/dev/null; exit 0 ;;
       *--forget*)
         if [ -f "$d/forget_fail" ]; then echo 'forget failed: boom' >&2; exit 1; fi
         echo 'forgot journal=restored'; exit 0 ;;
@@ -727,6 +732,39 @@ async fn setup_notifies_the_first_install_only() {
     let record: serde_json::Value = serde_json::from_str(&record).unwrap();
     assert_eq!(record["companion"], serde_json::json!(true));
     assert!(record["since"].as_u64().unwrap() > 1_700_000_000);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// The phone's name goes into its device record, from the first source that has one:
+/// `device_name`, then `ro.product.marketname`, then manufacturer + model.
+#[tokio::test]
+async fn setup_records_the_phone_name() {
+    let fake = FakeAdb::new("setup-name", "0");
+    let state = state_dir("name");
+    let (setup, _notes) = recording_setup(&state);
+    let name = |state: &Path| -> Option<String> {
+        let record = std::fs::read_to_string(state.join("devices/fake-serial.json")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["companion"], serde_json::json!(true));
+        record["name"].as_str().map(str::to_owned)
+    };
+    std::fs::write(fake.dir.join("prop_ro.product.manufacturer"), "Xiaomi\n").unwrap();
+    std::fs::write(fake.dir.join("prop_ro.product.model"), "2107113SG\n").unwrap();
+    setup.prepare(&fake.adb()).await;
+    assert_eq!(name(&state).as_deref(), Some("Xiaomi 2107113SG"));
+    std::fs::write(fake.dir.join("prop_ro.product.marketname"), "Mi 11T Pro\n").unwrap();
+    setup.prepare(&fake.adb()).await;
+    assert_eq!(name(&state).as_deref(), Some("Mi 11T Pro"));
+    std::fs::write(fake.dir.join("device_name"), " Xiaomi 11T Pro\r\n").unwrap();
+    setup.prepare(&fake.adb()).await;
+    assert_eq!(name(&state).as_deref(), Some("Xiaomi 11T Pro"));
+    let calls = fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("shell settings get global device_name")),
+        "{calls:#?}"
+    );
     let _ = std::fs::remove_dir_all(&state);
 }
 

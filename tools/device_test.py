@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-16
     python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
@@ -298,6 +298,13 @@ def test_activity_listed():
 def applications_dir():
     data = os.environ.get("XDG_DATA_HOME", "")
     return (Path(data) if data.startswith("/") else Path.home() / ".local/share") / "applications"
+
+
+def devices_dir():
+    """lanternd's device records (`companion::state_dir()/devices`)."""
+    state = os.environ.get("XDG_STATE_HOME", "")
+    return (Path(state) if state.startswith("/") else Path.home() / ".local/state") / \
+        "lantern" / "devices"
 
 
 def desktop_entry(app_id):
@@ -963,6 +970,54 @@ class Suite:
         finally:
             cleanup(ok, ("remove the planted entry", lambda: other.unlink(missing_ok=True)))
 
+    def not_on_this_phone_notice(self):
+        """After this phone's full sync, opening an app only another phone has is refused
+        (exit 1) with "Connect your <that phone's name>", and this phone's device record has
+        its name."""
+        pkg = "dev.lantern.test.absent"
+        entry = applications_dir() / f"lantern.{pkg}.desktop"
+        record = devices_dir() / "lantern-test-other.json"
+        check(not entry.exists(), f"{entry} exists before the test")
+        check(not record.exists(), f"{record} exists before the test")
+        planted = ("[Desktop Entry]\nType=Application\nVersion=1.5\nName=Lantern test absent\n"
+                   f"Exec=\"{LANTERN}\" open {pkg}\n"
+                   f"Categories=X-Lantern;\nStartupWMClass=lantern.{pkg}\n"
+                   "StartupNotify=true\nX-Lantern-Serial=lantern-test-other\n"
+                   "X-Lantern-Serials=lantern-test-other;\n"
+                   f"X-Lantern-Package={pkg}\nX-Lantern-User=0\n")
+        ok = False
+        try:
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            entry.write_text(planted)
+            record.parent.mkdir(parents=True, exist_ok=True)
+            record.write_text(json.dumps({"companion": True, "since": 0, "name": "Test Phone"}))
+            wait_ready(15)
+            _, csecs = wait_until("companion ready", 10,
+                                  lambda: status().get("companion") == "ready")
+            note(f"companion ready after {csecs:.1f} s; waiting 10 s for the full sync")
+            time.sleep(10)
+            t0 = time.monotonic()
+            w = Window(pkg, "not_on_this_phone")
+            code = w.wait_exit(5)
+            secs = time.monotonic() - t0
+            lines = w.lines()
+            for line in lines:
+                if "connect notice" in line or "not on this phone" in line:
+                    note(f"stderr: {line.strip()}")
+            check(code == 1, f"lantern open {pkg} -> {code}, want 1 ({w.log})")
+            check(any("connect notice: Connect your Test Phone" in l for l in lines),
+                  f"no 'connect notice: Connect your Test Phone' in {w.log}")
+            note(f"refused in {secs:.1f} s")
+            mine = devices_dir() / f"{SERIAL}.json"
+            check(mine.exists(), f"{mine} is missing")
+            name = json.loads(mine.read_text()).get("name")
+            check(isinstance(name, str) and name.strip(), f"{mine.name} has no name: {name!r}")
+            note(f"{mine.name}: name={name!r}")
+            ok = True
+        finally:
+            cleanup(ok, ("remove the planted entry", lambda: entry.unlink(missing_ok=True)),
+                    ("remove the planted device record", lambda: record.unlink(missing_ok=True)))
+
 
 ITEMS = [
     "session_starts_on_plug",
@@ -980,6 +1035,7 @@ ITEMS = [
     "clipboard_both_ways",
     "usb_yank_restores_keyboard",
     "phones_keep_their_entries",
+    "not_on_this_phone_notice",
 ]
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
 

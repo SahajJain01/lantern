@@ -41,7 +41,7 @@ use debounce::Debouncer;
 use decode::{Decoder, Nv12Frame};
 use geometry::{display_request, rotation_request, ResizeRequests, ResizedKind};
 use input::{InputState, Typed};
-use outcome::{Exit, OpenState};
+use outcome::{Exit, Notice, OpenState};
 use render::Renderer;
 
 pub const DEFAULT_LOGICAL: (u32, u32) = (1280, 800);
@@ -545,8 +545,8 @@ impl App {
         match c {
             Control::Error { msg, .. } => {
                 tracing::error!(stream, msg, "error from phone");
-                if self.state.connect_notice(stream, &msg) {
-                    notify_connect_phone(&self.id);
+                if let Some(notice) = self.state.notice(stream, &msg) {
+                    notify_connect_phone(&self.id, notice);
                 }
                 if let Some(exit) = self.state.on_error(stream, msg) {
                     self.finish(el, exit);
@@ -868,17 +868,36 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-/// "Connect your phone": the app (named as in its menu entry, with its icon) opens once a
-/// phone is plugged in. The exit status is unaffected.
-fn notify_connect_phone(id: &identity::Identity) {
+/// "Connect your …": the app (named as in its menu entry, with its icon) opens once a phone
+/// that has it is plugged in, named from the device records. For [`Notice::NotOnThisPhone`]
+/// the connected phone comes from `lantern status` (none if that fails). The exit status is
+/// unaffected.
+fn notify_connect_phone(id: &identity::Identity, notice: Notice) {
+    let here = match notice {
+        Notice::NoPhone => None,
+        Notice::NotOnThisPhone => ipc::runtime_dir()
+            .and_then(|dir| ipc::query_status(&ipc::socket_path_in(&dir)))
+            .ok()
+            .and_then(|report| report.serial),
+    };
     let (summary, body, icon) = match crate::daemon::catalog::Dirs::from_env() {
-        Ok(dirs) => crate::daemon::catalog::connect_notice(&dirs, &id.pkg, id.user),
+        Ok(dirs) => {
+            let names = crate::daemon::companion::names();
+            crate::daemon::catalog::connect_notice(
+                &dirs,
+                &*names,
+                &id.pkg,
+                id.user,
+                here.as_deref(),
+            )
+        }
         Err(_) => (
             "Connect your phone".to_owned(),
             format!("{} opens when your phone is connected by USB.", id.pkg),
             None,
         ),
     };
+    tracing::info!("connect notice: {summary}");
     crate::notify::send(&summary, &body, icon.as_deref());
 }
 
@@ -897,7 +916,7 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
         Ok(sock) => sock,
         Err(error) => {
             if outcome::daemon_unreachable(&error) {
-                notify_connect_phone(id);
+                notify_connect_phone(id, Notice::NoPhone);
             }
             return Err(error).with_context(|| {
                 format!(

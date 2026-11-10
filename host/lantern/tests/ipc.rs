@@ -1458,3 +1458,72 @@ async fn catalogue_from_helper_becomes_menu_entries() {
     daemon.shutdown().await;
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Plants the menu entry of `pkg` (user 0) as written by phone `serial`'s sync.
+fn plant_entry(dirs: &Dirs, pkg: &str, serial: &str) {
+    use lantern::daemon::catalog::{desktop_file, AppEntry};
+    let e = AppEntry {
+        pkg: pkg.into(),
+        user: 0,
+        label: pkg.into(),
+        work: false,
+        icon_png: Vec::new(),
+    };
+    std::fs::create_dir_all(&dirs.applications).unwrap();
+    let text = desktop_file(&e, serial, &[serial.to_owned()], &dirs.exe, None);
+    std::fs::write(
+        dirs.applications.join(format!("lantern.{pkg}.desktop")),
+        text,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn open_before_first_sync_is_forwarded() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (root, dirs, catalog) = temp_catalog();
+    plant_entry(&dirs, "com.x", "other");
+    let daemon = start_daemon_with(Some(port), Some(catalog));
+    helper.next_session().await;
+    // Session `dev` is up but has sent no apps_end: its catalogue is unknown, so the open goes
+    // to the phone.
+    let (_client, _win) = open_window(&daemon.sock, &mut helper, "com.x", 0).await;
+    daemon.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn open_of_other_phones_app_is_refused_after_sync() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (root, dirs, catalog) = temp_catalog();
+    plant_entry(&dirs, "com.x", "other");
+    let daemon = start_daemon_with(Some(port), Some(catalog));
+    helper.next_session().await;
+    helper.send(app("com.y", 0, "Yankee", ""));
+    helper.send(control(0, Control::AppsEnd { count: 1 }));
+    // Helper frames are handled in order: once com.z's entry exists, apps_end has been too.
+    helper.send(app("com.z", 0, "Zulu", ""));
+    wait_files(&dirs.applications, "synced", |n| {
+        n.iter().any(|f| f == "lantern.com.z.desktop")
+    })
+    .await;
+    let x = std::fs::read_to_string(dirs.applications.join("lantern.com.x.desktop")).unwrap();
+    assert!(x.contains("X-Lantern-Serials=other;\n"), "{x}");
+
+    let (mut client, reply) = connect_open(&daemon.sock, open("com.x", 0, None)).await;
+    let reply = reply.expect("a reply to the open");
+    assert_eq!(reply.stream, 0);
+    assert_eq!(decode(&reply), Control::error("app not on this phone"));
+    assert_eq!(ipc::NOT_ON_THIS_PHONE, "app not on this phone");
+    assert_eq!(
+        recv(&mut client).await,
+        None,
+        "the daemon closes the client"
+    );
+    helper.assert_quiet().await;
+
+    // An app that lists this phone still opens.
+    let (_client, _win) = open_window(&daemon.sock, &mut helper, "com.y", 0).await;
+    daemon.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
+}

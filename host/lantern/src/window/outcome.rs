@@ -11,6 +11,15 @@ pub struct Exit {
     pub message: Option<String>,
 }
 
+/// Why the daemon refused an open in a way that gets a "Connect your …" notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice {
+    /// No phone is connected (or lanternd is not running).
+    NoPhone,
+    /// The connected phone does not have the app; another phone does.
+    NotOnThisPhone,
+}
+
 #[derive(Debug, Default)]
 pub struct OpenState {
     /// Window id from `opened`.
@@ -77,10 +86,19 @@ impl OpenState {
         }
     }
 
-    /// Whether `error{msg}` on `stream` is the daemon refusing our open because no phone is
-    /// connected, which gets a "Connect your phone" notification.
-    pub fn connect_notice(&self, stream: u32, msg: &str) -> bool {
-        stream == 0 && self.win.is_none() && msg == crate::daemon::ipc::NOT_CONNECTED
+    /// Which "Connect your …" notification `error{msg}` on `stream` calls for: only the daemon
+    /// refusing our open (stream 0, before `opened`) because no phone is connected or the
+    /// connected one lacks the app.
+    pub fn notice(&self, stream: u32, msg: &str) -> Option<Notice> {
+        use crate::daemon::ipc::{NOT_CONNECTED, NOT_ON_THIS_PHONE};
+        if stream != 0 || self.win.is_some() {
+            return None;
+        }
+        match msg {
+            NOT_CONNECTED => Some(Notice::NoPhone),
+            NOT_ON_THIS_PHONE => Some(Notice::NotOnThisPhone),
+            _ => None,
+        }
     }
 
     fn failure(&self, fallback: &str) -> Exit {
@@ -180,14 +198,20 @@ mod tests {
     }
 
     #[test]
-    fn connect_notice_only_for_a_refused_open_without_phone() {
+    fn notice_only_for_refused_open() {
         let s = OpenState::default();
-        assert!(s.connect_notice(0, "phone not connected"));
-        assert!(!s.connect_notice(0, "open out of range: user=..."));
-        assert!(!s.connect_notice(3, "phone not connected"));
+        assert_eq!(s.notice(0, "phone not connected"), Some(Notice::NoPhone));
+        assert_eq!(
+            s.notice(0, "app not on this phone"),
+            Some(Notice::NotOnThisPhone)
+        );
+        assert_eq!(s.notice(0, "open out of range: user=..."), None);
+        assert_eq!(s.notice(3, "phone not connected"), None);
+        assert_eq!(s.notice(3, "app not on this phone"), None);
         let mut opened = OpenState::default();
         opened.opened(1);
-        assert!(!opened.connect_notice(0, "phone not connected"));
+        assert_eq!(opened.notice(0, "phone not connected"), None);
+        assert_eq!(opened.notice(0, "app not on this phone"), None);
     }
 
     #[test]
