@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15
     python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
@@ -924,6 +924,45 @@ class Suite:
             systemctl("start", UNIT)
         wait_ready(15)
 
+    # --- Plan 3 ----------------------------------------------------------------------------
+
+    def phones_keep_their_entries(self):
+        """Another phone's menu entry survives this phone's full sync byte for byte, and this
+        phone's entries list its serial in X-Lantern-Serials."""
+        other = applications_dir() / "lantern.dev.lantern.test.other.desktop"
+        check(not other.exists(), f"{other} exists before the test")
+        # The format of catalog::desktop_file for a phone "lantern-test-other".
+        planted = ("[Desktop Entry]\nType=Application\nVersion=1.5\nName=Lantern test other\n"
+                   f"Exec=\"{LANTERN}\" open dev.lantern.test.other\n"
+                   "Categories=X-Lantern;\nStartupWMClass=lantern.dev.lantern.test.other\n"
+                   "StartupNotify=true\nX-Lantern-Serial=lantern-test-other\n"
+                   "X-Lantern-Serials=lantern-test-other;\n"
+                   "X-Lantern-Package=dev.lantern.test.other\nX-Lantern-User=0\n").encode()
+        ok = False
+        try:
+            other.parent.mkdir(parents=True, exist_ok=True)
+            other.write_bytes(planted)
+            systemctl("restart", UNIT)
+            _, secs = wait_ready(15)
+            _, csecs = wait_until("companion ready", 10,
+                                  lambda: status().get("companion") == "ready")
+            note(f"ready {secs:.1f} s, companion ready {csecs:.1f} s after; "
+                 "waiting 10 s for the full sync")
+            time.sleep(10)
+            check(other.exists(), f"{other.name} was deleted by {SERIAL}'s full sync")
+            check(other.read_bytes() == planted, f"{other.name} was rewritten")
+            note(f"{other.name} unchanged")
+            settings = desktop_entry(f"lantern.{SETTINGS}")
+            check(settings is not None, f"lantern.{SETTINGS}.desktop is missing")
+            assert settings is not None
+            serials = settings.get("X-Lantern-Serials", "")
+            note(f"lantern.{SETTINGS}.desktop: X-Lantern-Serial={settings.get('X-Lantern-Serial')} "
+                 f"X-Lantern-Serials={serials}")
+            check(SERIAL in serials.split(";"), f"X-Lantern-Serials={serials!r} lacks {SERIAL}")
+            ok = True
+        finally:
+            cleanup(ok, ("remove the planted entry", lambda: other.unlink(missing_ok=True)))
+
 
 ITEMS = [
     "session_starts_on_plug",
@@ -940,6 +979,7 @@ ITEMS = [
     "ime_unicode_text",
     "clipboard_both_ways",
     "usb_yank_restores_keyboard",
+    "phones_keep_their_entries",
 ]
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
 

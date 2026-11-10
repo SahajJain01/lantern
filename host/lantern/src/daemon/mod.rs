@@ -4,7 +4,6 @@ pub mod ipc;
 pub mod registry;
 pub mod session;
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -23,14 +22,21 @@ use crate::adb::{track_devices, Adb, DeviceEvent};
 use crate::clipboard::{PcClipboard, PcOffer};
 use crate::daemon::session::{start_with_companion, HandshakeError};
 
-fn select_serial(configured: Option<&str>, connected: &HashSet<String>) -> Option<String> {
+/// The phone to serve: `configured` (`$LANTERN_SERIAL`) if set, else `current` (the live
+/// session's phone) while it is online, else the first of `online` (kept in the order devices
+/// came online).
+fn select_serial(
+    configured: Option<&str>,
+    online: &[String],
+    current: Option<&str>,
+) -> Option<String> {
     if let Some(serial) = configured {
         return Some(serial.to_owned());
     }
-    if connected.len() == 1 {
-        return connected.iter().next().cloned();
+    if let Some(current) = current.filter(|c| online.iter().any(|s| s == c)) {
+        return Some(current.to_owned());
     }
-    Some("20e9318".to_owned())
+    online.first().cloned()
 }
 
 /// Backoff for restarting a session after a failed start or helper death, while the target
@@ -189,7 +195,8 @@ where
 {
     tokio::pin!(events);
     tokio::pin!(shutdown);
-    let mut connected = HashSet::new();
+    // Online devices, in the order they came online.
+    let mut connected: Vec<String> = Vec::new();
     let mut active: Option<(SessionConn, Instant)> = None;
     let mut starting: Starting<F> = None;
     let mut retry_at: Option<Instant> = None;
@@ -227,8 +234,11 @@ where
                 match event {
                     DeviceEvent::Online(serial) => {
                         tracing::info!(serial, "device online");
-                        connected.insert(serial.clone());
-                        let target = select_serial(configured.as_deref(), &connected);
+                        if !connected.contains(&serial) {
+                            connected.push(serial.clone());
+                        }
+                        let current = active.as_ref().map(|(s, _)| s.serial().to_owned());
+                        let target = select_serial(configured.as_deref(), &connected, current.as_deref());
                         if idle && target.as_deref() == Some(serial.as_str()) {
                             failures = 0;
                             retry_at = Some(Instant::now());
@@ -236,15 +246,16 @@ where
                     }
                     DeviceEvent::Offline(serial) => {
                         tracing::info!(serial, "device offline");
-                        connected.remove(&serial);
+                        connected.retain(|s| *s != serial);
                         if starting.as_ref().map(|(s, _)| s.as_str()) == Some(serial.as_str()) {
                             cancel_start(&mut starting, "device offline");
                         }
                         if active.as_ref().map(|(s, _)| s.serial()) == Some(serial.as_str()) {
                             close_session(&mut active, &mut hub).await;
                         }
-                        let target = select_serial(configured.as_deref(), &connected);
-                        if target.as_deref().is_none_or(|t| !connected.contains(t)) {
+                        let current = active.as_ref().map(|(s, _)| s.serial().to_owned());
+                        let target = select_serial(configured.as_deref(), &connected, current.as_deref());
+                        if target.as_ref().is_none_or(|t| !connected.contains(t)) {
                             retry_at = None;
                             failures = 0;
                         }
@@ -253,7 +264,7 @@ where
             }
             _ = tokio::time::sleep_until(wake), if idle && retry_at.is_some() => {
                 retry_at = None;
-                let target = select_serial(configured.as_deref(), &connected)
+                let target = select_serial(configured.as_deref(), &connected, None)
                     .filter(|target| connected.contains(target));
                 if let Some(serial) = target {
                     tracing::info!(serial, attempt = failures + 1, "starting session");
@@ -404,14 +415,14 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn devices(serials: &[&str]) -> HashSet<String> {
+    fn online(serials: &[&str]) -> Vec<String> {
         serials.iter().map(|serial| (*serial).to_owned()).collect()
     }
 
     #[test]
     fn configured_serial_wins_over_single_device_default() {
         assert_eq!(
-            select_serial(Some("chosen"), &devices(&["only"])),
+            select_serial(Some("chosen"), &online(&["only"]), None),
             Some("chosen".into())
         );
     }
@@ -419,16 +430,30 @@ mod tests {
     #[test]
     fn unset_serial_uses_only_device() {
         assert_eq!(
-            select_serial(None, &devices(&["only"])),
+            select_serial(None, &online(&["only"]), None),
             Some("only".into())
         );
     }
 
     #[test]
-    fn unset_serial_defaults_when_multiple_devices_are_connected() {
+    fn select_serial_prefers_current_then_first_online() {
         assert_eq!(
-            select_serial(None, &devices(&["one", "two"])),
-            Some("20e9318".into())
+            select_serial(None, &online(&["b", "a"]), Some("a")),
+            Some("a".into())
+        );
+        assert_eq!(
+            select_serial(None, &online(&["b", "a"]), None),
+            Some("b".into())
+        );
+        assert_eq!(select_serial(None, &online(&[]), None), None);
+        assert_eq!(
+            select_serial(Some("x"), &online(&["a"]), None),
+            Some("x".into())
+        );
+        // A current phone that went offline gives way to the first online one.
+        assert_eq!(
+            select_serial(None, &online(&["b"]), Some("a")),
+            Some("b".into())
         );
     }
 

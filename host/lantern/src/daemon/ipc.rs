@@ -311,8 +311,6 @@ pub struct Hub {
     events: mpsc::Receiver<ClientEvent>,
     /// The phone's launcher apps as menu entries, if the daemon keeps them.
     catalog: Option<Catalog>,
-    /// The live session's serial, for re-opening the catalogue sync window after `apps_end`.
-    catalog_serial: Option<String>,
     /// Where phone `clip`s go (the PC clipboard), if the daemon syncs it.
     clip_out: Option<ClipHandle>,
     /// Echo/secret/size suppression for the clipboard; reset with each session.
@@ -335,7 +333,6 @@ impl Hub {
             events_tx,
             events,
             catalog: None,
-            catalog_serial: None,
             clip_out: None,
             clip_sync: ClipSync::default(),
         }
@@ -391,9 +388,8 @@ impl Hub {
 
     /// A session with `serial` is up: the first catalogue sync window opens.
     pub fn session_started(&mut self, serial: &str) {
-        self.catalog_serial = Some(serial.to_owned());
         if let Some(catalog) = self.catalog.as_mut() {
-            catalog.begin_sync(serial);
+            catalog.start_session(serial);
         }
     }
 
@@ -431,18 +427,13 @@ impl Hub {
                     );
                 }
             }
-            Control::AppsEnd { count } => {
-                match catalog.end_sync(count) {
-                    Ok(removed) => tracing::info!(count, removed, "catalogue synced"),
-                    Err(error) => {
-                        tracing::warn!(error = format!("{error:#}"), "catalogue prune failed")
-                    }
+            // `end_sync` also opens the next window (a companion relink, a profile change).
+            Control::AppsEnd { count } => match catalog.end_sync(count) {
+                Ok(removed) => tracing::info!(count, removed, "catalogue synced"),
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:#}"), "catalogue prune failed")
                 }
-                // The next full sync (a companion relink, a profile change) gets its own window.
-                if let Some(serial) = &self.catalog_serial {
-                    catalog.begin_sync(serial);
-                }
-            }
+            },
             _ => {}
         }
     }

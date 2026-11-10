@@ -193,8 +193,13 @@ mod tests {
             exe: "/usr/bin/lantern".into(),
         };
         let mut cat = Catalog::with_rebuild(dirs.clone(), std::sync::Arc::new(|| {}));
-        for (serial, pkg) in [("mine", "com.a"), ("mine", "com.b"), ("other", "com.c")] {
-            cat.begin_sync(serial);
+        for (serial, pkg) in [
+            ("mine", "com.a"),
+            ("mine", "com.s"),
+            ("other", "com.s"),
+            ("other", "com.c"),
+        ] {
+            cat.start_session(serial);
             cat.upsert(&AppEntry {
                 pkg: pkg.into(),
                 user: 0,
@@ -207,10 +212,18 @@ mod tests {
         drop(cat);
         let removed =
             remove_catalogue_entries_with(dirs.clone(), "mine", std::sync::Arc::new(|| {}));
-        let left = std::fs::read_dir(&dirs.applications).unwrap().count();
+        let mut left: Vec<String> = std::fs::read_dir(&dirs.applications)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let shared =
+            Catalog::with_rebuild(dirs.clone(), std::sync::Arc::new(|| {})).phones("com.s", 0);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(removed.unwrap(), 2);
-        assert_eq!(left, 1);
+        // The shared entry stays, listing only the other phone.
+        assert_eq!(left, ["lantern.com.c.desktop", "lantern.com.s.desktop"]);
+        assert_eq!(shared, ["other"]);
     }
 
     #[test]

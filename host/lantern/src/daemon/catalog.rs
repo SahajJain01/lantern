@@ -7,11 +7,14 @@
 //! "Phone" submenu. Every file Lantern writes carries `X-Lantern-Serial=`; a file without it is
 //! never modified or deleted. After changes, `kbuildsycoca6` runs once, 1 s after the last one.
 //!
-//! Full syncs (`begin_sync` … `end_sync(count)`) prune entries the phone no longer lists, but only
-//! when every announced app arrived, and only for the Android users that appeared in the sync
-//! (a paused work profile sends nothing and keeps its entries); entries of other serials go too.
+//! One entry serves every phone that has the app: `X-Lantern-Serials=` lists them (a Plan 2 file
+//! without it lists its `X-Lantern-Serial`). A phone's session only ever adds or removes its own
+//! serial; the file (and icon) goes when the list is empty. Full syncs (`start_session` …
+//! `end_sync(count)`) take the phone off entries it no longer lists, but only when every
+//! announced app arrived, and only for the Android users that appeared in the sync (a paused work
+//! profile sends nothing and keeps its entries). Other phones' entries are never touched.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -230,8 +233,50 @@ fn entry_name(e: &AppEntry) -> String {
     name + &suffix
 }
 
-/// The `.desktop` file for `e` on phone `serial`. `icon` is the absolute PNG path, if any.
-pub fn desktop_file(e: &AppEntry, serial: &str, exe: &Path, icon: Option<&Path>) -> String {
+/// `X-Lantern-Serials=` value: each serial string-escaped with `;` as `\;`, each followed by `;`,
+/// sorted and deduplicated.
+fn serials_value(serials: &[String]) -> String {
+    let set: BTreeSet<&String> = serials.iter().collect();
+    set.into_iter()
+        .map(|s| escape_value(s, MAX_LABEL).replace(';', "\\;") + ";")
+        .collect()
+}
+
+/// Splits an `X-Lantern-Serials=` value at its unescaped `;` and unescapes each serial.
+fn parse_serials(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut piece = String::new();
+    let mut it = value.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                piece.push(c);
+                if let Some(next) = it.next() {
+                    piece.push(next);
+                }
+            }
+            ';' => out.push(unescape_value(&std::mem::take(&mut piece))),
+            c => piece.push(c),
+        }
+    }
+    if !piece.is_empty() {
+        out.push(unescape_value(&piece));
+    }
+    out.retain(|s| !s.is_empty());
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The `.desktop` file for `e`, written by phone `serial`'s sync and listing the phones
+/// `serials`. `icon` is the absolute PNG path, if any.
+pub fn desktop_file(
+    e: &AppEntry,
+    serial: &str,
+    serials: &[String],
+    exe: &Path,
+    icon: Option<&Path>,
+) -> String {
     let user_arg = match e.user {
         0 => String::new(),
         n => format!(" --user {n}"),
@@ -249,6 +294,7 @@ pub fn desktop_file(e: &AppEntry, serial: &str, exe: &Path, icon: Option<&Path>)
     f += &format!("StartupWMClass={}\n", app_id(&e.pkg, e.user));
     f += "StartupNotify=true\n";
     f += &format!("X-Lantern-Serial={}\n", escape_value(serial, MAX_LABEL));
+    f += &format!("X-Lantern-Serials={}\n", serials_value(serials));
     f += &format!("X-Lantern-Package={}\n", e.pkg);
     f += &format!("X-Lantern-User={}\n", e.user);
     f
@@ -257,7 +303,8 @@ pub fn desktop_file(e: &AppEntry, serial: &str, exe: &Path, icon: Option<&Path>)
 /// What a Lantern-written `.desktop` file says about itself.
 #[derive(Debug)]
 struct Owned {
-    serial: String,
+    /// The phones that list this app (`X-Lantern-Serials`, else `[X-Lantern-Serial]`).
+    serials: Vec<String>,
     pkg: Option<String>,
     user: Option<u32>,
     name: Option<String>,
@@ -279,12 +326,42 @@ fn read_owned(path: &Path) -> Result<Option<Owned>> {
     let Some(serial) = value(&text, "X-Lantern-Serial") else {
         return Ok(None);
     };
+    let serials = match value(&text, "X-Lantern-Serials") {
+        Some(list) => parse_serials(list),
+        None => vec![unescape_value(serial)],
+    };
     Ok(Some(Owned {
-        serial: unescape_value(serial),
+        serials,
         pkg: value(&text, "X-Lantern-Package").map(str::to_owned),
         user: value(&text, "X-Lantern-User").and_then(|u| u.parse().ok()),
         name: value(&text, "Name").map(unescape_value),
     }))
+}
+
+/// `text` with its `X-Lantern-Serials=` line set to `serials` (added after `X-Lantern-Serial=`
+/// in a file that has none).
+fn with_serials(text: &str, serials: &[String]) -> String {
+    let new = format!("X-Lantern-Serials={}", serials_value(serials));
+    let mut out = String::new();
+    let mut done = false;
+    for l in text.lines() {
+        if l.starts_with("X-Lantern-Serials=") {
+            if !done {
+                out += &new;
+                out.push('\n');
+                done = true;
+            }
+            continue;
+        }
+        out += l;
+        out.push('\n');
+        if !done && l.starts_with("X-Lantern-Serial=") {
+            out += &new;
+            out.push('\n');
+            done = true;
+        }
+    }
+    out
 }
 
 /// Writes `bytes` to `path` atomically (temp file + rename) unless it already holds them.
@@ -447,9 +524,11 @@ const REBUILD_DELAY: Duration = Duration::from_secs(1);
 /// The menu entries of the phone's launcher apps. See the module docs.
 pub struct Catalog {
     dirs: Dirs,
-    /// The phone the current sync window belongs to.
+    /// The phone of the live session; the sync window belongs to it.
     serial: Option<String>,
-    /// `upsert`/`remove` calls since `begin_sync`.
+    /// A full sync whose count matched has ended since `start_session`.
+    synced: bool,
+    /// `upsert`/`remove` calls since the window opened (`start_session` or the last `end_sync`).
     seen: u32,
     /// Android users with at least one upsert in this window.
     users: HashSet<u32>,
@@ -464,37 +543,55 @@ impl Catalog {
         Self::with_rebuild(dirs, Arc::new(run_kbuildsycoca))
     }
 
-    /// A catalogue that runs `rebuild` (debounced) after changes.
+    /// A catalogue that runs `rebuild` (debounced) after changes. Writes nothing yet: the
+    /// Phone menu files come with the first entry.
     pub fn with_rebuild(dirs: Dirs, rebuild: Rebuild) -> Self {
-        let cat = Self {
+        Self {
             dirs,
             serial: None,
+            synced: false,
             seen: 0,
             users: HashSet::new(),
             keep: HashSet::new(),
             rebuild: Rebuilder::spawn(rebuild, REBUILD_DELAY),
-        };
-        match ensure_menu(&cat.dirs) {
-            Ok(true) => cat.rebuild.changed(),
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                error = format!("{error:#}"),
-                "could not write the Phone menu"
-            ),
         }
-        cat
     }
 
     pub fn dirs(&self) -> &Dirs {
         &self.dirs
     }
 
-    /// Starts counting a full catalogue from `serial`.
-    pub fn begin_sync(&mut self, serial: &str) {
+    /// A session with `serial` is up: its first sync window opens and [`Self::synced`] is false
+    /// until a full catalogue from it arrives.
+    pub fn start_session(&mut self, serial: &str) {
         self.serial = Some(serial.to_owned());
+        self.synced = false;
         self.seen = 0;
         self.users.clear();
         self.keep.clear();
+    }
+
+    /// True once an `end_sync` whose count matched has run since [`Self::start_session`].
+    pub fn synced(&self) -> bool {
+        self.synced
+    }
+
+    /// The phones whose catalogue lists `pkg` for `user`; empty when there is no Lantern entry.
+    pub fn phones(&self, pkg: &str, user: u32) -> Vec<String> {
+        if check_pkg(pkg).is_err() || check_user(user).is_err() {
+            return Vec::new();
+        }
+        match read_owned(&self.dirs.desktop_path(pkg, user)) {
+            Ok(Some(owned)) => owned.serials,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "could not read catalogue entry"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Writes (or refreshes) `e`'s icon and menu entry. Counts toward the sync window even when
@@ -508,16 +605,28 @@ impl Catalog {
         let serial = self
             .serial
             .clone()
-            .context("no phone session (begin_sync first)")?;
+            .context("no phone session (start_session first)")?;
         let path = self.dirs.desktop_path(&e.pkg, e.user);
-        if path.exists() && read_owned(&path)?.is_none() {
-            bail!(
+        let mut serials = match read_owned(&path)? {
+            Some(owned) => owned.serials,
+            None if path.exists() => bail!(
                 "{} is not a Lantern entry; leaving it alone",
                 path.display()
-            );
-        }
+            ),
+            None => Vec::new(),
+        };
+        serials.push(serial.clone());
+        let mut changed = match ensure_menu(&self.dirs) {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "could not write the Phone menu"
+                );
+                false
+            }
+        };
         let icon_path = self.dirs.icon_path(&e.pkg, e.user);
-        let mut changed = false;
         let icon = if is_png(&e.icon_png) {
             changed |= write_if_changed(&icon_path, &e.icon_png)?;
             Some(icon_path.as_path())
@@ -525,7 +634,7 @@ impl Catalog {
             changed |= remove_file(&icon_path)?;
             None
         };
-        let text = desktop_file(e, &serial, &self.dirs.exe, icon);
+        let text = desktop_file(e, &serial, &serials, &self.dirs.exe, icon);
         changed |= write_if_changed(&path, text.as_bytes())?;
         if changed {
             self.rebuild.changed();
@@ -533,39 +642,59 @@ impl Catalog {
         Ok(())
     }
 
-    /// Removes `pkg`'s entry for `user` (a no-op if there is none or it is not Lantern's).
+    /// The session's phone no longer has `pkg` for `user`: its serial comes off that entry,
+    /// which goes when no phone is left (a no-op if there is none or it is not Lantern's).
     pub fn remove(&mut self, pkg: &str, user: u32) -> Result<()> {
         self.seen = self.seen.saturating_add(1);
         check_pkg(pkg)?;
         check_user(user)?;
         self.keep.remove(&(pkg.to_owned(), user));
+        let serial = self
+            .serial
+            .clone()
+            .context("no phone session (start_session first)")?;
         let path = self.dirs.desktop_path(pkg, user);
-        let mut changed = false;
-        if read_owned(&path)?.is_some() {
-            changed |= remove_file(&path)?;
-            changed |= remove_file(&self.dirs.icon_path(pkg, user))?;
-        }
-        if changed {
-            self.rebuild.changed();
+        if let Some(owned) = read_owned(&path)? {
+            if self.drop_serial(&path, &owned, &serial)? {
+                self.rebuild.changed();
+            }
         }
         Ok(())
     }
 
-    fn remove_entry(&self, path: &Path) -> Result<()> {
-        remove_file(path)?;
-        if let Some(stem) = path.file_stem() {
-            let icon = self
-                .dirs
-                .icons
-                .join(format!("{}.png", stem.to_string_lossy()));
-            remove_file(&icon)?;
+    /// Takes `serial` off the entry at `path`: rewrites its `X-Lantern-Serials`, or removes it
+    /// and its icon when no phone is left. Returns whether `serial` was listed.
+    fn drop_serial(&self, path: &Path, owned: &Owned, serial: &str) -> Result<bool> {
+        if !owned.serials.iter().any(|s| s == serial) {
+            return Ok(false);
         }
-        Ok(())
+        let left: Vec<String> = owned
+            .serials
+            .iter()
+            .filter(|s| *s != serial)
+            .cloned()
+            .collect();
+        if left.is_empty() {
+            remove_file(path)?;
+            if let Some(stem) = path.file_stem() {
+                let icon = self
+                    .dirs
+                    .icons
+                    .join(format!("{}.png", stem.to_string_lossy()));
+                remove_file(&icon)?;
+            }
+        } else {
+            let text = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            let text = with_serials(&String::from_utf8_lossy(&text), &left);
+            write_if_changed(path, text.as_bytes())?;
+        }
+        Ok(true)
     }
 
-    /// Ends the sync window. If `count` matches what arrived, prunes entries of other serials
-    /// and, for each user that appeared, the apps it no longer lists. Returns how many entries
-    /// were removed.
+    /// Ends the sync window and opens the next one (a companion relink or a profile change
+    /// sends another full catalogue). If `count` matches what arrived, the session's phone comes
+    /// off every entry it lists for a user that appeared but did not send that app. Returns how
+    /// many entries it came off.
     pub fn end_sync(&mut self, count: u32) -> Result<usize> {
         let seen = self.seen;
         let users = std::mem::take(&mut self.users);
@@ -578,40 +707,36 @@ impl Catalog {
             tracing::info!("partial catalogue (got {seen} of {count}); not pruning");
             return Ok(0);
         }
+        self.synced = true;
         let mut removed = 0;
         for (path, owned) in owned_entries(&self.dirs)? {
-            let stale = if owned.serial != serial {
-                true
-            } else {
-                match (owned.pkg, owned.user) {
-                    (Some(pkg), Some(user)) => {
-                        users.contains(&user) && !keep.contains(&(pkg, user))
-                    }
-                    _ => false,
+            let stale = match (&owned.pkg, owned.user) {
+                (Some(pkg), Some(user)) => {
+                    users.contains(&user) && !keep.contains(&(pkg.clone(), user))
                 }
+                _ => false,
             };
-            if stale {
-                self.remove_entry(&path)?;
+            if stale && self.drop_serial(&path, &owned, &serial)? {
                 removed += 1;
             }
         }
         if removed > 0 {
-            tracing::info!(removed, "pruned catalogue entries");
+            tracing::info!(serial, removed, "pruned catalogue entries");
             self.rebuild.changed();
         }
         Ok(removed)
     }
 
-    /// Removes every entry of `serial`; with no Lantern entries left, the Phone menu goes too.
-    /// Returns how many entries were removed.
+    /// Takes `serial` off every entry (undo-setup); entries left with no phone go, and with no
+    /// Lantern entry left the Phone menu goes too. Returns how many entries it came off.
     pub fn remove_serial(&mut self, serial: &str) -> Result<usize> {
         let mut removed = 0;
         let mut left = 0;
         for (path, owned) in owned_entries(&self.dirs)? {
-            if owned.serial == serial {
-                self.remove_entry(&path)?;
+            if self.drop_serial(&path, &owned, serial)? {
                 removed += 1;
-            } else {
+            }
+            if path.exists() {
                 left += 1;
             }
         }
@@ -715,6 +840,174 @@ mod tests {
             .collect()
     }
 
+    /// A full sync from `serial`: a new session, every app upserted, a matching `end_sync`.
+    fn full_sync(cat: &mut Catalog, serial: &str, apps: &[(&str, u32)]) -> usize {
+        cat.start_session(serial);
+        for (pkg, user) in apps {
+            cat.upsert(&entry(pkg, *user)).unwrap();
+        }
+        cat.end_sync(apps.len() as u32).unwrap()
+    }
+
+    fn set_mtime(path: &Path, t: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn serials_line(path: &Path) -> Vec<String> {
+        let f = std::fs::read_to_string(path).unwrap();
+        line(&f, "X-Lantern-Serials")
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn full_sync_keeps_other_phones_entries() {
+        let (_t, dirs) = tmp();
+        let b = desktop(&dirs, "com.b", 0);
+        let files = [
+            desktop(&dirs, "com.a", 0),
+            desktop(&dirs, "com.x", 0),
+            dirs.icons.join("lantern.com.a.png"),
+            dirs.icons.join("lantern.com.x.png"),
+        ];
+        let (mut cat, _) = quiet(dirs);
+        assert_eq!(full_sync(&mut cat, "A", &[("com.a", 0), ("com.x", 0)]), 0);
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        for f in &files {
+            set_mtime(f, old);
+        }
+        let before: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+        assert_eq!(full_sync(&mut cat, "B", &[("com.b", 0)]), 0);
+        for (f, bytes) in files.iter().zip(&before) {
+            assert_eq!(&std::fs::read(f).unwrap(), bytes, "{f:?}");
+            assert_eq!(
+                std::fs::metadata(f).unwrap().modified().unwrap(),
+                old,
+                "{f:?}"
+            );
+        }
+        assert_eq!(serials_line(&b), ["B;"]);
+        assert_eq!(cat.phones("com.b", 0), ["B"]);
+        assert_eq!(cat.phones("com.a", 0), ["A"]);
+        assert!(cat.phones("com.none", 0).is_empty());
+    }
+
+    #[test]
+    fn shared_app_lists_both_phones() {
+        let (_t, dirs) = tmp();
+        let (s, t) = (desktop(&dirs, "com.s", 0), desktop(&dirs, "com.t", 0));
+        let (mut cat, _) = quiet(dirs);
+        full_sync(&mut cat, "A", &[("com.s", 0)]);
+        full_sync(&mut cat, "B", &[("com.s", 0)]);
+        assert_eq!(serials_line(&s), ["A;B;"]);
+        // The ownership marker names the phone whose sync wrote the file.
+        let f = std::fs::read_to_string(&s).unwrap();
+        assert_eq!(line(&f, "X-Lantern-Serial"), ["B"]);
+        assert_eq!(cat.phones("com.s", 0), ["A", "B"]);
+        // Sorted and deduplicated, whatever the order the phones synced in.
+        full_sync(&mut cat, "B", &[("com.t", 0)]);
+        full_sync(&mut cat, "A", &[("com.t", 0)]);
+        full_sync(&mut cat, "A", &[("com.t", 0)]);
+        assert_eq!(serials_line(&t), ["A;B;"]);
+    }
+
+    #[test]
+    fn full_sync_drops_only_that_phone() {
+        let (_t, dirs) = tmp();
+        let s = desktop(&dirs, "com.s", 0);
+        let s_icon = dirs.icons.join("lantern.com.s.png");
+        let (mut cat, _) = quiet(dirs);
+        full_sync(&mut cat, "A", &[("com.s", 0), ("com.a", 0)]);
+        full_sync(&mut cat, "B", &[("com.s", 0), ("com.b", 0)]);
+        assert_eq!(full_sync(&mut cat, "B", &[("com.b", 0)]), 1);
+        assert!(s.exists() && s_icon.exists());
+        assert_eq!(serials_line(&s), ["A;"]);
+        assert_eq!(cat.phones("com.s", 0), ["A"]);
+        assert_eq!(full_sync(&mut cat, "A", &[("com.a", 0)]), 1);
+        assert!(!s.exists() && !s_icon.exists());
+        assert!(cat.phones("com.s", 0).is_empty());
+    }
+
+    #[test]
+    fn live_remove_drops_only_that_phone() {
+        let (_t, dirs) = tmp();
+        let s = desktop(&dirs, "com.s", 0);
+        let s_icon = dirs.icons.join("lantern.com.s.png");
+        let (mut cat, _) = quiet(dirs);
+        cat.start_session("A");
+        cat.upsert(&entry("com.s", 0)).unwrap();
+        cat.start_session("B");
+        cat.upsert(&entry("com.s", 0)).unwrap();
+        cat.remove("com.s", 0).unwrap();
+        assert!(s.exists() && s_icon.exists());
+        assert_eq!(serials_line(&s), ["A;"]);
+        // B no longer lists it: removing it again changes nothing.
+        cat.remove("com.s", 0).unwrap();
+        assert_eq!(cat.phones("com.s", 0), ["A"]);
+        cat.start_session("A");
+        cat.remove("com.s", 0).unwrap();
+        assert!(!s.exists() && !s_icon.exists());
+    }
+
+    #[test]
+    fn legacy_entry_reads_as_one_phone() {
+        let (_t, dirs) = tmp();
+        let l = desktop(&dirs, "com.l", 0);
+        std::fs::create_dir_all(&dirs.applications).unwrap();
+        std::fs::write(
+            &l,
+            "[Desktop Entry]\nType=Application\nName=Old\nExec=x open com.l\n\
+             Categories=X-Lantern;\nX-Lantern-Serial=A\nX-Lantern-Package=com.l\n\
+             X-Lantern-User=0\n",
+        )
+        .unwrap();
+        let (mut cat, _) = quiet(dirs);
+        assert_eq!(cat.phones("com.l", 0), ["A"]);
+        cat.start_session("B");
+        cat.upsert(&entry("com.l", 0)).unwrap();
+        assert_eq!(serials_line(&l), ["A;B;"]);
+        assert_eq!(cat.phones("com.l", 0), ["A", "B"]);
+    }
+
+    #[test]
+    fn serial_with_semicolon_round_trips() {
+        let (_t, dirs) = tmp();
+        let a = desktop(&dirs, "com.a", 0);
+        let (mut cat, _) = quiet(dirs);
+        cat.start_session("a;b");
+        cat.upsert(&entry("com.a", 0)).unwrap();
+        assert_eq!(cat.phones("com.a", 0), ["a;b"]);
+        cat.start_session("c\\d");
+        cat.upsert(&entry("com.a", 0)).unwrap();
+        assert_eq!(serials_line(&a), ["a\\;b;c\\\\d;"]);
+        assert_eq!(cat.phones("com.a", 0), ["a;b", "c\\d"]);
+        cat.remove("com.a", 0).unwrap();
+        assert_eq!(cat.phones("com.a", 0), ["a;b"]);
+    }
+
+    #[test]
+    fn synced_after_matching_end_sync_only() {
+        let (_t, dirs) = tmp();
+        let (mut cat, _) = quiet(dirs);
+        assert!(!cat.synced());
+        cat.start_session("A");
+        assert!(!cat.synced());
+        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.end_sync(2).unwrap();
+        assert!(!cat.synced(), "mismatched end_sync");
+        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.end_sync(1).unwrap();
+        assert!(cat.synced());
+        cat.start_session("B");
+        assert!(!cat.synced());
+    }
+
     #[test]
     fn desktop_file_escapes_label() {
         let mut label = "A\nB=C;%x \"q\" 🙂".to_owned();
@@ -723,7 +1016,13 @@ mod tests {
             label,
             ..entry("com.a", 0)
         };
-        let f = desktop_file(&e, "ser", Path::new("/usr/bin/lantern"), None);
+        let f = desktop_file(
+            &e,
+            "ser",
+            &["ser".to_owned()],
+            Path::new("/usr/bin/lantern"),
+            None,
+        );
         let name = line(&f, "Name");
         assert_eq!(name.len(), 1, "{f}");
         assert!(name[0].starts_with("A\\nB=C;%x \"q\" 🙂x"), "{}", name[0]);
@@ -744,6 +1043,7 @@ mod tests {
             "StartupWMClass=lantern.com.a",
             "StartupNotify=true",
             "X-Lantern-Serial=ser",
+            "X-Lantern-Serials=ser;",
             "X-Lantern-Package=com.a",
             "X-Lantern-User=0",
         ] {
@@ -758,14 +1058,14 @@ mod tests {
             label: "a\\b\tc\rd\u{7}e\u{0}f".into(),
             ..entry("com.a", 0)
         };
-        let f = desktop_file(&e, "s", Path::new("/l"), None);
+        let f = desktop_file(&e, "s", &["s".to_owned()], Path::new("/l"), None);
         assert_eq!(line(&f, "Name"), ["a\\\\b\\tc\\rdef"]);
         // Truncation never splits an escape: 199 x then a backslash gives no dangling `\`.
         let e = AppEntry {
             label: format!("{}\\", "x".repeat(199)),
             ..entry("com.a", 0)
         };
-        let f = desktop_file(&e, "s", Path::new("/l"), None);
+        let f = desktop_file(&e, "s", &["s".to_owned()], Path::new("/l"), None);
         let name = line(&f, "Name")[0];
         assert!(name.chars().count() <= 200);
         assert!(!name.ends_with('\\') || name.ends_with("\\\\"), "{name}");
@@ -778,7 +1078,13 @@ mod tests {
             work: true,
             ..entry("com.f", 10)
         };
-        let f = desktop_file(&work, "s", Path::new("/l"), Some(Path::new("/i/x.png")));
+        let f = desktop_file(
+            &work,
+            "s",
+            &["s".to_owned()],
+            Path::new("/l"),
+            Some(Path::new("/i/x.png")),
+        );
         assert_eq!(line(&f, "Name"), ["Files (work)"]);
         assert_eq!(line(&f, "Exec"), ["\"/l\" open --user 10 com.f"]);
         assert_eq!(line(&f, "Icon"), ["/i/x.png"]);
@@ -789,7 +1095,7 @@ mod tests {
             work: false,
             ..entry("com.f", 11)
         };
-        let f = desktop_file(&other, "s", Path::new("/l"), None);
+        let f = desktop_file(&other, "s", &["s".to_owned()], Path::new("/l"), None);
         assert_eq!(line(&f, "Name"), ["Files (user 11)"]);
         let owner = AppEntry {
             label: "Files".into(),
@@ -797,7 +1103,10 @@ mod tests {
             ..entry("com.f", 0)
         };
         assert_eq!(
-            line(&desktop_file(&owner, "s", Path::new("/l"), None), "Name"),
+            line(
+                &desktop_file(&owner, "s", &["s".to_owned()], Path::new("/l"), None),
+                "Name"
+            ),
             ["Files"]
         );
         // A long label still leaves room for the suffix.
@@ -806,7 +1115,7 @@ mod tests {
             work: true,
             ..entry("com.f", 10)
         };
-        let f = desktop_file(&long, "s", Path::new("/l"), None);
+        let f = desktop_file(&long, "s", &["s".to_owned()], Path::new("/l"), None);
         let name = line(&f, "Name")[0];
         assert!(
             name.ends_with(" (work)") && name.chars().count() <= 200,
@@ -821,14 +1130,14 @@ mod tests {
             work: true,
             ..entry("com.f", 10)
         };
-        let f = desktop_file(&e, "s", Path::new("/l"), None);
+        let f = desktop_file(&e, "s", &["s".to_owned()], Path::new("/l"), None);
         assert_eq!(line(&f, "Name"), ["com.f (work)"]);
         let e = AppEntry {
             label: "\u{1}\u{2}".into(),
             work: false,
             ..entry("com.f", 0)
         };
-        let f = desktop_file(&e, "s", Path::new("/l"), None);
+        let f = desktop_file(&e, "s", &["s".to_owned()], Path::new("/l"), None);
         assert_eq!(line(&f, "Name"), ["com.f"]);
     }
 
@@ -837,6 +1146,7 @@ mod tests {
         let f = desktop_file(
             &entry("com.a", 0),
             "s",
+            &["s".to_owned()],
             Path::new("/home/a b/lantern"),
             None,
         );
@@ -846,6 +1156,7 @@ mod tests {
         let f = desktop_file(
             &entry("com.a", 0),
             "s",
+            &["s".to_owned()],
             Path::new("/o\"d`d$d\\d%d/lantern"),
             None,
         );
@@ -861,7 +1172,7 @@ mod tests {
         let apps = dirs.applications.clone();
         let icons = dirs.icons.clone();
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("s");
+        cat.start_session("s");
         for bad in ["com.x;rm -rf", "", "../x", "com/x", "com.x-u1"] {
             assert!(cat.upsert(&entry(bad, 0)).is_err(), "{bad:?} accepted");
             assert!(cat.remove(bad, 0).is_err(), "{bad:?} remove accepted");
@@ -878,7 +1189,7 @@ mod tests {
         let icon = dirs.icons.join("lantern.com.a.png");
         let apps = dirs.applications.clone();
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("ser");
+        cat.start_session("ser");
         cat.upsert(&entry("com.a", 0)).unwrap();
         assert_eq!(std::fs::read(&icon).unwrap(), PNG);
         let f = std::fs::read_to_string(&path).unwrap();
@@ -902,7 +1213,7 @@ mod tests {
         let path = desktop(&dirs, "com.a", 0);
         let icon = dirs.icons.join("lantern.com.a.png");
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("s");
+        cat.start_session("s");
         cat.upsert(&entry("com.a", 0)).unwrap();
         let old = SystemTime::now() - Duration::from_secs(3600);
         for p in [&path, &icon] {
@@ -936,11 +1247,11 @@ mod tests {
         let (a, b) = (desktop(&dirs, "com.a", 0), desktop(&dirs, "com.b", 0));
         let b_icon = dirs.icons.join("lantern.com.b.png");
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("s");
+        cat.start_session("s");
         cat.upsert(&entry("com.a", 0)).unwrap();
         cat.upsert(&entry("com.b", 0)).unwrap();
         assert_eq!(cat.end_sync(2).unwrap(), 0);
-        cat.begin_sync("s");
+        cat.start_session("s");
         cat.upsert(&entry("com.a", 0)).unwrap();
         assert_eq!(cat.end_sync(1).unwrap(), 1);
         assert!(a.exists());
@@ -949,34 +1260,19 @@ mod tests {
     }
 
     #[test]
-    fn full_sync_prunes_other_serial() {
-        let (_t, dirs) = tmp();
-        let (a, b) = (desktop(&dirs, "com.a", 0), desktop(&dirs, "com.b", 10));
-        let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("old");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.upsert(&entry("com.b", 10)).unwrap();
-        assert_eq!(cat.end_sync(2).unwrap(), 0);
-        cat.begin_sync("new");
-        cat.upsert(&entry("com.c", 0)).unwrap();
-        assert_eq!(cat.end_sync(1).unwrap(), 2);
-        assert!(!a.exists() && !b.exists());
-    }
-
-    #[test]
     fn full_sync_keeps_absent_profile() {
         let (_t, dirs) = tmp();
         let (a, w) = (desktop(&dirs, "com.a", 0), desktop(&dirs, "com.w", 10));
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.upsert(&entry("com.w", 10)).unwrap();
-        cat.end_sync(2).unwrap();
-        // The work profile is paused: the next full sync has only user 0's apps.
-        cat.begin_sync("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        assert_eq!(cat.end_sync(1).unwrap(), 0);
+        full_sync(&mut cat, "A", &[("com.a", 0), ("com.w", 10)]);
+        full_sync(&mut cat, "B", &[("com.b", 0), ("com.w", 10)]);
+        // B's work profile is paused: its next full sync has only user 0's apps.
+        assert_eq!(full_sync(&mut cat, "B", &[("com.b", 0)]), 0);
+        assert_eq!(cat.phones("com.w", 10), ["A", "B"]);
+        // So is A's.
+        assert_eq!(full_sync(&mut cat, "A", &[("com.a", 0)]), 0);
         assert!(a.exists() && w.exists());
+        assert_eq!(cat.phones("com.w", 10), ["A", "B"]);
     }
 
     #[test]
@@ -984,20 +1280,19 @@ mod tests {
         let (_t, dirs) = tmp();
         let b = desktop(&dirs, "com.b", 0);
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.upsert(&entry("com.b", 0)).unwrap();
-        cat.end_sync(2).unwrap();
-        cat.begin_sync("other");
+        full_sync(&mut cat, "A", &[("com.a", 0), ("com.b", 0)]);
+        full_sync(&mut cat, "B", &[("com.a", 0), ("com.b", 0)]);
+        cat.start_session("B");
         cat.upsert(&entry("com.a", 0)).unwrap();
         assert_eq!(cat.end_sync(5).unwrap(), 0);
         assert!(b.exists());
+        assert_eq!(cat.phones("com.b", 0), ["A", "B"]);
         // A live removal counts toward the window, so the sync no longer matches.
-        cat.begin_sync("s");
+        cat.start_session("A");
         cat.upsert(&entry("com.a", 0)).unwrap();
         cat.remove("com.zz", 0).unwrap();
         assert_eq!(cat.end_sync(1).unwrap(), 0);
-        assert!(b.exists());
+        assert_eq!(cat.phones("com.b", 0), ["A", "B"]);
     }
 
     #[test]
@@ -1006,7 +1301,7 @@ mod tests {
         let a = desktop(&dirs, "com.a", 10);
         let icon = dirs.icons.join("lantern.com.a-u10.png");
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("s");
+        cat.start_session("s");
         cat.upsert(&entry("com.a", 10)).unwrap();
         cat.remove("com.a", 10).unwrap();
         assert!(!a.exists() && !icon.exists());
@@ -1023,7 +1318,7 @@ mod tests {
         let other = dirs.applications.join("org.kde.dolphin.desktop");
         std::fs::write(&other, "[Desktop Entry]\nX-Lantern-Serial=s\n").unwrap();
         let (mut cat, _) = quiet(dirs);
-        cat.begin_sync("s");
+        cat.start_session("s");
         cat.upsert(&entry("com.a", 0)).unwrap();
         // Same app_id as the hand-made file: refused, file untouched.
         assert!(cat.upsert(&entry("foo", 0)).is_err());
@@ -1036,21 +1331,33 @@ mod tests {
     }
 
     #[test]
-    fn remove_serial_removes_only_that_serial() {
+    fn remove_serial_drops_one_phone() {
         let (_t, dirs) = tmp();
-        let (a, b) = (desktop(&dirs, "com.a", 0), desktop(&dirs, "com.b", 0));
+        let (a, b, s) = (
+            desktop(&dirs, "com.a", 0),
+            desktop(&dirs, "com.b", 0),
+            desktop(&dirs, "com.s", 0),
+        );
         let menu = dirs.menus.join("lantern.menu");
         let dir = dirs.directories.join("lantern-phone.directory");
         let (mut cat, _) = quiet(dirs);
-        assert!(menu.exists() && dir.exists());
-        cat.begin_sync("one");
+        cat.start_session("one");
         cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.begin_sync("two");
+        cat.upsert(&entry("com.s", 0)).unwrap();
+        cat.start_session("two");
         cat.upsert(&entry("com.b", 0)).unwrap();
-        assert_eq!(cat.remove_serial("one").unwrap(), 1);
-        assert!(!a.exists() && b.exists());
-        assert!(menu.exists(), "other entries remain: the menu stays");
-        assert_eq!(cat.remove_serial("two").unwrap(), 1);
+        cat.upsert(&entry("com.s", 0)).unwrap();
+        assert!(menu.exists() && dir.exists());
+        assert_eq!(cat.remove_serial("one").unwrap(), 2);
+        assert!(!a.exists() && b.exists() && s.exists());
+        assert_eq!(cat.phones("com.s", 0), ["two"]);
+        assert!(
+            menu.exists() && dir.exists(),
+            "other entries remain: the menu stays"
+        );
+        assert_eq!(cat.remove_serial("one").unwrap(), 0);
+        assert_eq!(cat.remove_serial("two").unwrap(), 2);
+        assert!(!b.exists() && !s.exists());
         assert!(
             !menu.exists() && !dir.exists(),
             "no entries left: menu removed"
@@ -1058,11 +1365,24 @@ mod tests {
     }
 
     #[test]
+    fn construction_writes_no_menu_files() {
+        let (_t, dirs) = tmp();
+        let menu = dirs.menus.join("lantern.menu");
+        let dir = dirs.directories.join("lantern-phone.directory");
+        let (cat, runs) = quiet(dirs);
+        drop(cat);
+        assert!(!menu.exists() && !dir.exists());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn menu_and_directory_files() {
         let (_t, dirs) = tmp();
         let menu = dirs.menus.join("lantern.menu");
         let dir = dirs.directories.join("lantern-phone.directory");
-        let _cat = quiet(dirs);
+        let (mut cat, _) = quiet(dirs);
+        cat.start_session("s");
+        cat.upsert(&entry("com.a", 0)).unwrap();
         let m = std::fs::read_to_string(&menu).unwrap();
         for want in [
             "<Menu>",
@@ -1086,7 +1406,7 @@ mod tests {
         let (_t, dirs) = tmp();
         let (mut cat, runs) = quiet(dirs);
         // Writing the menu files is a change too.
-        cat.begin_sync("s");
+        cat.start_session("s");
         cat.upsert(&entry("com.a", 0)).unwrap();
         cat.upsert(&entry("com.b", 0)).unwrap();
         std::thread::sleep(Duration::from_millis(400));
@@ -1145,7 +1465,7 @@ mod tests {
         assert_eq!(icon, None);
         let icons = dirs.icons.clone();
         let (mut cat, _) = quiet(Dirs { ..dirs });
-        cat.begin_sync("s");
+        cat.start_session("s");
         cat.upsert(&AppEntry {
             label: "Sett\\ings".into(),
             ..entry("com.a", 0)
