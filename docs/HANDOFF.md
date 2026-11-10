@@ -186,13 +186,38 @@ Write it with superpowers:writing-plans, using the spec as the authority, then r
 superpowers:subagent-driven-development, as Plans 1 and 2 were. Finish Plan 2's deferred checks
 and the merge first.
 
+- **Menu entries for every phone, not just the last one (do this early; Sahaj switches phones).**
+  Today a full sync from phone B prunes every entry of phone A (Ruling 11 in Plan 2), so each switch
+  rewrites the menu, rebuilds sycoca and breaks pins/favourites of apps only phone A has. Decided
+  with Sahaj (2026-11-10):
+  - Keep the union of all phones' apps. One entry per app_id (no serial in the app_id: window
+    identity, titles and remembered sizes stay as they are); the entry lists the phones that have
+    the app (e.g. `X-Lantern-Serials=a;b`).
+  - A full sync from phone S only removes S from entries it didn't list; an entry is deleted when
+    no phone lists it. `undo-setup` removes one phone the same way.
+  - Name/icon come from the phone that synced last (almost always identical).
+  - Launching an entry whose phones are all unplugged says which phone to connect ("Connect your
+    Xiaomi"); give each phone a friendly name (`ro.product.model`) in the device record.
+- **System tray (StatusNotifierItem from `lanternd`), built as the home for future settings.**
+  Spec §9a already asks for one; Sahaj wants it to be where users act on Lantern and change its
+  settings. Plan 3 scope:
+  - Status: connected (phone name) / disconnected / starting / reconnecting / companion unavailable.
+  - Actions: Disconnect (end the session, phone restored), Undo phone setup, Open settings folder,
+    Quit.
+  - A settings model to grow into: one TOML file (`~/.config/lantern/settings.toml`) read by
+    lanternd and the windows, with typed defaults; the tray exposes the first few toggles (e.g.
+    clipboard sync on/off, text input via the Lantern keyboard on/off, launch at login) as checkable
+    menu items, and anything the tray changes takes effect without restarting lanternd. Keep the
+    tray a thin view over that model so later settings are one line each.
+  - Builder calls: zbus (already in `~/.cargo/registry`, v5) for the SNI + `com.canonical.dbusmenu`
+    interfaces, or the `ksni` crate if available offline; icon from the theme (`smartphone`) with
+    a state overlay.
 - Notifications to KDE, with clicks opening that app's window (§8.5).
 - Drag and drop from PC to phone: copy the file, then use Android share, falling back to Downloads.
 - One phone audio stream.
 - Gamepads: the helper must re-attach the UHID controller to the display of the active PC window.
   Spikes showed scrcpy keeps it pinned to the first display. On Linux the GameSir must be held
   open, or it reconnects over and over.
-- A tray icon.
 - Pausing a window's encoder while it is minimised. This is added within protocol v1 (see
   `docs/protocol.md`).
 - A latency harness, and the target from spec §9a/§11: no more than 5 ms worse than scrcpy.
