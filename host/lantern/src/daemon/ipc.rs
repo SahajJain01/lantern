@@ -22,14 +22,15 @@ use lantern_proto::{
     SessionState, StatusReport, WindowInfo, MAX_CLIP, MAX_IME_TEXT,
 };
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use tokio::time::timeout;
 
 use super::catalog::{AppEntry, Catalog};
 use super::registry::{Claim, Registry};
 use crate::clipboard::{ClipHandle, ClipSync, PcOffer};
+use crate::settings::Settings;
 
 /// Frames queued per client before it counts as stuck (~4 s of 60 fps video).
 pub const CLIENT_QUEUE: usize = 240;
@@ -317,6 +318,10 @@ pub struct Hub {
     clip_out: Option<ClipHandle>,
     /// Echo/secret/size suppression for the clipboard; reset with each session.
     clip_sync: ClipSync,
+    /// The user's settings (`clipboard_sync`), if the daemon has a settings file.
+    settings: Option<watch::Receiver<Settings>>,
+    /// `clipboard_sync` as of the last clipboard event, to reset `clip_sync` when it turns on.
+    clip_was_on: bool,
 }
 
 impl Hub {
@@ -337,7 +342,31 @@ impl Hub {
             catalog: None,
             clip_out: None,
             clip_sync: ClipSync::default(),
+            settings: None,
+            clip_was_on: true,
         }
+    }
+
+    /// Follows the user's settings: while `clipboard_sync` is false nothing crosses either way.
+    pub fn set_settings(&mut self, settings: watch::Receiver<Settings>) {
+        self.clip_was_on = settings.borrow().clipboard_sync;
+        self.settings = Some(settings);
+    }
+
+    /// Whether clipboard sync is on now. Turning it back on resets [`ClipSync`]: what it
+    /// remembered may be stale after changes it never saw. (Checked at each clipboard event,
+    /// which is equivalent: nothing reads `clip_sync` in between.)
+    fn clip_on(&mut self) -> bool {
+        let on = self
+            .settings
+            .as_ref()
+            .is_none_or(|settings| settings.borrow().clipboard_sync);
+        if on && !self.clip_was_on {
+            tracing::debug!("clipboard sync back on");
+            self.clip_sync = ClipSync::default();
+        }
+        self.clip_was_on = on;
+        on
     }
 
     /// Phone `clip`s are put on the PC clipboard through `handle`.
@@ -352,6 +381,11 @@ impl Hub {
         offer: PcOffer,
         helper: &mpsc::Sender<Frame>,
     ) -> Result<(), HelperWedged> {
+        if !self.clip_on() {
+            let len = offer.text.as_ref().map_or(0, String::len);
+            tracing::debug!("clipboard sync off; {len} chars not synced");
+            return Ok(());
+        }
         match self.clip_sync.pc_changed(&offer) {
             Some(text) => {
                 tracing::debug!(len = text.len(), "PC clipboard sent to the phone");
@@ -371,6 +405,10 @@ impl Hub {
     /// A phone `clip`: onto the PC clipboard (never echoed back by [`Self::on_pc_clip`]).
     fn on_phone_clip(&mut self, text: String) {
         let len = text.len();
+        if !self.clip_on() {
+            tracing::debug!("clipboard sync off; {len} chars not synced");
+            return;
+        }
         if text.is_empty() || len > MAX_CLIP {
             tracing::warn!(len, "phone clip empty or over MAX_CLIP; ignored");
             return;

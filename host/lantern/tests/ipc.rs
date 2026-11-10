@@ -12,7 +12,8 @@ use lantern::clipboard::{ClipHandle, PcClipboard, PcOffer};
 use lantern::daemon::catalog::{Catalog, Dirs};
 use lantern::daemon::ipc;
 use lantern::daemon::session::{handshake, SessionConn};
-use lantern::daemon::{serve, serve_with_catalog, RetryPolicy};
+use lantern::daemon::{serve, serve_with, Parts, RetryPolicy};
+use lantern::settings::{Key, SettingsHandle};
 use lantern_proto::{
     read_frame_async, write_frame_async, CloseReason, CompanionState, Control, Frame, ImeOp, Kind,
     SessionState, StatusReport, WindowInfo, MAX_IME_TEXT,
@@ -203,6 +204,18 @@ fn start_daemon_full(
     catalog: Option<Catalog>,
     clipboard: Option<PcClipboard>,
 ) -> Daemon {
+    start_daemon_parts(
+        port,
+        Parts {
+            catalog,
+            clipboard,
+            ..Default::default()
+        },
+    )
+}
+
+/// [`start_daemon`] with every optional part given.
+fn start_daemon_parts(port: Option<u16>, parts: Parts) -> Daemon {
     let rt = runtime_dir();
     let listener = ipc::bind(&rt).unwrap();
     let sock = ipc::socket_path_in(&rt);
@@ -219,10 +232,9 @@ fn start_daemon_full(
         Ok(SessionConn::attach(stream, Adb::new(serial), "sha"))
     };
     let (stop, stop_rx) = oneshot::channel::<()>();
-    let task = tokio::spawn(serve_with_catalog(
+    let task = tokio::spawn(serve_with(
         listener,
-        catalog,
-        clipboard,
+        parts,
         None,
         events,
         starter,
@@ -1340,6 +1352,64 @@ async fn clipboard_offer_without_session_is_dropped() {
     offers.send(pc_offer("nobody", false)).await.unwrap();
     let report = status(&daemon.sock).await;
     assert_eq!(report.state, SessionState::Idle);
+    daemon.shutdown().await;
+}
+
+/// Nothing is put on the (fake) PC clipboard for a while.
+async fn assert_no_pc_set(rx: &std::sync::mpsc::Receiver<String>) {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rx.try_recv().is_err(), "the PC clipboard was set");
+}
+
+/// With `clipboard_sync = false` nothing crosses either way; turned back on, both directions
+/// flow again (live, no restart).
+#[tokio::test]
+async fn clipboard_off_syncs_nothing_either_way() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (handle, pc_sets) = ClipHandle::test_pair();
+    let (offers, offers_rx) = mpsc::channel(8);
+    let path = runtime_dir().join("config").join("settings.toml");
+    let settings = SettingsHandle::new(Some(path));
+    let daemon = start_daemon_parts(
+        Some(port),
+        Parts {
+            clipboard: Some(PcClipboard {
+                handle,
+                offers: offers_rx,
+            }),
+            settings: Some(settings.clone()),
+            ..Default::default()
+        },
+    );
+    status_until(&daemon.sock, |r| r.state == SessionState::Ready).await;
+    helper.assert_quiet().await;
+
+    settings.set(Key::ClipboardSync, false).unwrap();
+    offers.send(pc_offer("pc-off", false)).await.unwrap();
+    helper.assert_quiet().await;
+    helper.send(control(
+        0,
+        Control::Clip {
+            text: "phone-off".into(),
+        },
+    ));
+    assert_no_pc_set(&pc_sets).await;
+
+    settings.set(Key::ClipboardSync, true).unwrap();
+    offers.send(pc_offer("pc-on", false)).await.unwrap();
+    assert_eq!(
+        decode(&helper.next().await),
+        Control::Clip {
+            text: "pc-on".into()
+        }
+    );
+    helper.send(control(
+        0,
+        Control::Clip {
+            text: "phone-on".into(),
+        },
+    ));
+    assert_eq!(next_pc_set(&pc_sets).await, "phone-on");
     daemon.shutdown().await;
 }
 

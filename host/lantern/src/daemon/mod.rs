@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use crate::adb::{track_devices, Adb, DeviceEvent};
 use crate::clipboard::{PcClipboard, PcOffer};
 use crate::daemon::session::{start_with_companion, HandshakeError};
+use crate::settings::{self, SettingsHandle};
 
 /// The phone to serve: `configured` (`$LANTERN_SERIAL`) if set, else `current` (the live
 /// session's phone) while it is online, else the first of `online` (kept in the order devices
@@ -89,13 +90,22 @@ fn cancel_start<F>(starting: &mut Starting<F>, why: &str) {
     }
 }
 
-/// [`serve`] that also keeps `catalog` (the phone's apps as menu entries) in step with the
-/// helper's `app`/`apps_end`/`app_removed` messages.
-#[allow(clippy::too_many_arguments)]
-pub async fn serve_with_catalog<E, S, F, D>(
+/// The daemon's optional parts; each one left `None` is simply off.
+#[derive(Default)]
+pub struct Parts {
+    /// The phone's apps as menu entries, kept in step with the helper's
+    /// `app`/`apps_end`/`app_removed` messages.
+    pub catalog: Option<catalog::Catalog>,
+    /// The PC clipboard, synced with the phone's.
+    pub clipboard: Option<PcClipboard>,
+    /// The user's settings (clipboard sync on/off).
+    pub settings: Option<SettingsHandle>,
+}
+
+/// [`serve`] with the daemon's optional [`Parts`].
+pub async fn serve_with<E, S, F, D>(
     listener: UnixListener,
-    catalog: Option<catalog::Catalog>,
-    clipboard: Option<PcClipboard>,
+    parts: Parts,
     configured: Option<String>,
     events: E,
     starter: S,
@@ -108,9 +118,17 @@ where
     F: Future<Output = Result<SessionConn>>,
     D: Future<Output = &'static str>,
 {
+    let Parts {
+        catalog,
+        clipboard,
+        settings,
+    } = parts;
     let mut hub = Hub::new(Some(listener));
     if let Some(catalog) = catalog {
         hub.set_catalog(catalog);
+    }
+    if let Some(settings) = settings {
+        hub.set_settings(settings.subscribe());
     }
     let offers = clipboard.map(|clipboard| {
         hub.set_clipboard(clipboard.handle);
@@ -168,8 +186,14 @@ where
     F: Future<Output = Result<SessionConn>>,
     D: Future<Output = &'static str>,
 {
-    serve_with_catalog(
-        listener, None, None, configured, events, starter, shutdown, policy,
+    serve_with(
+        listener,
+        Parts::default(),
+        configured,
+        events,
+        starter,
+        shutdown,
+        policy,
     )
     .await
 }
@@ -395,10 +419,16 @@ pub async fn run() -> Result<()> {
         handle: crate::clipboard::wayland::spawn(offer_tx),
         offers,
     };
-    serve_with_catalog(
+    let settings = SettingsHandle::new(settings::default_path());
+    // Runs for the daemon's lifetime; the runtime ends it.
+    settings.spawn_poll();
+    serve_with(
         listener,
-        catalog,
-        Some(clipboard),
+        Parts {
+            catalog,
+            clipboard: Some(clipboard),
+            settings: Some(settings),
+        },
         configured,
         track_devices(),
         move |serial| {

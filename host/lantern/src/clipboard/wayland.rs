@@ -177,23 +177,12 @@ fn run(cmds: std_mpsc::Receiver<String>, wake: OwnedFd, jobs: std_mpsc::Sender<J
 }
 
 /// The compositor socket: `$WAYLAND_DISPLAY`, or (when lanternd started before the session
-/// exported it) the systemd user manager's `WAYLAND_DISPLAY`, under `$XDG_RUNTIME_DIR`.
+/// exported it) the systemd user manager's `WAYLAND_DISPLAY` ([`crate::desktop`]), under
+/// `$XDG_RUNTIME_DIR`.
 fn socket_path() -> Result<PathBuf> {
-    let name = std::env::var_os("WAYLAND_DISPLAY")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            let out = std::process::Command::new("systemctl")
-                .args(["--user", "show-environment"])
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()?;
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .find_map(|l| l.strip_prefix("WAYLAND_DISPLAY="))
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        })
+    let name = crate::desktop::session_vars(&["WAYLAND_DISPLAY"])
+        .pop()
+        .map(|(_, value)| PathBuf::from(value))
         .context("WAYLAND_DISPLAY is not set")?;
     if name.is_absolute() {
         return Ok(name);

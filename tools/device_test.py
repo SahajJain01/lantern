@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-16
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-17
     python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
@@ -9,13 +9,15 @@
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
-Klipper's D-Bus (item 13). Opens only com.android.settings, org.lineageos.jelly and the
-companion's test screen (enabled only during items 10, 12 and 13), each for a few seconds, and
-touches no other window. Item 13 saves the PC clipboard's text and puts it back afterwards.
+Klipper's D-Bus (items 13, 17). Opens only com.android.settings, org.lineageos.jelly and the
+companion's test screen (enabled only during items 10, 12, 13 and 17), each for a few seconds,
+and touches no other window. Items 13 and 17 save the PC clipboard's text and put it back
+afterwards; item 17 also saves ~/.config/lantern/settings.toml and restores it (or removes it if
+it was absent).
 Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
-The window items (2-6, 11-13) need frames from the compositor, which a locked Plasma session does
-not give. --nested (or LANTERN_TEST_NESTED=1) runs every test window in a private headless
+The window items (2-6, 11-13, 17) need frames from the compositor, which a locked Plasma session
+does not give. --nested (or LANTERN_TEST_NESTED=1) runs every test window in a private headless
 `kwin_wayland --virtual` (no Xwayland, no DISPLAY) on its own D-Bus instead, with scratch XDG
 config/data/state/cache and runtime dirs (removed afterwards, with every service that bus
 activated); the windows keep the real XDG_RUNTIME_DIR and reach it by absolute WAYLAND_DISPLAY.
@@ -305,6 +307,13 @@ def devices_dir():
     state = os.environ.get("XDG_STATE_HOME", "")
     return (Path(state) if state.startswith("/") else Path.home() / ".local/state") / \
         "lantern" / "devices"
+
+
+def settings_file():
+    """lanternd's settings file (`settings::default_path()`)."""
+    config = os.environ.get("XDG_CONFIG_HOME", "")
+    return (Path(config) if config.startswith("/") else Path.home() / ".config") / \
+        "lantern" / "settings.toml"
 
 
 def desktop_entry(app_id):
@@ -1018,6 +1027,69 @@ class Suite:
             cleanup(ok, ("remove the planted entry", lambda: entry.unlink(missing_ok=True)),
                     ("remove the planted device record", lambda: record.unlink(missing_ok=True)))
 
+    def clipboard_setting_off(self):
+        """A hand edit `clipboard_sync = false` in settings.toml applies live (within 2 s): a
+        phone copy made through the test screen never reaches Klipper."""
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+        saved = klipper("getClipboardContents")
+        saved = saved[:-1] if saved.endswith("\n") else saved
+        note(f"saved the PC clipboard text ({len(saved)} chars)")
+        phone_text = f"phone-off-{os.getpid()}{int(time.time()) % 100000}"
+        ok = False
+        try:
+            # 2. Every other line kept; clipboard_sync replaced.
+            old = saved_file.decode("utf-8", "replace") if saved_file is not None else ""
+            lines = [l for l in old.splitlines()
+                     if not l.strip().startswith("clipboard_sync")]
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.write_text("\n".join(lines + ["clipboard_sync = false"]) + "\n")
+            time.sleep(3)
+            # 3. A phone copy through the test screen (item 13's path).
+            test_activity(True)
+            wait_until("test screen in the launcher", 5, test_activity_listed, interval=0.2)
+            since = phone_now()
+            w = Window(COMPANION, "clipboard_off", debug_input=("focus;" if NESTED else "") +
+                       f"tap:0.5,0.15;key:Ctrl+A;text:{phone_text};key:Ctrl+A;key:Ctrl+C;close")
+            try:
+                wait_until("test screen opened", 15, lambda: w.find("opened"))
+                code = w.wait_exit(15)
+            finally:
+                w.kill()
+            check(code == 0, f"window exit {code}")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                check(klipper("getClipboardContents").rstrip("\n") != phone_text,
+                      "Klipper got the phone's copy with clipboard_sync = false")
+                time.sleep(0.1)
+            note("Klipper did not get the phone's copy within 3 s")
+            texts = [m for _, m in logcat_since(since, ["LanternTest"])]
+            check(f"text={phone_text}" in texts, f"the test screen never held {phone_text!r}")
+            # The helper cannot know the PC's setting (no message tells it), so it still sends
+            # the copy over the link and lanternd drops it; its line is recorded, not checked.
+            helper = [m for _, m in logcat_since(since, ["lantern"]) if m.startswith("clip:")]
+            note(f"helper: {helper}")
+            ok = True
+        finally:
+            # The settings file first (so sync is back on), then the user's clipboard text,
+            # then the test screen; each guarded on its own.
+            def restore_file():
+                if saved_file is None:
+                    path.unlink(missing_ok=True)
+                    note(f"removed {path} (it was absent)")
+                else:
+                    path.write_bytes(saved_file)
+                    note(f"restored {path}")
+
+            def restore_clipboard():
+                klipper("setClipboardContents", saved)
+                note("restored the PC clipboard text")
+            cleanup(ok, ("restore settings.toml", restore_file),
+                    ("restore the PC clipboard", restore_clipboard),
+                    ("disable the test screen", lambda: test_activity(False)))
+
 
 ITEMS = [
     "session_starts_on_plug",
@@ -1036,6 +1108,7 @@ ITEMS = [
     "usb_yank_restores_keyboard",
     "phones_keep_their_entries",
     "not_on_this_phone_notice",
+    "clipboard_setting_off",
 ]
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
 
@@ -1089,7 +1162,7 @@ def main():
     print(f"lantern device test: serial={SERIAL} binary={LANTERN} logs={LOG_DIR}", flush=True)
     if not args.nested and desktop_locked():
         print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
-              "(4-6, 12, 13) cannot pass. Unlock it or use --nested.", flush=True)
+              "(4-6, 12, 13, 17) cannot pass. Unlock it or use --nested.", flush=True)
     results = []
     try:
         if args.nested:
@@ -1131,7 +1204,8 @@ def main():
             except Exception as e:
                 print(f"WARNING: nested KWin stop failed: {e}", flush=True)
                 shutil.rmtree(NESTED.home, ignore_errors=True)
-        if {"catalogue_tracks_phone", "ime_unicode_text", "clipboard_both_ways"} & set(items):
+        if {"catalogue_tracks_phone", "ime_unicode_text", "clipboard_both_ways",
+            "clipboard_setting_off"} & set(items):
             try:  # the test screen is never left enabled
                 test_activity(False)
             except Exception as e:
