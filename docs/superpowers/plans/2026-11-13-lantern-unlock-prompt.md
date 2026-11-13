@@ -69,7 +69,7 @@ profile with its own separate lock, prompting when nothing is blocked.
 2. **Keys go to the wrong place.** Two cases: Windows App is focused, or the phone was unlocked
    by hand between the prompt and the submit.
    - Expected: nothing is typed, and the result is `ok:false` with reason `lock screen not
-     reached` or `already unlocked`.
+     reached`, or `ok:true` with reason `already unlocked`.
    - Pinned by Task 2 `typesNothingUnlessKeyguardFocused` and `alreadyUnlockedTypesNothing`.
 3. **A wrong PIN.** Expected: exactly one attempt and one failure notification, and the panel
    is off again.

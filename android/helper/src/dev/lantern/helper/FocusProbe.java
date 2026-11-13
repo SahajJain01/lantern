@@ -67,7 +67,9 @@ final class FocusProbe {
 
     /** The keyguard (PIN pad) has the focus: {@code NotificationShade}, {@code Keyguard} or {@code Bouncer}. */
     static boolean isKeyguard(String title) {
-        return title != null
+        // System windows have no "pkg/cls" title. An app activity shown over the lock screen does,
+        // and must never pass even if its class name contains one of these words.
+        return title != null && title.indexOf('/') < 0
             && (title.contains("NotificationShade") || title.contains("Keyguard") || title.contains("Bouncer"));
     }
 }

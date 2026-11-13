@@ -84,8 +84,10 @@ final class LockWatch implements AutoCloseable {
                     continue; // still locked, or unknown: keep polling
                 }
                 // Under the monitor: close() either came first (returned above) or waits until
-                // the follow-up is posted, and then drops the held copy before it can be written
-                // to a phone that is no longer served.
+                // the follow-up is posted, and then drops the held copy if it hasn't been written
+                // yet. close() runs after the Router's session teardown, so a read that lands in
+                // that gap can still write the held copy; the phone has just read as unlocked and
+                // the copy is the user's own, so that is accepted (Plan 4a final review M4).
                 log.accept("lock: phone unlocked");
                 send.accept(Msg.of("unlocked"));
                 try {

@@ -43,6 +43,8 @@ public final class FocusProbeTest {
         eq(false, FocusProbe.isKeyguard("com.microsoft.rdc.androidx/com.microsoft.a3rdc.ui.activities.HomeActivity"),
             "an app");
         eq(false, FocusProbe.isKeyguard(null), "null");
+        eq(false, FocusProbe.isKeyguard("com.evil/.KeyguardActivity"), "app activity named Keyguard");
+        eq(false, FocusProbe.isKeyguard("com.x.keyguardtheme/com.x.NotificationShadeMain"), "app activity named NotificationShade");
     }
 
     static void eq(Object want, Object got, String what) {

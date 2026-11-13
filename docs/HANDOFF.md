@@ -33,7 +33,8 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   run.** Worktree `.worktrees/plan4a`, base `main` `5d83b8b`. Device steps were deferred by
   Sahaj's instruction to one run at the end (he types the PIN); see "Plan 4a device checks
   (pending)". Tasks 1–3 each passed their own review after one fix round; Task 4 (tray row,
-  item 22, docs) is in review. The SDD ledger and reports are in the worktree's gitignored
+  item 22, docs) passed review without one. The final branch review asked for two fixes (the
+  keyguard focus check now rejects any `pkg/cls` title; these docs), both done. The SDD ledger and reports are in the worktree's gitignored
   `.superpowers/sdd/2026-11-13-lantern-unlock-prompt/` (copy it to the main checkout before
   removing the worktree).
   - Host: `cargo test --workspace --offline` 341 passed, 1 ignored; clippy clean (2026-11-13).
@@ -135,7 +136,7 @@ adb -s ZD222LMDFV shell dumpsys trust | grep deviceLocked        # (current) lin
 #    copy any text on the PC, then (the last lines only):
 adb -s ZD222LMDFV logcat -d -t 500 -s lantern | grep -E 'lock:|clip:'
 #    want `lock: phone locked (clipboard)` once and no `clip: PC clipboard ... set`;
-#    Sahaj unlocks by hand; within 3 s `lock: phone unlocked` and `clip: held PC copy ... set on
+#    Sahaj unlocks by hand; within ~5 s (2 s poll + up to 3 s dumpsys) `lock: phone unlocked` and `clip: held PC copy ... set on
 #    the phone`.
 # 3. Item 21 (manual; Sahaj clicks "Enter PIN…" and types the PIN, then a wrong PIN and
 #    "Try again"):
