@@ -256,12 +256,43 @@ pub fn read_record(state_dir: &Path, serial: &str) -> Option<Record> {
 /// Edits `serial`'s device record with `f`. Creates `{}` if absent; keeps unknown keys; always
 /// writes `"serial"`; temp + fsync + rename. Returns whether the file changed (nothing is
 /// written when it would not). A record that isn't a JSON object is an error and stays as it is.
+///
+/// The read-modify-write holds an flock on `devices/.lock`, so a concurrent writer can't lose
+/// this change (an `off` flag lost that way would connect a phone without the user's say-so).
+/// Callers are lanternd's run loop (and the undo it runs) or the CLI while lanternd is down.
 pub fn update_record(
     state_dir: &Path,
     serial: &str,
     f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
 ) -> Result<bool> {
+    use std::os::fd::AsRawFd;
     let path = record_path(state_dir, serial);
+    let dir = path.parent().context("record path has no parent")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let lock_path = dir.join(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    // SAFETY: flock on a file descriptor we own; released when `lock` closes.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("lock {}", lock_path.display()));
+    }
+    let changed = update_record_locked(&path, serial, f);
+    drop(lock);
+    changed
+}
+
+/// [`update_record`]'s read-modify-write, with `devices/.lock` held.
+fn update_record_locked(
+    path: &Path,
+    serial: &str,
+    f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<bool> {
+    let path = path.to_path_buf();
     let before = match std::fs::read_to_string(&path) {
         Ok(text) => {
             match serde_json::from_str(&text)
@@ -570,18 +601,17 @@ mod tests {
         );
         assert!(record_setup(&state, "192.168.1.5:5555", Install::Current).unwrap());
         // No temp files are left behind.
-        let names: Vec<String> = std::fs::read_dir(state.join("devices"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let names = files_in(&state.join("devices"));
         assert_eq!(names.len(), 2, "{names:?}");
         let _ = std::fs::remove_dir_all(&state);
     }
 
+    /// The files in `dir`, sorted, without `update_record`'s `.lock`.
     fn files_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != ".lock")
             .collect();
         names.sort();
         names
@@ -589,6 +619,40 @@ mod tests {
 
     fn raw(state: &Path, serial: &str) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(record_path(state, serial)).unwrap()).unwrap()
+    }
+
+    /// R3: two writers' read-modify-writes of one record never lose each other's flag (lanternd's
+    /// loop and its undo, or the CLI): `devices/.lock` serializes them.
+    #[test]
+    fn concurrent_flag_updates_both_survive() {
+        let state = scratch("lock");
+        for round in 0..200u32 {
+            let (off, live) = (round % 2 == 0, round % 3 == 0);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let writers: Vec<_> = [true, false]
+                .into_iter()
+                .map(|is_off| {
+                    let (state, barrier) = (state.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if is_off {
+                            set_off(&state, "dev", off).unwrap();
+                        } else {
+                            set_live(&state, "dev", live).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            let record = read_record(&state, "dev").unwrap();
+            assert_eq!((record.off, record.live), (off, live), "round {round}");
+        }
+        // The lock file is not a record.
+        assert!(state.join("devices").join(".lock").exists());
+        assert_eq!(known_serials(&state), vec!["dev".to_owned()]);
+        let _ = std::fs::remove_dir_all(state);
     }
 
     #[test]
@@ -733,11 +797,7 @@ mod tests {
         );
         assert_eq!(names_in(state.clone())("other"), None);
         // No temp files are left behind.
-        let files: Vec<String> = std::fs::read_dir(state.join("devices"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(files, ["20e9318.json"]);
+        assert_eq!(files_in(&state.join("devices")), ["20e9318.json"]);
         // A record without a usable name has none.
         std::fs::write(&path, r#"{"companion":true,"name":""}"#).unwrap();
         assert_eq!(device_name(&state, "20e9318"), None);

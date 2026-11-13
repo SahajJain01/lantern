@@ -28,6 +28,7 @@ use tokio::task::AbortHandle;
 use tokio::time::{timeout, Instant};
 
 use super::catalog::{AppEntry, Catalog};
+use super::control::{Command, View};
 use super::registry::{Claim, Registry};
 use crate::clipboard::{ClipHandle, ClipSync, PcOffer};
 use crate::settings::Settings;
@@ -156,12 +157,16 @@ pub fn query_status(sock: &Path) -> Result<StatusReport> {
     request_report(sock, Control::Status, "status")
 }
 
-/// `lantern connect|disconnect`: queues `cmd` in the daemon listening on `sock` and returns its
-/// [`StatusReport`] from before the command applies. Blocking.
-pub fn send_daemon_cmd(sock: &Path, cmd: DaemonCmd) -> Result<StatusReport> {
+/// `lantern connect|disconnect [<serial>]`: queues `cmd` for `serial` (without one: the only
+/// plugged-in phone) in the daemon listening on `sock` and returns its [`StatusReport`] from
+/// before the command applies. Blocking.
+pub fn send_daemon_cmd(sock: &Path, cmd: DaemonCmd, serial: Option<&str>) -> Result<StatusReport> {
     request_report(
         sock,
-        Control::Daemon { cmd, serial: None },
+        Control::Daemon {
+            cmd,
+            serial: serial.map(str::to_owned),
+        },
         "daemon command",
     )
 }
@@ -346,7 +351,12 @@ pub struct Hub {
     /// `clipboard_sync` as of the last clipboard event, to reset `clip_sync` when it turns on.
     clip_was_on: bool,
     /// `lantern connect|disconnect` commands not yet taken by the run loop.
-    commands: Vec<DaemonCmd>,
+    commands: Vec<Command>,
+    /// The run loop's phones as of its last turn (`lantern status`, and the phone a
+    /// `daemon{cmd}` without a serial is for).
+    view: View,
+    /// Where the device records are (`connected_at` for `lantern status`).
+    state_dir: Option<PathBuf>,
     /// The phone's PIN lock is in the way (`locked` .. `unlocked`); false between sessions.
     locked: bool,
     /// Where `locked`/`unlocked`/`unlock_result` go (the unlock prompt), if anywhere.
@@ -379,6 +389,8 @@ impl Hub {
             settings: None,
             clip_was_on: true,
             commands: Vec::new(),
+            view: View::default(),
+            state_dir: None,
             locked: false,
             lock_events: None,
             opened: HashSet::new(),
@@ -457,9 +469,63 @@ impl Hub {
         to_helper(helper, frame).await
     }
 
-    /// The `lantern connect|disconnect` commands received since the last call, oldest first.
-    pub fn take_commands(&mut self) -> Vec<DaemonCmd> {
+    /// The `lantern connect|disconnect` commands received since the last call, oldest first,
+    /// each resolved to its phone.
+    pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.commands)
+    }
+
+    /// The run loop's phones, for `lantern status` and for resolving `daemon{cmd}`.
+    pub fn set_view(&mut self, view: &View) {
+        if self.view != *view {
+            self.view = view.clone();
+        }
+    }
+
+    /// The device records `lantern status` reads `connected_at` from.
+    pub fn set_state_dir(&mut self, state_dir: Option<PathBuf>) {
+        self.state_dir = state_dir;
+    }
+
+    /// The menu name of `pkg` for `user` (from any phone's entry), else `pkg`.
+    pub fn app_name(&self, pkg: &str, user: u32) -> String {
+        match &self.catalog {
+            Some(catalog) => super::catalog::app_name(catalog.dirs(), pkg, user),
+            None => pkg.to_owned(),
+        }
+    }
+
+    /// The command `daemon{cmd, serial}` asks for. Without a serial it is for the only plugged-in
+    /// phone; `Err` is the reply when there is none or several.
+    fn daemon_command(&self, cmd: DaemonCmd, serial: Option<String>) -> Result<Command, String> {
+        let serial = match serial {
+            Some(serial) => serial,
+            None => {
+                let plugged: Vec<_> = self.view.phones.iter().filter(|p| p.plugged).collect();
+                match plugged.as_slice() {
+                    [] => return Err("no phone is plugged in".to_owned()),
+                    [one] => one.serial.clone(),
+                    several => {
+                        let list: Vec<String> = several
+                            .iter()
+                            .map(|p| format!("{} ({})", p.display_name(), p.serial))
+                            .collect();
+                        let verb = match cmd {
+                            DaemonCmd::Connect => "connect",
+                            DaemonCmd::Disconnect => "disconnect",
+                        };
+                        return Err(format!(
+                            "several phones are plugged in: {}; name one: lantern {verb} <serial>",
+                            list.join(", ")
+                        ));
+                    }
+                }
+            }
+        };
+        Ok(match cmd {
+            DaemonCmd::Connect => Command::Connect { serial, open: None },
+            DaemonCmd::Disconnect => Command::Disconnect { serial },
+        })
     }
 
     /// Follows the user's settings: while `clipboard_sync` is false nothing crosses either way.
@@ -614,13 +680,26 @@ impl Hub {
             .as_ref()
             .map(|(companion, _)| *companion)
             .filter(|_| state == SessionState::Ready);
+        let phones = self
+            .view
+            .phones
+            .iter()
+            .map(|phone| {
+                let connected_at = self
+                    .state_dir
+                    .as_deref()
+                    .and_then(|dir| super::companion::read_record(dir, &phone.serial))
+                    .and_then(|record| record.connected_at);
+                phone.report(connected_at)
+            })
+            .collect();
         StatusReport {
             state,
             serial,
             helper,
             windows,
             companion,
-            phones: Vec::new(),
+            phones,
         }
     }
 
@@ -809,11 +888,21 @@ impl Hub {
             self.reply_and_finish(cid, control(0, report));
             return Ok(());
         }
-        if let Some(Control::Daemon { cmd, .. }) = open {
-            tracing::info!(cid, ?cmd, "daemon command");
-            self.commands.push(cmd);
-            let report = Control::StatusReport(self.status());
-            self.reply_and_finish(cid, control(0, report));
+        if let Some(Control::Daemon { cmd, serial }) = open {
+            let reply = match self.daemon_command(cmd, serial) {
+                Ok(command) => {
+                    tracing::info!(cid, ?command, "daemon command");
+                    // The reply is the state before the command applies.
+                    let report = Control::StatusReport(self.status());
+                    self.commands.push(command);
+                    report
+                }
+                Err(msg) => {
+                    tracing::info!(cid, ?cmd, msg, "daemon command refused");
+                    Control::error(msg)
+                }
+            };
+            self.reply_and_finish(cid, control(0, reply));
             return Ok(());
         }
         let Some(Control::Open {

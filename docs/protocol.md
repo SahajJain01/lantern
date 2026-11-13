@@ -463,16 +463,24 @@ Host-only, like `status`.
   daemon queues the command. As anything but the first frame it is a protocol error.
 - Optional `serial: string` names the phone the command is for
   (`{"t":"daemon","cmd":"connect","serial":"20e9318"}`); omitted when absent, so the plain form is
-  unchanged.
-- `disconnect`: the phone being served, started or retried is paused: the session ends with
-  `bye` (the helper restores the phone) and nothing restarts it until the phone is replugged or
-  gets `connect`. With nothing live it does nothing.
-- `connect`: clears the pause; an online target phone is started now (a backoff is skipped).
-- While paused, an `open` gets `error{msg:"phone disconnected in Lantern"}` on stream 0, then
-  close.
+  unchanged. Without it the command is for the only plugged-in phone; with none or several
+  plugged in nothing is queued and the reply is `error{msg}` instead of the report:
+  `"no phone is plugged in"`, or `"several phones are plugged in: <name> (<serial>), …; name one:
+  lantern connect|disconnect <serial>"`. Under `$LANTERN_SERIAL` commands for any other serial are
+  ignored.
+- `disconnect`: sets the phone's `off` flag (and clears `live`) in its device record, then, if it
+  is the phone being served, started, retried or reconnected, ends that session with `bye` (the
+  helper restores the phone). An `off` phone is not connected by itself again, across unplugging
+  and lanternd restarts, until it gets `connect`.
+- `connect`: clears `off`. A plugged-in phone becomes the one lanternd serves (another live
+  phone's session is closed; its `off` is untouched); a backoff is skipped.
+- While no phone is live and the phone disconnected most recently is still plugged in (the
+  top-level `paused`), an `open` gets `error{msg:"phone disconnected in Lantern"}` on stream 0,
+  then close.
 
-`lantern connect` and `lantern disconnect` print the report like `lantern status` and exit 0
-(1 if lanternd is unreachable).
+`lantern connect [<serial>]` and `lantern disconnect [<serial>]` print the report like
+`lantern status` and exit 0 (1 if lanternd is unreachable or answers an error; 2 for more than one
+argument).
 
 ### Exit statuses (`lantern`)
 

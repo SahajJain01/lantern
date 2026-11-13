@@ -231,12 +231,10 @@ pub fn reopen_args(pkg: &str, user: u32, phone: Option<&str>) -> Vec<String> {
 
 /// The phone's name for notification texts.
 fn phone_name(view: &watch::Receiver<View>) -> String {
-    let view = view.borrow();
-    view.name
-        .as_deref()
-        .or_else(|| view.phone.serial())
-        .unwrap_or("phone")
-        .to_owned()
+    view.borrow()
+        .live()
+        .map(|p| p.display_name().to_owned())
+        .unwrap_or_else(|| "phone".to_owned())
 }
 
 /// The notification server as [`run`] uses it.
@@ -361,7 +359,7 @@ fn begin_asking(
         return None;
     }
     // The PIN is pinned to the phone shown now.
-    let Some(serial) = view.borrow().phone.serial().map(str::to_owned) else {
+    let Some(serial) = view.borrow().live().map(|p| p.serial.clone()) else {
         tracing::info!(from, "unlock clicked with no phone; no PIN dialog");
         return None;
     };

@@ -2,7 +2,7 @@
 //!
 //! The tray menu writes the file through [`set`]; hand edits are picked up by
 //! [`SettingsHandle::spawn_poll`] within [`POLL`]. Readers hold a `watch` of the typed values.
-//! - A missing file or key means the default (every setting on).
+//! - A missing file or key means the default (every setting on except `autoconnect`).
 //! - A known key with a wrong-typed value gets its default plus a warning; unknown keys are
 //!   ignored when reading and kept when writing.
 //! - A file that doesn't parse gives the defaults and is never overwritten: [`set`] refuses.
@@ -23,6 +23,7 @@ pub const HEADER: &str = "\
 # Lantern settings. Lantern's tray menu changes this file; edits here apply within a few seconds.
 # clipboard_sync: copy text between the PC and the phone (true/false).
 # lantern_keyboard: type on the phone through the Lantern keyboard (true/false; applies at the next connection).
+# autoconnect: connect a phone as soon as it is plugged in (true/false; when false, Lantern asks each time).
 ";
 
 /// How often [`SettingsHandle::spawn_poll`] checks the file for hand edits.
@@ -34,6 +35,8 @@ pub struct Settings {
     pub clipboard_sync: bool,
     /// Type through the Lantern keyboard; applies at the next connection.
     pub lantern_keyboard: bool,
+    /// Connect a phone as soon as it is plugged in (else Lantern asks); read at each plug-in.
+    pub autoconnect: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +44,7 @@ impl Default for Settings {
         Self {
             clipboard_sync: true,
             lantern_keyboard: true,
+            autoconnect: false,
         }
     }
 }
@@ -49,16 +53,18 @@ impl Default for Settings {
 pub enum Key {
     ClipboardSync,
     LanternKeyboard,
+    Autoconnect,
 }
 
 impl Key {
-    const ALL: [Key; 2] = [Key::ClipboardSync, Key::LanternKeyboard];
+    const ALL: [Key; 3] = [Key::ClipboardSync, Key::LanternKeyboard, Key::Autoconnect];
 
     /// The key's name in the file.
     pub fn name(self) -> &'static str {
         match self {
             Key::ClipboardSync => "clipboard_sync",
             Key::LanternKeyboard => "lantern_keyboard",
+            Key::Autoconnect => "autoconnect",
         }
     }
 
@@ -66,6 +72,16 @@ impl Key {
         match self {
             Key::ClipboardSync => &mut settings.clipboard_sync,
             Key::LanternKeyboard => &mut settings.lantern_keyboard,
+            Key::Autoconnect => &mut settings.autoconnect,
+        }
+    }
+
+    /// This key's value in `settings`.
+    pub fn get(self, settings: &Settings) -> bool {
+        match self {
+            Key::ClipboardSync => settings.clipboard_sync,
+            Key::LanternKeyboard => settings.lantern_keyboard,
+            Key::Autoconnect => settings.autoconnect,
         }
     }
 }
@@ -226,6 +242,8 @@ pub struct SettingsHandle {
     loaded: Option<(SystemTime, u64)>,
     /// Held across [`Self::set`]: concurrent writes would share one temp file name.
     writing: Arc<Mutex<()>>,
+    /// [`Self::fixed`]: no file; [`Self::set`] only publishes.
+    fixed: bool,
 }
 
 impl SettingsHandle {
@@ -240,6 +258,19 @@ impl SettingsHandle {
             error: watch::Sender::new(error),
             loaded,
             writing: Arc::default(),
+            fixed: false,
+        }
+    }
+
+    /// For tests: `settings` with no file behind them. [`Self::set`] updates the watch only.
+    pub fn fixed(settings: Settings) -> Self {
+        Self {
+            path: None,
+            tx: watch::Sender::new(settings),
+            error: watch::Sender::new(None),
+            loaded: None,
+            writing: Arc::default(),
+            fixed: true,
         }
     }
 
@@ -268,6 +299,10 @@ impl SettingsHandle {
     /// Writes `key` to the file ([`set`]) and publishes the result at once. Blocks on file IO
     /// (and on another thread's `set`).
     pub fn set(&self, key: Key, value: bool) -> Result<()> {
+        if self.fixed {
+            self.tx.send_modify(|settings| *key.field(settings) = value);
+            return Ok(());
+        }
         let Some(path) = &self.path else {
             bail!("no settings file (no config directory)");
         };
@@ -351,7 +386,8 @@ mod tests {
             Settings::default(),
             Settings {
                 clipboard_sync: true,
-                lantern_keyboard: true
+                lantern_keyboard: true,
+                autoconnect: false,
             }
         );
         let handle = SettingsHandle::new(Some(path.clone()));
@@ -364,6 +400,51 @@ mod tests {
         assert!(none.set(Key::ClipboardSync, false).is_err());
         assert_eq!(Key::ClipboardSync.name(), "clipboard_sync");
         assert_eq!(Key::LanternKeyboard.name(), "lantern_keyboard");
+        assert_eq!(Key::Autoconnect.name(), "autoconnect");
+    }
+
+    #[test]
+    fn autoconnect_defaults_off() {
+        assert!(!Settings::default().autoconnect);
+        assert!(!parse("clipboard_sync = false\n").unwrap().0.autoconnect);
+        // The header explains it; a fresh file writes it out as false.
+        assert!(HEADER.contains(
+            "# autoconnect: connect a phone as soon as it is plugged in \
+             (true/false; when false, Lantern asks each time).\n"
+        ));
+        let path = scratch().join("lantern").join("settings.toml");
+        ensure_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("autoconnect = false"), "{text}");
+    }
+
+    #[test]
+    fn parses_autoconnect() {
+        let (s, warnings) = parse("autoconnect = true\n").unwrap();
+        assert!(s.autoconnect);
+        assert!(s.clipboard_sync && s.lantern_keyboard);
+        assert!(warnings.is_empty());
+        let (s, warnings) = parse("autoconnect = 1\n").unwrap();
+        assert!(!s.autoconnect);
+        assert_eq!(
+            warnings,
+            vec!["autoconnect must be true or false; using false".to_owned()]
+        );
+        let dir = scratch();
+        let path = dir.join("settings.toml");
+        assert!(set(&path, Key::Autoconnect, true).unwrap().autoconnect);
+        assert!(load(&path).0.autoconnect);
+    }
+
+    #[test]
+    fn fixed_handle_sets_without_a_file() {
+        let handle = SettingsHandle::fixed(Settings::default());
+        let mut rx = handle.subscribe();
+        handle.set(Key::Autoconnect, true).unwrap();
+        assert!(rx.has_changed().unwrap());
+        assert!(rx.borrow_and_update().autoconnect);
+        assert_eq!(handle.path(), None);
+        assert!(Key::Autoconnect.get(&handle.get()));
     }
 
     #[test]
@@ -374,7 +455,8 @@ mod tests {
             s,
             Settings {
                 clipboard_sync: false,
-                lantern_keyboard: false
+                lantern_keyboard: false,
+                autoconnect: false,
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -383,7 +465,8 @@ mod tests {
             s,
             Settings {
                 clipboard_sync: true,
-                lantern_keyboard: false
+                lantern_keyboard: false,
+                autoconnect: false,
             }
         );
         assert_eq!(parse("").unwrap(), (Settings::default(), vec![]));
@@ -433,7 +516,8 @@ mod tests {
             s,
             Settings {
                 clipboard_sync: false,
-                lantern_keyboard: false
+                lantern_keyboard: false,
+                autoconnect: false,
             }
         );
         let text = std::fs::read_to_string(&path).unwrap();

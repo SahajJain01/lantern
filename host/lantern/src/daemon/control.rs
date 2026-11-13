@@ -1,83 +1,113 @@
 //! Controlling lanternd from the tray menu and `lantern connect|disconnect`: the commands it
-//! takes and the phone state ([`View`]) it publishes after every change.
+//! takes, the per-phone state ([`View`]) it publishes after every change, and the connect
+//! events the prompts show.
 
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
-use lantern_proto::{CompanionState, DaemonCmd};
+use lantern_proto::{CompanionState, PhoneReport, PhoneState};
 
-/// A command for the daemon's run loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A command for the daemon's run loop. Each names its phone.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Serve the paused phone again; a start in backoff is retried now.
-    Connect,
-    /// End the session and leave the phone alone until it is replugged or connected again.
-    Disconnect,
-    /// Close the session, then remove Lantern from the phone (`undo::run_steps`).
-    UndoSetup,
-    /// End the daemon as on SIGTERM (after a running undo finishes).
+    /// Clear the phone's `off` flag and make it the wanted phone if it is plugged in (another
+    /// live phone is closed, its `off` untouched); otherwise ask the user to plug it in.
+    /// `open` (pkg, user) is opened on it once its session is ready (within
+    /// [`super::phones::Timing::pending_for`]).
+    Connect {
+        serial: String,
+        open: Option<(String, u32)>,
+    },
+    /// Set the phone's `off` flag (it stays off across unplugging and restarts) and end its
+    /// session if it has one.
+    Disconnect { serial: String },
+    /// Switch the phone off, close its session if it has one, then remove Lantern from it
+    /// (`undo::run_steps`). Only for a plugged-in phone.
+    UndoSetup { serial: String },
+    /// End the daemon (after a running undo finishes); the live phone's `live` flag is cleared.
     Quit,
 }
 
-impl From<DaemonCmd> for Command {
-    fn from(cmd: DaemonCmd) -> Self {
-        match cmd {
-            DaemonCmd::Connect => Self::Connect,
-            DaemonCmd::Disconnect => Self::Disconnect,
-        }
-    }
-}
-
-/// What the daemon is doing with which phone.
+/// One phone as the tray and `lantern status` show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Phone {
-    /// No target phone online.
-    None,
-    Starting {
-        serial: String,
-    },
-    Ready {
-        serial: String,
-        /// The live session's last `companion` state and its `msg`.
-        companion: Option<(CompanionState, Option<String>)>,
-    },
-    /// Retry backoff after a failed start or helper death; the phone is still online.
-    Retrying {
-        serial: String,
-    },
-    /// Disconnect, or after Undo, until the phone is replugged or connected again.
-    Paused {
-        serial: String,
-    },
-    Undoing {
-        serial: String,
-    },
-}
-
-impl Phone {
-    /// The phone this state is about.
-    pub fn serial(&self) -> Option<&str> {
-        match self {
-            Self::None => None,
-            Self::Starting { serial }
-            | Self::Ready { serial, .. }
-            | Self::Retrying { serial }
-            | Self::Paused { serial }
-            | Self::Undoing { serial } => Some(serial),
-        }
-    }
-}
-
-/// The daemon's state as the tray shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct View {
-    pub phone: Phone,
-    /// The phone's recorded name (`companion::Names`), if it has one.
+pub struct PhoneView {
+    pub serial: String,
+    /// Its recorded name (`companion::Names`), if it has one.
     pub name: Option<String>,
-    /// The phone's PIN lock is in the way: from the helper's `locked` until `unlocked`, a
-    /// successful `unlock_result`, or the end of the session.
+    pub state: PhoneState,
+    /// adb reports it online.
+    pub plugged: bool,
+    /// The user switched it off in Lantern.
+    pub off: bool,
+    /// Its PIN lock is in the way: from the helper's `locked` until `unlocked`, a successful
+    /// `unlock_result`, or the end of the session. Only ever true for the live phone.
     pub locked: bool,
+    /// The live session's last `companion` state and its `msg` (live phone only).
+    pub companion: Option<(CompanionState, Option<String>)>,
 }
+
+impl PhoneView {
+    /// Its name, else its serial.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.serial)
+    }
+
+    /// The `status_report.phones` entry, with `connected_at` from its record.
+    pub fn report(&self, connected_at: Option<u64>) -> PhoneReport {
+        PhoneReport {
+            serial: self.serial.clone(),
+            name: self.name.clone(),
+            state: self.state,
+            plugged: self.plugged,
+            off: self.off,
+            connected_at,
+        }
+    }
+}
+
+/// The daemon's phones: plugged ones in the order they came online, then the other known
+/// phones by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct View {
+    pub phones: Vec<PhoneView>,
+}
+
+impl View {
+    /// The phone being served, started, retried or reconnected (at most one).
+    pub fn live(&self) -> Option<&PhoneView> {
+        self.phones.iter().find(|p| p.state.is_live())
+    }
+
+    pub fn phone(&self, serial: &str) -> Option<&PhoneView> {
+        self.phones.iter().find(|p| p.serial == serial)
+    }
+}
+
+/// What the connect prompt shows (Task 6). Sent with `try_send`: a full channel drops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectEvent {
+    /// A phone was plugged in and Lantern asks before connecting it (one per plug-in).
+    PluggedIn { serial: String, name: String },
+    /// An open was refused because its phone isn't connected.
+    OpenRefused {
+        serial: String,
+        name: String,
+        app: String,
+        pkg: String,
+        user: u32,
+    },
+    /// Connect for a phone that isn't plugged in: plug it in (`app` will open on it).
+    PlugIn {
+        serial: String,
+        name: String,
+        app: Option<String>,
+    },
+    /// The phone connected or was unplugged: close its notices.
+    Gone { serial: String },
+}
+
+/// Opens an app on a phone once its session is ready: `(serial, pkg, user)`.
+pub type Opener = Arc<dyn Fn(&str, &str, u32) + Send + Sync>;
 
 /// Removes Lantern from the phone with this serial: `(all steps ok, output lines joined with
 /// newlines)`.
@@ -100,6 +130,18 @@ pub fn undo_notice(ok: bool, name: &str, output: &str) -> (String, String) {
 mod tests {
     use super::*;
 
+    fn phone(serial: &str, state: PhoneState) -> PhoneView {
+        PhoneView {
+            serial: serial.into(),
+            name: None,
+            state,
+            plugged: true,
+            off: false,
+            locked: false,
+            companion: None,
+        }
+    }
+
     #[test]
     fn undo_notice_texts() {
         assert_eq!(
@@ -116,19 +158,31 @@ mod tests {
     }
 
     #[test]
-    fn socket_commands_map_to_commands() {
-        assert_eq!(Command::from(DaemonCmd::Connect), Command::Connect);
-        assert_eq!(Command::from(DaemonCmd::Disconnect), Command::Disconnect);
-    }
-
-    #[test]
-    fn phone_serial() {
-        assert_eq!(Phone::None.serial(), None);
-        let ready = Phone::Ready {
-            serial: "a".into(),
-            companion: None,
+    fn view_live_and_phone() {
+        let mut a = phone("a", PhoneState::Waiting);
+        a.name = Some("Pixel".into());
+        let b = phone("b", PhoneState::Reconnecting);
+        let view = View {
+            phones: vec![a.clone(), b.clone()],
         };
-        assert_eq!(ready.serial(), Some("a"));
-        assert_eq!(Phone::Undoing { serial: "b".into() }.serial(), Some("b"));
+        assert_eq!(view.live(), Some(&b));
+        assert_eq!(view.phone("a"), Some(&a));
+        assert_eq!(view.phone("c"), None);
+        assert_eq!(a.display_name(), "Pixel");
+        assert_eq!(b.display_name(), "b");
+        assert_eq!(View::default().live(), None);
+        let mut off = phone("c", PhoneState::Off);
+        off.off = true;
+        assert_eq!(
+            off.report(Some(7)),
+            PhoneReport {
+                serial: "c".into(),
+                name: None,
+                state: PhoneState::Off,
+                plugged: true,
+                off: true,
+                connected_at: Some(7),
+            }
+        );
     }
 }

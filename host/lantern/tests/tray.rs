@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use lantern::daemon::control::{Command, Phone, View};
+use lantern::daemon::control::{Command, PhoneView, View};
 use lantern::settings::SettingsHandle;
 use lantern::unlock::{self, LockEvent, Pin, Prompt};
-use lantern_proto::{CompanionState, LockReason};
+use lantern_proto::{CompanionState, LockReason, PhoneState};
 use tokio::sync::{mpsc, watch};
 use zbus::zvariant::{OwnedValue, Value};
 use zbus::{connection, Connection, MatchRule, MessageStream};
@@ -106,15 +106,23 @@ fn tray_name() -> String {
     format!("org.kde.StatusNotifierItem-{}-1", std::process::id())
 }
 
-fn ready() -> View {
+/// "Test Phone" (`s1`) in `state`.
+fn one(state: PhoneState) -> View {
     View {
-        phone: Phone::Ready {
+        phones: vec![PhoneView {
             serial: "s1".into(),
-            companion: Some((CompanionState::Ready, None)),
-        },
-        name: Some("Test Phone".into()),
-        locked: false,
+            name: Some("Test Phone".into()),
+            state,
+            plugged: true,
+            off: state == PhoneState::Off,
+            locked: false,
+            companion: (state == PhoneState::Ready).then_some((CompanionState::Ready, None)),
+        }],
     }
+}
+
+fn ready() -> View {
+    one(PhoneState::Ready)
 }
 
 /// A running tray on a private bus, with a watcher already present.
@@ -313,7 +321,12 @@ async fn click_sends_command() {
     let cmd = tokio::time::timeout(Duration::from_secs(2), tray.commands.recv())
         .await
         .expect("no command within 2 s");
-    assert_eq!(cmd, Some(Command::Disconnect));
+    assert_eq!(
+        cmd,
+        Some(Command::Disconnect {
+            serial: "s1".into()
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -355,13 +368,7 @@ async fn view_change_emits_layout_updated() {
     let mut signals = MessageStream::for_match_rule(rule, &tray.client, None)
         .await
         .unwrap();
-    tray.view.send_replace(View {
-        phone: Phone::Paused {
-            serial: "s1".into(),
-        },
-        name: Some("Test Phone".into()),
-        locked: false,
-    });
+    tray.view.send_replace(one(PhoneState::Off));
     let signal = tokio::time::timeout(Duration::from_secs(2), signals.next())
         .await
         .expect("no LayoutUpdated within 2 s")
@@ -397,7 +404,7 @@ async fn reregisters_when_watcher_returns() {
 async fn unlock_row_click_prompts() {
     let (request, requests) = unlock::Request::channel();
     let mut locked = ready();
-    locked.locked = true;
+    locked.phones[0].locked = true;
     let tray = Tray::start_with(locked, Some(request)).await;
     // The unlock prompt on the same private bus (no notification server there).
     let (events, events_rx) = mpsc::channel(8);

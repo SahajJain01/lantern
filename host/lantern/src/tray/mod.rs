@@ -312,20 +312,32 @@ async fn systemctl(args: &[&str]) -> Option<std::process::Output> {
 fn send(shared: &Shared, cmd: Command) {
     match shared.commands.try_send(cmd) {
         Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
+        Err(mpsc::error::TrySendError::Full(cmd)) => {
             tracing::warn!(?cmd, "tray: the daemon is busy; click dropped")
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
+        Err(mpsc::error::TrySendError::Closed(cmd)) => {
             tracing::warn!(?cmd, "tray: the daemon no longer takes commands")
         }
     }
 }
 
+/// The serial of the phone the menu shows now.
+fn shown_serial(shared: &Shared) -> Option<String> {
+    menu::shown(&shared.state().view).map(|p| p.serial.clone())
+}
+
 /// Does what a menu click asks. Returns at once; slow work runs in its own task.
 pub(crate) fn perform(shared: &Arc<Shared>, action: Action) {
     match action {
-        Action::Connect => send(shared, Command::Connect),
-        Action::Disconnect => send(shared, Command::Disconnect),
+        // Row 3 acts on the phone the menu shows.
+        Action::Connect => match shown_serial(shared) {
+            Some(serial) => send(shared, Command::Connect { serial, open: None }),
+            None => tracing::info!("tray: no phone to connect; click dropped"),
+        },
+        Action::Disconnect => match shown_serial(shared) {
+            Some(serial) => send(shared, Command::Disconnect { serial }),
+            None => tracing::info!("tray: no phone to disconnect; click dropped"),
+        },
         Action::Quit => send(shared, Command::Quit),
         Action::ToggleClipboard => toggle(shared, Key::ClipboardSync),
         Action::ToggleKeyboard => toggle(shared, Key::LanternKeyboard),
@@ -354,10 +366,7 @@ fn toggle(shared: &Shared, key: Key) {
     let settings = shared.settings.clone();
     tokio::task::spawn_blocking(move || {
         let current = settings.get();
-        let value = match key {
-            Key::ClipboardSync => !current.clipboard_sync,
-            Key::LanternKeyboard => !current.lantern_keyboard,
-        };
+        let value = !key.get(&current);
         if let Err(error) = settings.set(key, value) {
             let error = format!("{error:#}");
             tracing::warn!(key = key.name(), error, "tray: could not save the setting");
@@ -436,7 +445,7 @@ async fn confirm_undo(shared: &Shared) {
         let state = shared.state();
         (
             menu::name(&state.view).to_owned(),
-            state.view.phone.serial().map(str::to_owned),
+            menu::shown(&state.view).map(|p| p.serial.clone()),
         )
     };
     let question = undo_question(&name);
@@ -476,9 +485,10 @@ async fn confirm_undo(shared: &Shared) {
     };
     match child.wait().await {
         Ok(status) if status.code() == Some(0) => {
-            let now = shared.state().view.phone.serial().map(str::to_owned);
-            if confirm_target(clicked.as_deref(), now.as_deref()) {
-                send(shared, Command::UndoSetup);
+            let now = shown_serial(shared);
+            if let (true, Some(serial)) = (confirm_target(clicked.as_deref(), now.as_deref()), now)
+            {
+                send(shared, Command::UndoSetup { serial });
             } else {
                 tracing::info!("undo cancelled: the phone changed while asking");
                 crate::notify::send(
@@ -533,11 +543,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let shared = Shared {
             state: Mutex::new(State {
-                view: View {
-                    phone: crate::daemon::control::Phone::None,
-                    name: None,
-                    locked: false,
-                },
+                view: View::default(),
                 settings: Settings::default(),
                 settings_error: false,
                 login: None,
@@ -550,7 +556,13 @@ mod tests {
             login_changed: Notify::new(),
         };
         for _ in 0..10 {
-            send(&shared, Command::Connect);
+            send(
+                &shared,
+                Command::Connect {
+                    serial: "a".into(),
+                    open: None,
+                },
+            );
         }
         let mut got = 0;
         while rx.try_recv().is_ok() {

@@ -5,7 +5,9 @@
 
 use lantern_proto::CompanionState;
 
-use crate::daemon::control::{Phone, View};
+use lantern_proto::PhoneState;
+
+use crate::daemon::control::{PhoneView, View};
 use crate::settings::Settings;
 
 /// What a click on a row does.
@@ -66,21 +68,42 @@ const KEYBOARD_OFF_MSG: &str = "keyboard off in Lantern settings";
 /// The settings error row's text (row 12).
 pub const SETTINGS_ERROR: &str = "Settings file has an error; using defaults";
 
-/// The phone's name for menu texts: its recorded name, else its serial.
+/// The phone the menu is about: the live one, else the one being undone, else the last
+/// switched-off phone that is plugged in. (Task 4 gives every phone its own rows.)
+pub(crate) fn shown(view: &View) -> Option<&PhoneView> {
+    view.live()
+        .or_else(|| view.phones.iter().find(|p| p.state == PhoneState::Undoing))
+        .or_else(|| {
+            view.phones
+                .iter()
+                .rev()
+                .find(|p| p.state == PhoneState::Off)
+        })
+}
+
+/// The shown phone's name for menu texts: its recorded name, else its serial.
 pub(crate) fn name(view: &View) -> &str {
-    view.name
-        .as_deref()
-        .or_else(|| view.phone.serial())
-        .unwrap_or_default()
+    shown(view).map(PhoneView::display_name).unwrap_or_default()
+}
+
+/// The shown phone's state.
+fn state(view: &View) -> Option<PhoneState> {
+    shown(view).map(|p| p.state)
+}
+
+/// Whether the shown phone's PIN lock is in the way.
+fn locked(view: &View) -> bool {
+    shown(view).is_some_and(|p| p.locked)
 }
 
 /// The live session's companion `msg`, if the phone is ready and has one.
 fn companion_msg(view: &View) -> Option<(CompanionState, &str)> {
-    match &view.phone {
-        Phone::Ready {
+    match shown(view) {
+        Some(PhoneView {
+            state: PhoneState::Ready,
             companion: Some((state, Some(msg))),
             ..
-        } => Some((*state, msg.as_str())),
+        }) => Some((*state, msg.as_str())),
         _ => None,
     }
 }
@@ -88,33 +111,39 @@ fn companion_msg(view: &View) -> Option<(CompanionState, &str)> {
 /// Row 1: what Lantern is doing with which phone.
 pub fn status_line(view: &View) -> String {
     let name = name(view);
-    match &view.phone {
-        Phone::None => "No phone connected".to_owned(),
-        Phone::Starting { .. } => format!("Connecting to {name}…"),
-        Phone::Ready { .. } if view.locked => format!("Connected to {name} (locked)"),
-        Phone::Ready { .. } => format!("Connected to {name}"),
-        Phone::Retrying { .. } => format!("Reconnecting to {name}…"),
-        Phone::Paused { .. } => format!("Disconnected from {name}"),
-        Phone::Undoing { .. } => format!("Removing Lantern from {name}…"),
+    match state(view) {
+        Some(PhoneState::Starting) => format!("Connecting to {name}…"),
+        Some(PhoneState::Ready) if locked(view) => format!("Connected to {name} (locked)"),
+        Some(PhoneState::Ready) => format!("Connected to {name}"),
+        Some(PhoneState::Retrying | PhoneState::Reconnecting) => {
+            format!("Reconnecting to {name}…")
+        }
+        Some(PhoneState::Off) => format!("Disconnected from {name}"),
+        Some(PhoneState::Undoing) => format!("Removing Lantern from {name}…"),
+        None | Some(PhoneState::Waiting | PhoneState::Unplugged) => "No phone connected".to_owned(),
     }
 }
 
 /// The overlay icon name on the tray icon, or `""` for none.
 pub fn overlay(view: &View) -> &'static str {
-    match &view.phone {
-        Phone::None => "",
-        Phone::Ready { .. } if companion_msg(view).is_some() => "emblem-warning",
-        Phone::Ready { .. } => "",
-        Phone::Starting { .. } | Phone::Retrying { .. } | Phone::Undoing { .. } => "view-refresh",
-        Phone::Paused { .. } => "media-playback-pause",
+    match state(view) {
+        Some(PhoneState::Ready) if companion_msg(view).is_some() => "emblem-warning",
+        Some(
+            PhoneState::Starting
+            | PhoneState::Retrying
+            | PhoneState::Reconnecting
+            | PhoneState::Undoing,
+        ) => "view-refresh",
+        Some(PhoneState::Off) => "media-playback-pause",
+        _ => "",
     }
 }
 
 /// The StatusNotifierItem `Status`: `Passive` (tucked away) with no phone, else `Active`.
 pub fn sni_status(view: &View) -> &'static str {
-    match view.phone {
-        Phone::None => "Passive",
-        _ => "Active",
+    match shown(view) {
+        None => "Passive",
+        Some(_) => "Active",
     }
 }
 
@@ -130,7 +159,7 @@ pub fn items(
         id: 1,
         text: status_line(view),
     }];
-    if view.locked {
+    if locked(view) {
         rows.push(Item::Button {
             id: 13,
             text: format!("Unlock {}…", name(view)),
@@ -152,12 +181,15 @@ pub fn items(
             text: SETTINGS_ERROR.to_owned(),
         });
     }
-    let connection = match &view.phone {
-        Phone::Starting { .. } | Phone::Ready { .. } | Phone::Retrying { .. } => {
-            Some(("Disconnect", Action::Disconnect))
-        }
-        Phone::Paused { .. } => Some(("Connect", Action::Connect)),
-        Phone::None | Phone::Undoing { .. } => None,
+    let connection = match state(view) {
+        Some(
+            PhoneState::Starting
+            | PhoneState::Ready
+            | PhoneState::Retrying
+            | PhoneState::Reconnecting,
+        ) => Some(("Disconnect", Action::Disconnect)),
+        Some(PhoneState::Off) => Some(("Connect", Action::Connect)),
+        _ => None,
     };
     if let Some((text, action)) = connection {
         rows.push(Item::Button {
@@ -198,7 +230,7 @@ pub fn items(
     rows.push(Item::Button {
         id: 10,
         text: "Undo phone setup…".to_owned(),
-        enabled: view.phone.serial().is_some() && !matches!(view.phone, Phone::Undoing { .. }),
+        enabled: state(view).is_some_and(|state| state != PhoneState::Undoing),
         action: Action::UndoSetup,
     });
     rows.push(Item::Button {
@@ -231,12 +263,27 @@ pub fn action(items: &[Item], id: i32) -> Option<Action> {
 mod tests {
     use super::*;
 
-    fn view(phone: Phone) -> View {
+    /// One phone, "Test Phone" (`s1`), in `state`.
+    fn view(state: PhoneState) -> View {
+        with(state, None)
+    }
+
+    fn with(state: PhoneState, companion: Option<(CompanionState, Option<String>)>) -> View {
         View {
-            phone,
-            name: Some("Test Phone".to_owned()),
-            locked: false,
+            phones: vec![PhoneView {
+                serial: "s1".into(),
+                name: Some("Test Phone".to_owned()),
+                state,
+                plugged: true,
+                off: state == PhoneState::Off,
+                locked: false,
+                companion,
+            }],
         }
+    }
+
+    fn set_locked(view: &mut View, locked: bool) {
+        view.phones[0].locked = locked;
     }
 
     fn label(id: i32, text: &str) -> Item {
@@ -288,17 +335,9 @@ mod tests {
         items(view, &Settings::default(), Some(true), false)
     }
 
-    fn serial(s: &str) -> String {
-        s.to_owned()
-    }
-
     #[test]
     fn none() {
-        let v = View {
-            phone: Phone::None,
-            name: None,
-            locked: false,
-        };
+        let v = View::default();
         let mut want = vec![label(1, "No phone connected")];
         want.extend(tail(false));
         assert_eq!(rows(&v), want);
@@ -309,9 +348,7 @@ mod tests {
 
     #[test]
     fn starting() {
-        let v = view(Phone::Starting {
-            serial: serial("s1"),
-        });
+        let v = view(PhoneState::Starting);
         let mut want = vec![
             label(1, "Connecting to Test Phone…"),
             button(3, "Disconnect", true, Action::Disconnect),
@@ -324,10 +361,7 @@ mod tests {
 
     #[test]
     fn ready() {
-        let v = view(Phone::Ready {
-            serial: serial("s1"),
-            companion: Some((CompanionState::Ready, None)),
-        });
+        let v = with(PhoneState::Ready, Some((CompanionState::Ready, None)));
         let mut want = vec![
             label(1, "Connected to Test Phone"),
             button(3, "Disconnect", true, Action::Disconnect),
@@ -341,13 +375,13 @@ mod tests {
 
     #[test]
     fn ready_with_companion_msg() {
-        let v = view(Phone::Ready {
-            serial: serial("s1"),
-            companion: Some((
+        let v = with(
+            PhoneState::Ready,
+            Some((
                 CompanionState::Unavailable,
                 Some("install failed".to_owned()),
             )),
-        });
+        );
         let mut want = vec![
             label(1, "Connected to Test Phone"),
             label(2, "Companion: install failed"),
@@ -357,13 +391,13 @@ mod tests {
         assert_eq!(rows(&v), want);
         assert_eq!(overlay(&v), "emblem-warning");
         assert_eq!(sni_status(&v), "Active");
-        let off = view(Phone::Ready {
-            serial: serial("s1"),
-            companion: Some((
+        let off = with(
+            PhoneState::Ready,
+            Some((
                 CompanionState::Unavailable,
                 Some("keyboard off in Lantern settings".to_owned()),
             )),
-        });
+        );
         assert_eq!(
             rows(&off)[1],
             label(2, "Typing through the Lantern keyboard is off")
@@ -373,9 +407,7 @@ mod tests {
 
     #[test]
     fn retrying() {
-        let v = view(Phone::Retrying {
-            serial: serial("s1"),
-        });
+        let v = view(PhoneState::Retrying);
         let mut want = vec![
             label(1, "Reconnecting to Test Phone…"),
             button(3, "Disconnect", true, Action::Disconnect),
@@ -388,9 +420,7 @@ mod tests {
 
     #[test]
     fn paused() {
-        let v = view(Phone::Paused {
-            serial: serial("s1"),
-        });
+        let v = view(PhoneState::Off);
         let mut want = vec![
             label(1, "Disconnected from Test Phone"),
             button(3, "Connect", true, Action::Connect),
@@ -402,10 +432,38 @@ mod tests {
     }
 
     #[test]
+    fn reconnecting_reads_like_retrying() {
+        let v = view(PhoneState::Reconnecting);
+        assert_eq!(status_line(&v), "Reconnecting to Test Phone…");
+        assert_eq!(action(&rows(&v), 3), Some(Action::Disconnect));
+        assert_eq!(overlay(&v), "view-refresh");
+    }
+
+    #[test]
+    fn shows_the_live_phone_else_an_off_one() {
+        let mut v = view(PhoneState::Off);
+        let mut other = v.phones[0].clone();
+        other.serial = "s2".into();
+        other.name = Some("Other".into());
+        other.state = PhoneState::Waiting;
+        other.off = false;
+        v.phones.push(other.clone());
+        assert_eq!(shown(&v).map(|p| p.serial.as_str()), Some("s1"));
+        // A waiting phone alone shows nothing (Task 4 lists it).
+        assert_eq!(
+            shown(&View {
+                phones: vec![other.clone()]
+            }),
+            None
+        );
+        v.phones[1].state = PhoneState::Starting;
+        assert_eq!(shown(&v).map(|p| p.serial.as_str()), Some("s2"));
+        assert_eq!(status_line(&v), "Connecting to Other…");
+    }
+
+    #[test]
     fn undoing() {
-        let v = view(Phone::Undoing {
-            serial: serial("s1"),
-        });
+        let v = view(PhoneState::Undoing);
         let mut want = vec![label(1, "Removing Lantern from Test Phone…")];
         want.extend(tail(false));
         assert_eq!(rows(&v), want);
@@ -415,11 +473,8 @@ mod tests {
 
     #[test]
     fn locked_shows_unlock_row() {
-        let mut v = view(Phone::Ready {
-            serial: serial("s1"),
-            companion: Some((CompanionState::Ready, None)),
-        });
-        v.locked = true;
+        let mut v = with(PhoneState::Ready, Some((CompanionState::Ready, None)));
+        set_locked(&mut v, true);
         let mut want = vec![
             label(1, "Connected to Test Phone (locked)"),
             button(13, "Unlock Test Phone…", true, Action::Unlock),
@@ -431,17 +486,14 @@ mod tests {
         assert_eq!(action(&rows(&v), 13), Some(Action::Unlock));
         // Row 13 right after row 1, before the companion and settings-error rows.
         let mut warn = v.clone();
-        warn.phone = Phone::Ready {
-            serial: serial("s1"),
-            companion: Some((CompanionState::Unavailable, Some("x".to_owned()))),
-        };
+        warn.phones[0].companion = Some((CompanionState::Unavailable, Some("x".to_owned())));
         let ids: Vec<i32> = items(&warn, &Settings::default(), None, true)
             .iter()
             .map(Item::id)
             .collect();
         assert_eq!(ids, [1, 13, 2, 12, 3, 4, 5, 6, 8, 9, 10, 11]);
         // Not locked: no row 13, and a click on its id does nothing.
-        v.locked = false;
+        set_locked(&mut v, false);
         assert!(!rows(&v).iter().any(|i| i.id() == 13));
         assert_eq!(action(&rows(&v), 13), None);
         assert_eq!(status_line(&v), "Connected to Test Phone");
@@ -449,25 +501,22 @@ mod tests {
 
     #[test]
     fn serial_stands_in_for_an_unknown_name() {
-        let v = View {
-            phone: Phone::Paused {
-                serial: serial("20e9318"),
-            },
-            name: None,
-            locked: false,
-        };
+        let mut v = view(PhoneState::Off);
+        v.phones[0].serial = "20e9318".into();
+        v.phones[0].name = None;
         assert_eq!(status_line(&v), "Disconnected from 20e9318");
     }
 
     #[test]
     fn settings_login_and_error_rows() {
-        let v = view(Phone::Ready {
-            serial: serial("s1"),
-            companion: Some((CompanionState::Unavailable, Some("x".to_owned()))),
-        });
+        let v = with(
+            PhoneState::Ready,
+            Some((CompanionState::Unavailable, Some("x".to_owned()))),
+        );
         let settings = Settings {
             clipboard_sync: false,
             lantern_keyboard: false,
+            autoconnect: false,
         };
         let got = items(&v, &settings, None, true);
         let ids: Vec<i32> = got.iter().map(Item::id).collect();
@@ -507,13 +556,8 @@ mod tests {
 
     #[test]
     fn action_maps_ids_across_states() {
-        let ready = rows(&view(Phone::Ready {
-            serial: serial("s1"),
-            companion: None,
-        }));
-        let paused = rows(&view(Phone::Paused {
-            serial: serial("s1"),
-        }));
+        let ready = rows(&with(PhoneState::Ready, None));
+        let paused = rows(&view(PhoneState::Off));
         assert_eq!(action(&ready, 3), Some(Action::Disconnect));
         assert_eq!(action(&paused, 3), Some(Action::Connect));
         assert_eq!(action(&ready, 5), Some(Action::ToggleClipboard));
@@ -526,11 +570,7 @@ mod tests {
         for id in [0, 1, 2, 4, 9, 12, 99] {
             assert_eq!(action(&ready, id), None, "id {id}");
         }
-        let none = rows(&View {
-            phone: Phone::None,
-            name: None,
-            locked: false,
-        });
+        let none = rows(&View::default());
         assert_eq!(action(&none, 3), None);
         assert_eq!(action(&none, 10), None, "undo is disabled without a phone");
     }

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22, 23
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-24
     python3 tools/device_test.py --manual                            # also 8, 14, 21 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
 
-Items (23; 20 automatic, 8, 14 and 21 only with --manual):
+Items (24; 21 automatic, 8, 14 and 21 only with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -21,7 +21,13 @@ Items (23; 20 automatic, 8, 14 and 21 only with --manual):
                                            21 unlock_prompt (manual, PIN phone, Sahaj types)
                                            22 swipe_phone_never_prompts (Xiaomi, no PIN)
                                            23 per_phone_folders (restarts lanternd)
-A full automatic run prints `20/20 PASS` when everything passes.
+                                           24 autoconnect_on_remembers_off (adb reconnect)
+A full automatic run prints `21/21 PASS` when everything passes.
+
+lanternd serves only LANTERN_SERIAL's phone during the run: the suite sets
+`LANTERN_SERIAL=<SERIAL>` in the systemd user environment (restarting lanternd) if it isn't set
+there, and puts the previous value back (restarting again) at the end. Item 24 lifts it for its
+own steps.
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
@@ -31,7 +37,9 @@ seconds, and touches no other window. Items 13, 17, 21 and 22 save the PC clipbo
 afterwards; items 17 and 18 also save ~/.config/lantern/settings.toml and restore it (or remove it
 if it was absent); item 18 restarts lanternd with the keyboard off and back on; item 19
 disconnects the phone in Lantern for ~15 s and connects it again; item 20 does the same through
-the tray menu over the session bus (and saves a screenshot of the screen to the log dir).
+the tray menu over the session bus (and saves a screenshot of the screen to the log dir); item 24
+sets `autoconnect = true` in settings.toml (restored afterwards), drops the phone off adb with
+`adb reconnect` twice and restarts lanternd.
 Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
 The window items (2-6, 11-13, 17, 22) need frames from the compositor, which a locked Plasma session
@@ -73,6 +81,7 @@ STAY_ON_SESSION = "7"  # Session.STAY_ON in the helper
 JOURNAL = "/data/local/tmp/lantern-session.json"  # JournalStore.PATH in the helper
 RESIZE_LOGICAL = 900
 KILL_SIGNAL = "TERM"  # item 7; --signal=KILL
+MANUAL_RUN = False  # --manual: replug() asks for a real unplug
 LOG_DIR = Path(tempfile.mkdtemp(prefix="lantern-device-test-"))
 NESTED = None  # the Nested compositor while --nested
 IME_TEXT = "Tiếng Việt 👍việ"  # item 12: the EditText after text + compose + finish
@@ -135,9 +144,29 @@ def status():
     return json.loads(r.stdout)
 
 
-def lantern_cmd(cmd):
-    """`lantern connect|disconnect`: the status report lanternd answered with (as JSON)."""
-    r = subprocess.run([LANTERN, cmd], capture_output=True, text=True, timeout=10)
+def phone_status(serial=None):
+    """`serial`'s entry in `lantern status`'s `phones` (default SERIAL), or {}."""
+    serial = serial or SERIAL
+    for phone in status().get("phones", []):
+        if phone.get("serial") == serial:
+            return phone
+    return {}
+
+
+def device_record(serial=None):
+    """`serial`'s device record (default SERIAL) as a dict, {} if absent or unreadable."""
+    path = devices_dir() / f"{re.sub(r'[^A-Za-z0-9._:-]', '_', serial or SERIAL)}.json"
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def lantern_cmd(cmd, serial=None):
+    """`lantern connect|disconnect [serial]`: the status report lanternd answered with (as
+    JSON)."""
+    args = [LANTERN, cmd] + ([serial] if serial else [])
+    r = subprocess.run(args, capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         raise Fail(f"lantern {cmd} -> {r.returncode}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -148,8 +177,80 @@ def systemctl(*args, check_rc=True):
 
 
 def wait_ready(timeout=10):
-    st, secs = wait_until("daemon ready", timeout, lambda: (s := status())["state"] == "ready" and s)
+    """Waits until lanternd serves SERIAL's phone."""
+    st, secs = wait_until("daemon ready", timeout,
+                          lambda: (s := status())["state"] == "ready"
+                          and s["serial"] == SERIAL and s)
     return st, secs
+
+
+def systemd_env():
+    """The systemd user manager's environment as a dict."""
+    env = {}
+    for line in systemctl("show-environment").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
+
+
+class manager_env:
+    """Changes the systemd user environment (`set` values, `unset` names) and restarts
+    lanternd; on exit puts every changed name back as it was (or unsets it) and restarts
+    lanternd again. Each restore step is guarded."""
+
+    def __init__(self, set={}, unset=[]):
+        self.set, self.unset = dict(set), list(unset)
+        self.saved = {}
+
+    def __enter__(self):
+        env = systemd_env()
+        self.saved = {k: env.get(k) for k in [*self.set, *self.unset]}
+        if self.set:
+            systemctl("set-environment", *(f"{k}={v}" for k, v in self.set.items()))
+        if self.unset:
+            systemctl("unset-environment", *self.unset)
+        note(f"lanternd environment: set {self.set} unset {self.unset}")
+        systemctl("restart", UNIT)
+        return self
+
+    def __exit__(self, *exc):
+        steps = []
+        for k, v in self.saved.items():
+            if v is None:
+                steps.append((f"unset {k}", lambda k=k: systemctl("unset-environment", k)))
+            else:
+                steps.append((f"put back {k}", lambda k=k, v=v: systemctl("set-environment",
+                                                                         f"{k}={v}")))
+        steps.append(("restart lanternd", lambda: systemctl("restart", UNIT)))
+        cleanup(exc[0] is None, *steps)
+        return False
+
+
+def adb_state(serial=None):
+    """`serial`'s state in `adb devices` (`device`, `offline`, ...), None if not listed."""
+    for line in sh("adb", "devices", timeout=10).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == (serial or SERIAL):
+            return parts[1]
+    return None
+
+
+def replug(manual=None):
+    """Drops the phone off adb and back: `adb -s SERIAL reconnect`, which must take it away
+    (missing or `offline`) within 5 s, then back as `device` within 15 s. Under --manual
+    Sahaj pulls the cable and plugs it back in instead."""
+    manual = MANUAL_RUN if manual is None else manual
+    if manual:
+        input(f">>> Pull {SERIAL}'s USB cable, wait 15 s, plug it back in, then press Enter: ")
+    else:
+        sh("adb", "-s", SERIAL, "reconnect", timeout=15, check_rc=False)
+        try:
+            wait_until("phone off adb", 5, lambda: adb_state() != "device", interval=0.1)
+        except Fail:
+            raise Fail("adb reconnect did not drop the phone; run --manual and pull the cable")
+    _, secs = wait_until("phone back on adb", 15, lambda: adb_state() == "device", interval=0.2)
+    note(f"phone back on adb after {secs:.1f} s")
 
 
 class Window:
@@ -1254,35 +1355,44 @@ class Suite:
 
 
     def disconnect_and_connect(self):
-        """`lantern disconnect` ends the session and the helper restores the phone within 5 s;
-        lanternd then stays `paused` (no restart) for 15 s. `lantern connect` makes it ready
-        again within 15 s."""
+        """`lantern disconnect SERIAL` ends the session and the helper restores the phone within
+        5 s; lanternd then stays `paused` with the phone `off` (in `status.phones` and its
+        record) and no restart for 15 s. `lantern connect SERIAL` makes it ready again within
+        15 s and clears `off`."""
         base = baseline()  # 1. the originals, read with lanternd stopped
         note(f"originals: stay_on={base['stay_on']} ime={base['ime']} imes={base['imes']}")
         connected = False
         try:
-            # 2. Disconnect: restored, and paused for 15 s.
-            note(f"lantern disconnect: {lantern_cmd('disconnect')}")
+            # 2. Disconnect: restored, and paused (off) for 15 s.
+            note(f"lantern disconnect {SERIAL}: {lantern_cmd('disconnect', SERIAL)}")
             st, secs = wait_until("phone restored", 5,
                                   lambda: restored(s := phone_state()) and s, interval=0.2)
             note(f"restored {secs:.1f} s after disconnect: {st}")
+            check(device_record().get("off") is True,
+                  f"record not off after disconnect: {device_record()}")
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 now = status()
                 check(now["state"] == "paused" and now["serial"] == SERIAL,
                       f"not paused after disconnect: {json.dumps(now)}")
+                check(phone_status(SERIAL).get("state") == "off",
+                      f"phone not off after disconnect: {json.dumps(now)}")
                 check(not phone_state()["helper_pids"], "a helper started while paused")
                 time.sleep(1)
             note(f"paused for 15 s: {json.dumps(status())}")
-            # 3. Connect: ready again.
-            note(f"lantern connect: {lantern_cmd('connect')}")
+            # 3. Connect: ready again, off cleared.
+            note(f"lantern connect {SERIAL}: {lantern_cmd('connect', SERIAL)}")
             _, secs = wait_ready(15)
             connected = True
             note(f"ready {secs:.1f} s after connect")
+            check("off" not in phone_status(SERIAL),
+                  f"status still says off: {json.dumps(phone_status(SERIAL))}")
+            check(device_record().get("off") is not True,
+                  f"record still off after connect: {device_record()}")
         finally:
             # 4. Leave lanternd ready, whatever failed.
             if not connected:
-                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect")),
+                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect", SERIAL)),
                         ("lanternd ready", lambda: wait_ready(15)))
 
 
@@ -1593,6 +1703,74 @@ class Suite:
             cleanup(ok, ("remove the planted file", lambda: foreign.unlink(missing_ok=True)))
 
 
+    def autoconnect_on_remembers_off(self):
+        """With `autoconnect = true` (and LANTERN_SERIAL lifted, a 0 ms unplug grace): a phone
+        switched off stays off across a replug and a lanternd restart; `lantern connect` turns
+        it back on, and a replug then reconnects it by itself."""
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+
+        def restore_file():
+            if saved_file is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(saved_file)
+
+        def stays_off(secs):
+            deadline = time.monotonic() + secs
+            while time.monotonic() < deadline:
+                now = status()
+                check(phone_status(SERIAL).get("state") == "off",
+                      f"phone not off: {json.dumps(now)}")
+                check(not (now["state"] == "ready" and now["serial"] == SERIAL),
+                      f"the phone connected while off: {json.dumps(now)}")
+                time.sleep(1)
+
+        env = manager_env(set={"LANTERN_UNPLUG_GRACE_MS": "0"}, unset=["LANTERN_SERIAL"])
+        ok = False
+        entered = False
+        try:
+            # 1. Autoconnect on; the live flag set earlier in the suite reconnects the phone.
+            text = (saved_file or b"").decode(errors="replace")
+            lines = [l for l in text.splitlines() if not re.match(r"\s*autoconnect\s*=", l)]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(lines + ["autoconnect = true"]) + "\n")
+            env.__enter__()
+            entered = True
+            _, secs = wait_ready(15)
+            note(f"autoconnect on: ready {secs:.1f} s after the restart")
+            # 2. Switched off: the phone is restored within 5 s.
+            note(f"lantern disconnect {SERIAL}: {lantern_cmd('disconnect', SERIAL)}")
+            wait_until("phone restored", 5, lambda: restored(phone_state()), interval=0.2)
+            # 3. A replug leaves it off.
+            replug()
+            stays_off(15)
+            note("off for 15 s after the replug")
+            # 4. So does a lanternd restart.
+            systemctl("restart", UNIT)
+            stays_off(15)
+            note("off for 15 s after a lanternd restart")
+            # 5. Connect: ready.
+            note(f"lantern connect {SERIAL}: {lantern_cmd('connect', SERIAL)}")
+            _, secs = wait_ready(15)
+            note(f"ready {secs:.1f} s after connect")
+            # 6. A replug reconnects it by itself.
+            replug()
+            _, secs = wait_ready(20)
+            note(f"ready again {secs:.1f} s after the replug")
+            ok = True
+        finally:
+            # 7. The file, then the environment (restarts lanternd); lanternd left ready.
+            steps = [("restore settings.toml", restore_file)]
+            if entered:
+                steps.append(("restore lanternd's environment",
+                              lambda: env.__exit__(None if ok else Fail, None, None)))
+            steps.append(("lanternd ready", lambda: wait_ready(20)))
+            cleanup(ok, *steps)
+
+
 ITEMS = [
     "session_starts_on_plug",
     "open_settings_creates_one_display",
@@ -1617,6 +1795,7 @@ ITEMS = [
     "unlock_prompt",
     "swipe_phone_never_prompts",
     "per_phone_folders",
+    "autoconnect_on_remembers_off",
 ]
 # Need a person: pull the cable (8, 14) or type the phone's PIN (21).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt"}
@@ -1650,8 +1829,9 @@ def main():
                     help="item 7: TERM (clean stop, default) or KILL (no cleanup; systemd "
                          "restarts lanternd and its new session must drop the stale forward)")
     args = ap.parse_args()
-    global KILL_SIGNAL, NESTED
+    global KILL_SIGNAL, NESTED, MANUAL_RUN
     KILL_SIGNAL = args.signal
+    MANUAL_RUN = args.manual
     if args.state:
         try:
             st = status()
@@ -1673,6 +1853,13 @@ def main():
         print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
               "(4-6, 12, 13, 17, 22) cannot pass. Unlock it or use --nested.", flush=True)
     results = []
+    # Preflight: lanternd serves only this phone for the run (other phones plugged in are
+    # ignored); the previous value is put back at the end.
+    previous = systemd_env().get("LANTERN_SERIAL")
+    if previous != SERIAL:
+        systemctl("set-environment", f"LANTERN_SERIAL={SERIAL}")
+        systemctl("restart", UNIT)
+    print(f"lanternd LANTERN_SERIAL={SERIAL} for this run", flush=True)
     try:
         if args.nested:
             NESTED = Nested()
@@ -1719,6 +1906,19 @@ def main():
                 test_activity(False)
             except Exception as e:
                 print(f"WARNING: could not disable the companion's test screen: {e}", flush=True)
+        if previous != SERIAL:
+            # lanternd's environment as it was before the run, each step guarded.
+            try:
+                if previous is None:
+                    systemctl("unset-environment", "LANTERN_SERIAL")
+                else:
+                    systemctl("set-environment", f"LANTERN_SERIAL={previous}")
+            except Exception as e:
+                print(f"WARNING: could not put back LANTERN_SERIAL: {e}", flush=True)
+            try:
+                systemctl("restart", UNIT)
+            except Exception as e:
+                print(f"WARNING: could not restart {UNIT}: {e}", flush=True)
     if not args.manual and not args.only:
         for name in sorted(MANUAL, key=ITEMS.index):
             print(f"SKIP {ITEMS.index(name) + 1} {name} (needs a person: run with --manual)")

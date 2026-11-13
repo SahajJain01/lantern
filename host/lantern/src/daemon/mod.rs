@@ -2,11 +2,13 @@ pub mod catalog;
 pub mod companion;
 pub mod control;
 pub mod ipc;
+pub mod phones;
 pub mod registry;
 pub mod session;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +18,7 @@ use futures_core::Stream;
 use futures_util::future::BoxFuture;
 use futures_util::StreamExt;
 use ipc::Hub;
-use lantern_proto::SessionState;
+use lantern_proto::{PhoneState, SessionState};
 use session::{Inbound, SessionConn};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -26,27 +28,13 @@ use tokio::time::Instant;
 use crate::adb::{track_devices, Adb, DeviceEvent};
 use crate::clipboard::{PcClipboard, PcOffer};
 use crate::daemon::companion::Names;
-use crate::daemon::control::{Command, Notifier, Phone, UndoRunner, View};
+use crate::daemon::control::{
+    Command, ConnectEvent, Notifier, Opener, PhoneView, UndoRunner, View,
+};
+use crate::daemon::phones::{on_plug, OnPlug, Timing};
 use crate::daemon::session::{start_with_companion, HandshakeError};
-use crate::settings::{self, SettingsHandle};
+use crate::settings::{self, Settings, SettingsHandle};
 use crate::unlock::{self, LockEvent};
-
-/// The phone to serve: `configured` (`$LANTERN_SERIAL`) if set, else `current` (the live
-/// session's phone) while it is online, else the first of `online` (kept in the order devices
-/// came online).
-fn select_serial(
-    configured: Option<&str>,
-    online: &[String],
-    current: Option<&str>,
-) -> Option<String> {
-    if let Some(serial) = configured {
-        return Some(serial.to_owned());
-    }
-    if let Some(current) = current.filter(|c| online.iter().any(|s| s == c)) {
-        return Some(current.to_owned());
-    }
-    online.first().cloned()
-}
 
 /// Backoff for restarting a session after a failed start or helper death, while the target
 /// device stays connected.
@@ -106,7 +94,7 @@ pub struct Parts {
     pub catalog: Option<catalog::Catalog>,
     /// The PC clipboard, synced with the phone's.
     pub clipboard: Option<PcClipboard>,
-    /// The user's settings (clipboard sync on/off).
+    /// The user's settings (clipboard sync, autoconnect; without them autoconnect is on).
     pub settings: Option<SettingsHandle>,
     /// Commands from the tray menu.
     pub commands: Option<mpsc::Receiver<Command>>,
@@ -124,6 +112,15 @@ pub struct Parts {
     pub unlock: Option<mpsc::Receiver<(String, unlock::Pin)>>,
     /// Gets the helper's `locked`/`unlocked`/`unlock_result` and the opens to redo.
     pub lock_events: Option<mpsc::Sender<LockEvent>>,
+    /// The device records (`devices/<serial>.json`) holding each phone's `off`/`live` flags.
+    /// With `None` the flags live in memory only.
+    pub state_dir: Option<PathBuf>,
+    /// The unplug grace and how long a connect-and-open request waits.
+    pub timing: Timing,
+    /// Gets the "plugged in" / "plug it in" prompts (`try_send`: a full channel drops one).
+    pub connect_events: Option<mpsc::Sender<ConnectEvent>>,
+    /// Opens the app of a connect-and-open request once its phone is ready.
+    pub opener: Option<Opener>,
 }
 
 /// The parts of [`Parts`] the run loop itself uses.
@@ -135,6 +132,12 @@ struct Controls {
     undo: Option<UndoRunner>,
     notify: Option<Notifier>,
     unlock: Option<mpsc::Receiver<(String, unlock::Pin)>>,
+    /// `autoconnect` (without settings it counts as on).
+    settings: Option<watch::Receiver<Settings>>,
+    state_dir: Option<PathBuf>,
+    timing: Timing,
+    connect_events: Option<mpsc::Sender<ConnectEvent>>,
+    opener: Option<Opener>,
 }
 
 /// [`serve`] with the daemon's optional [`Parts`].
@@ -164,17 +167,23 @@ where
         notify,
         unlock,
         lock_events,
+        state_dir,
+        timing,
+        connect_events,
+        opener,
     } = parts;
     let mut hub = Hub::new(Some(listener));
+    hub.set_state_dir(state_dir.clone());
     if let Some(events) = lock_events {
         hub.set_lock_events(events);
     }
     if let Some(catalog) = catalog {
         hub.set_catalog(catalog);
     }
-    if let Some(settings) = settings {
+    let settings = settings.map(|settings| {
         hub.set_settings(settings.subscribe());
-    }
+        settings.subscribe()
+    });
     let offers = clipboard.map(|clipboard| {
         hub.set_clipboard(clipboard.handle);
         clipboard.offers
@@ -186,6 +195,11 @@ where
         undo,
         notify,
         unlock,
+        settings,
+        state_dir,
+        timing,
+        connect_events,
+        opener,
     };
     let path = hub.socket_path();
     let result = drive(
@@ -255,22 +269,6 @@ where
     .await
 }
 
-/// The phone to start: [`select_serial`] over the online phones that are not `paused`, and
-/// only if it is online.
-fn target(
-    configured: Option<&str>,
-    connected: &[String],
-    paused: &[String],
-    current: Option<&str>,
-) -> Option<String> {
-    let online: Vec<String> = connected
-        .iter()
-        .filter(|serial| !paused.contains(serial))
-        .cloned()
-        .collect();
-    select_serial(configured, &online, current).filter(|serial| online.contains(serial))
-}
-
 /// Phone names, read once per serial and again only when [`Self::refresh`]ed (on Online and
 /// when a session becomes ready), never once per loop turn.
 struct NameCache {
@@ -297,14 +295,164 @@ impl NameCache {
 /// The phone being undone and its undo.
 type Undoing = Option<(String, BoxFuture<'static, (bool, String)>)>;
 
+/// A phone's `off`/`live` flags (see [`companion::Record`]).
+#[derive(Debug, Clone, Copy, Default)]
+struct Flags {
+    off: bool,
+    live: bool,
+}
+
+/// A connect-and-open request: open `pkg` for `user` once the phone is ready, until `until`.
+struct Pending {
+    pkg: String,
+    user: u32,
+    until: Instant,
+}
+
+/// The phone table: what lanternd knows about each phone besides the session it serves.
+struct Table {
+    /// Where the device records are; `None`: the flags live in memory only.
+    state_dir: Option<PathBuf>,
+    /// Online phones, in the order they came online.
+    plugged: Vec<String>,
+    /// Each phone's flags as last read or written.
+    flags: HashMap<String, Flags>,
+    /// The phones with a device record, re-read after each record write.
+    known: Vec<String>,
+    /// The phone switched off most recently in this run (the top-level `paused`).
+    last_off: Option<String>,
+    /// Connect-and-open requests, at most one per phone (a later one replaces it).
+    pending: HashMap<String, Pending>,
+}
+
+impl Table {
+    fn new(state_dir: Option<PathBuf>) -> Self {
+        let mut table = Self {
+            state_dir,
+            plugged: Vec::new(),
+            flags: HashMap::new(),
+            known: Vec::new(),
+            last_off: None,
+            pending: HashMap::new(),
+        };
+        table.refresh_known();
+        table
+    }
+
+    /// Re-reads which phones have a record; a phone seen for the first time gets its flags.
+    fn refresh_known(&mut self) {
+        let Some(dir) = &self.state_dir else {
+            return;
+        };
+        self.known = companion::known_serials(dir);
+        for serial in self.known.clone() {
+            if !self.flags.contains_key(&serial) {
+                self.read(&serial);
+            }
+        }
+    }
+
+    fn plugged(&self, serial: &str) -> bool {
+        self.plugged.iter().any(|s| s == serial)
+    }
+
+    /// `serial`'s flags, read from its record (else from this run's memory).
+    fn read(&mut self, serial: &str) -> Flags {
+        let Some(dir) = &self.state_dir else {
+            return self.flags.get(serial).copied().unwrap_or_default();
+        };
+        let flags = companion::read_record(dir, serial)
+            .map(|r| Flags {
+                off: r.off,
+                live: r.live,
+            })
+            .unwrap_or_default();
+        self.flags.insert(serial.to_owned(), flags);
+        flags
+    }
+
+    fn off(&self, serial: &str) -> bool {
+        self.flags.get(serial).is_some_and(|f| f.off)
+    }
+
+    /// Sets `serial`'s `off` flag, in memory and in its record. A failed write is logged; the
+    /// flag still applies for this run.
+    fn set_off(&mut self, serial: &str, off: bool) {
+        self.flags.entry(serial.to_owned()).or_default().off = off;
+        if let Some(dir) = &self.state_dir {
+            let written = companion::set_off(dir, serial, off);
+            self.written(serial, "off", off, written);
+        }
+    }
+
+    /// Sets `serial`'s `live` flag (`true` also stamps `connected_at`), as [`Self::set_off`].
+    fn set_live(&mut self, serial: &str, live: bool) {
+        self.flags.entry(serial.to_owned()).or_default().live = live;
+        if let Some(dir) = &self.state_dir {
+            let written = companion::set_live(dir, serial, live);
+            self.written(serial, "live", live, written);
+        }
+    }
+
+    fn written(&mut self, serial: &str, flag: &str, value: bool, written: Result<bool>) {
+        match written {
+            Ok(true) => {
+                tracing::debug!(serial, flag, value, "device record updated");
+                self.refresh_known();
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                serial,
+                flag,
+                value,
+                error = format!("{error:#}"),
+                "device record not written; the flag applies until lanternd stops"
+            ),
+        }
+    }
+
+    /// Whether `serial` has a connect-and-open request that hasn't expired.
+    fn pending(&self, serial: &str) -> bool {
+        self.pending
+            .get(serial)
+            .is_some_and(|p| p.until > Instant::now())
+    }
+
+    /// The phones the view lists besides the plugged ones: records, else this run's flags.
+    fn others(&self) -> Vec<String> {
+        let mut all: Vec<String> = self.known.clone();
+        all.extend(self.flags.keys().cloned());
+        all.sort();
+        all.dedup();
+        all
+    }
+}
+
+/// Hands `event` to the connect prompt without waiting; a full channel drops it.
+fn connect_event(events: Option<&mpsc::Sender<ConnectEvent>>, event: ConnectEvent) {
+    let Some(events) = events else {
+        return;
+    };
+    if let Err(error) = events.try_send(event) {
+        tracing::warn!(%error, "connect prompt not listening; event dropped");
+    }
+}
+
 /// Every branch is polled concurrently: a session start in flight never blocks the stop signal,
 /// device events or clients, and helper death is noticed through `SessionConn::closed`. The live
 /// session's inbound frames are always drained (routed to window clients).
 ///
-/// A phone joins `paused` (Disconnect, Undo) before its session is closed. Nothing starts for a
-/// paused phone until it goes offline or gets Connect, and nothing starts at all while an undo
-/// runs. The most recently paused phone is the one shown and the one Connect resumes.
-#[allow(clippy::too_many_arguments)]
+/// The phone table decides what is served (see [`phones::on_plug`]):
+/// - `wanted` is the only start target; retries keep it. At most one phone is wanted.
+/// - The wanted phone going offline closes its session and starts the unplug grace; back within
+///   it, it restarts at once without asking; past it, its `live` flag is cleared and nothing
+///   else starts.
+/// - Disconnect and Undo set the phone's `off` (and clear `live`) before its session closes;
+///   Connect clears `off`. Switching to another phone closes the old one without touching its
+///   `off`. A stop signal leaves every flag as it is; Quit clears the live phone's `live`.
+/// - Nothing starts while an undo runs, and commands other than Quit are ignored meanwhile.
+// `release!` resets `retry_at` before a switch schedules the new phone's start.
+#[allow(clippy::too_many_arguments, unused_assignments)]
 async fn drive<E, S, F, D>(
     mut hub: Hub,
     mut offers: Option<mpsc::Receiver<PcOffer>>,
@@ -330,24 +478,54 @@ where
         undo,
         notify,
         mut unlock,
+        settings,
+        state_dir,
+        timing,
+        connect_events,
+        opener,
     } = controls;
     let mut names = NameCache {
         names,
         cache: HashMap::new(),
     };
-    // Online devices, in the order they came online.
-    let mut connected: Vec<String> = Vec::new();
+    let configured = configured.as_deref();
+    // Records with a stale `live` flag are cleared once the grace after start has passed.
+    let mut startup = state_dir
+        .as_ref()
+        .map(|_| Instant::now() + timing.unplug_grace);
+    let mut table = Table::new(state_dir);
+    // The one phone to serve.
+    let mut wanted: Option<String> = None;
+    // The wanted phone is offline: the end of its unplug grace.
+    let mut grace: Option<Instant> = None;
     let mut active: Option<(SessionConn, Instant)> = None;
     let mut starting: Starting<F> = None;
     let mut retry_at: Option<Instant> = None;
     let mut failures: u32 = 0;
-    // The phones the user disconnected (or undid), oldest first; never start targets.
-    let mut paused: Vec<String> = Vec::new();
     let mut undoing: Undoing = None;
+
+    // Ends whatever runs for the wanted phone and forgets it; evaluates to its serial. Its
+    // flags are the caller's.
+    macro_rules! release {
+        ($why:expr) => {{
+            cancel_start(&mut starting, $why);
+            close_session(&mut active, &mut hub).await;
+            retry_at = None;
+            failures = 0;
+            grace = None;
+            wanted.take()
+        }};
+    }
 
     loop {
         let idle = active.is_none() && starting.is_none() && undoing.is_none();
-        match (&active, &starting, paused.last()) {
+        // The top-level status: the live phone, else the phone switched off most recently while
+        // it stays plugged (and off), else idle.
+        let paused = table
+            .last_off
+            .clone()
+            .filter(|s| wanted.is_none() && table.plugged(s) && table.off(s));
+        match (&active, &starting, paused) {
             (Some((session, _)), _, _) => hub.set_session(
                 SessionState::Ready,
                 Some(session.serial().to_owned()),
@@ -356,68 +534,101 @@ where
             (None, Some((serial, _)), _) => {
                 hub.set_session(SessionState::Starting, Some(serial.clone()), None)
             }
-            (None, None, Some(serial)) => {
-                hub.set_session(SessionState::Paused, Some(serial.clone()), None)
-            }
+            (None, None, Some(serial)) => hub.set_session(SessionState::Paused, Some(serial), None),
             (None, None, None) => hub.set_session(SessionState::Idle, None, None),
         }
-        if let Some(view) = &view {
-            let phone = if let Some((serial, _)) = &undoing {
-                Phone::Undoing {
-                    serial: serial.clone(),
-                }
-            } else if let Some((session, _)) = &active {
-                Phone::Ready {
-                    serial: session.serial().to_owned(),
-                    companion: hub.companion(),
-                }
-            } else if let Some((serial, _)) = &starting {
-                Phone::Starting {
-                    serial: serial.clone(),
-                }
-            } else if let Some(serial) =
-                retry_at.and_then(|_| target(configured.as_deref(), &connected, &paused, None))
-            {
-                // A start due now (a phone just came online) is as good as starting.
-                if failures > 0 {
-                    Phone::Retrying { serial }
+        // In a block: the closure borrows `undoing`, which must not live across an await.
+        let now_view = {
+            let state_of = |serial: &str| -> PhoneState {
+                if undoing.as_ref().is_some_and(|(s, _)| s == serial) {
+                    PhoneState::Undoing
+                } else if wanted.as_deref() == Some(serial) {
+                    if active.is_some() {
+                        PhoneState::Ready
+                    } else if starting.is_some() {
+                        PhoneState::Starting
+                    } else if grace.is_some() {
+                        PhoneState::Reconnecting
+                    } else if failures > 0 {
+                        PhoneState::Retrying
+                    } else {
+                        // A start due now is as good as starting.
+                        PhoneState::Starting
+                    }
+                } else if table.plugged(serial) {
+                    if table.off(serial) {
+                        PhoneState::Off
+                    } else {
+                        PhoneState::Waiting
+                    }
                 } else {
-                    Phone::Starting { serial }
+                    PhoneState::Unplugged
                 }
-            } else if let Some(serial) = paused.last() {
-                Phone::Paused {
-                    serial: serial.clone(),
-                }
-            } else {
-                Phone::None
             };
-            let name = phone.serial().and_then(|serial| names.get(serial));
-            let next = View {
-                phone,
-                name,
-                locked: hub.locked(),
-            };
+            let mut listed: Vec<String> = table.plugged.clone();
+            if let Some(w) = wanted.as_ref().filter(|w| !listed.contains(w)) {
+                listed.push(w.clone());
+            }
+            let mut rest: Vec<(String, String)> = table
+                .others()
+                .into_iter()
+                .filter(|s| !listed.contains(s))
+                .map(|s| (names.get(&s).unwrap_or_else(|| s.clone()), s))
+                .collect();
+            rest.sort();
+            listed.extend(rest.into_iter().map(|(_, s)| s));
+            if let Some(configured) = configured {
+                listed.retain(|s| s == configured);
+            }
+            let live_serial = active.as_ref().map(|(s, _)| s.serial().to_owned());
+            View {
+                phones: listed
+                    .iter()
+                    .map(|serial| {
+                        let live = live_serial.as_deref() == Some(serial.as_str());
+                        PhoneView {
+                            serial: serial.clone(),
+                            name: names.get(serial),
+                            state: state_of(serial),
+                            plugged: table.plugged(serial),
+                            off: table.off(serial),
+                            locked: live && hub.locked(),
+                            companion: if live { hub.companion() } else { None },
+                        }
+                    })
+                    .collect(),
+            }
+        };
+        hub.set_view(&now_view);
+        if let Some(view) = &view {
             view.send_if_modified(|current| {
-                if *current == next {
+                if *current == now_view {
                     return false;
                 }
-                tracing::debug!(?next, "view");
-                *current = next;
+                tracing::debug!(next = ?now_view, "view");
+                *current = now_view;
                 true
             });
         }
         let wake = retry_at.unwrap_or_else(Instant::now);
+        let grace_end = grace.unwrap_or_else(Instant::now);
+        let startup_end = startup.unwrap_or_else(Instant::now);
         // Set when the live session must be torn down and restarted.
         let mut ended: Option<&'static str> = None;
         // Set when the daemon must end (signal or Quit).
         let mut quit: Option<&'static str> = None;
+        // Quit (not a stop signal) clears the live phone's `live` flag.
+        let mut clear_live = false;
         // Commands to apply after this turn's event.
         let mut queued: Vec<Command> = Vec::new();
         tokio::select! {
             why = &mut stop => quit = Some(why),
             cmd = async { commands.as_mut().expect("guarded").recv().await }, if commands.is_some() => {
                 match cmd {
-                    Some(Command::Quit) => quit = Some("Quit command"),
+                    Some(Command::Quit) => {
+                        quit = Some("Quit command");
+                        clear_live = true;
+                    }
                     Some(cmd) => queued.push(cmd),
                     None => {
                         tracing::debug!("command channel closed");
@@ -438,59 +649,97 @@ where
                 };
                 match event {
                     DeviceEvent::Online(serial) => {
+                        if configured.is_some_and(|c| c != serial) {
+                            tracing::debug!(serial, "device online; not LANTERN_SERIAL, ignored");
+                            continue;
+                        }
                         tracing::info!(serial, "device online");
-                        if !connected.contains(&serial) {
-                            connected.push(serial.clone());
+                        if !table.plugged(&serial) {
+                            table.plugged.push(serial.clone());
                         }
                         names.refresh(&serial);
-                        if paused.contains(&serial) {
-                            tracing::info!(serial, "phone is disconnected in Lantern; not starting");
-                        }
-                        let current = active.as_ref().map(|(s, _)| s.serial().to_owned());
-                        let target = target(configured.as_deref(), &connected, &paused, current.as_deref());
-                        if idle && target.as_deref() == Some(serial.as_str()) {
-                            failures = 0;
-                            retry_at = Some(Instant::now());
-                        }
-                    }
-                    DeviceEvent::Offline(serial) => {
-                        tracing::info!(serial, "device offline");
-                        let before = target(configured.as_deref(), &connected, &paused, None);
-                        connected.retain(|s| *s != serial);
-                        if paused.contains(&serial) {
-                            tracing::info!(serial, "unplugged: no longer disconnected in Lantern");
-                            paused.retain(|s| *s != serial);
-                        }
-                        if starting.as_ref().map(|(s, _)| s.as_str()) == Some(serial.as_str()) {
-                            cancel_start(&mut starting, "device offline");
-                        }
-                        if active.as_ref().map(|(s, _)| s.serial()) == Some(serial.as_str()) {
-                            close_session(&mut active, &mut hub).await;
-                        }
-                        let current = active.as_ref().map(|(s, _)| s.serial().to_owned());
-                        let after = target(configured.as_deref(), &connected, &paused, current.as_deref());
-                        let idle = active.is_none() && starting.is_none() && undoing.is_none();
-                        match after {
-                            None => {
-                                retry_at = None;
-                                failures = 0;
-                            }
-                            // The live (or backed-off) phone left: serve the next online one now.
-                            Some(next) if idle && (retry_at.is_none() || before.as_ref() != Some(&next)) => {
-                                tracing::info!(serial = next, "next online phone");
+                        let flags = table.read(&serial);
+                        if wanted.as_deref() == Some(serial.as_str()) {
+                            if grace.take().is_some() {
+                                tracing::info!(serial, "back within the unplug grace; reconnecting");
                                 failures = 0;
                                 retry_at = Some(Instant::now());
                             }
-                            Some(_) => {}
+                        } else if undoing.as_ref().is_some_and(|(s, _)| *s == serial) {
+                            tracing::info!(serial, "phone is being undone; not starting");
+                        } else {
+                            let autoconnect = settings
+                                .as_ref()
+                                .is_none_or(|settings| settings.borrow().autoconnect);
+                            let rule = on_plug(
+                                &serial,
+                                configured,
+                                autoconnect,
+                                flags.off,
+                                flags.live,
+                                table.pending(&serial),
+                                wanted.as_deref(),
+                            );
+                            tracing::info!(serial, ?rule, autoconnect, off = flags.off, live = flags.live, "plugged in");
+                            match rule {
+                                OnPlug::Connect => {
+                                    if let Some(old) = release!("another phone connects") {
+                                        table.set_live(&old, false);
+                                    }
+                                    wanted = Some(serial);
+                                    retry_at = Some(Instant::now());
+                                }
+                                OnPlug::Prompt => {
+                                    let name = names.get(&serial).unwrap_or_else(|| serial.clone());
+                                    connect_event(connect_events.as_ref(), ConnectEvent::PluggedIn { serial, name });
+                                }
+                                OnPlug::Wait | OnPlug::Ignore => {}
+                            }
+                        }
+                    }
+                    DeviceEvent::Offline(serial) => {
+                        let was_plugged = table.plugged(&serial);
+                        table.plugged.retain(|s| *s != serial);
+                        if wanted.as_deref() == Some(serial.as_str()) {
+                            tracing::info!(serial, grace = ?timing.unplug_grace, "device offline; waiting for it to come back");
+                            cancel_start(&mut starting, "device offline");
+                            close_session(&mut active, &mut hub).await;
+                            retry_at = None;
+                            failures = 0;
+                            grace = Some(Instant::now() + timing.unplug_grace);
+                        } else if was_plugged {
+                            tracing::info!(serial, "device offline");
+                            connect_event(connect_events.as_ref(), ConnectEvent::Gone { serial });
                         }
                     }
                 }
             }
             _ = tokio::time::sleep_until(wake), if idle && retry_at.is_some() => {
                 retry_at = None;
-                if let Some(serial) = target(configured.as_deref(), &connected, &paused, None) {
+                if let Some(serial) = wanted.clone().filter(|s| table.plugged(s)) {
                     tracing::info!(serial, attempt = failures + 1, "starting session");
                     starting = Some((serial.clone(), Box::pin(starter(serial))));
+                }
+            }
+            _ = tokio::time::sleep_until(grace_end), if grace.is_some() => {
+                grace = None;
+                if let Some(serial) = wanted.take() {
+                    tracing::info!(serial, "unplugged (offline past the grace)");
+                    table.set_live(&serial, false);
+                }
+                retry_at = None;
+                failures = 0;
+            }
+            _ = tokio::time::sleep_until(startup_end), if startup.is_some() => {
+                startup = None;
+                for serial in table.known.clone() {
+                    if table.plugged(&serial) || wanted.as_deref() == Some(serial.as_str()) {
+                        continue;
+                    }
+                    if table.read(&serial).live {
+                        tracing::info!(serial, "not plugged in since lanternd started; live flag cleared");
+                        table.set_live(&serial, false);
+                    }
                 }
             }
             result = async { starting.as_mut().expect("guarded").1.as_mut().await }, if starting.is_some() => {
@@ -502,6 +751,18 @@ where
                         // The start has just recorded the phone's name.
                         names.refresh(&serial);
                         active = Some((session, Instant::now()));
+                        table.set_live(&serial, true);
+                        connect_event(connect_events.as_ref(), ConnectEvent::Gone { serial: serial.clone() });
+                        if let Some(p) = table.pending.remove(&serial) {
+                            if p.until > Instant::now() {
+                                tracing::info!(serial, pkg = p.pkg, user = p.user, "opening the requested app");
+                                if let Some(opener) = &opener {
+                                    opener(&serial, &p.pkg, p.user);
+                                }
+                            } else {
+                                tracing::info!(serial, pkg = p.pkg, "connect-and-open request expired");
+                            }
+                        }
                     }
                     Err(error) if HandshakeError::find(&error).is_some() => {
                         // The embedded helper answers the same way on every attempt; retrying
@@ -521,12 +782,8 @@ where
             (ok, output) = async { undoing.as_mut().expect("guarded").1.as_mut().await }, if undoing.is_some() => {
                 let (serial, _) = undoing.take().expect("guarded");
                 undo_done(&serial, ok, &output, &mut names, notify.as_ref());
-                // Paused until replugged or connected again (unless it was unplugged meanwhile).
-                if connected.contains(&serial) && !paused.contains(&serial) {
-                    paused.push(serial);
-                }
-                // Another online phone is served now.
-                serve_next(configured.as_deref(), &connected, &paused, &mut retry_at, &mut failures);
+                // The phone stays off (set before the undo); nothing else starts.
+                table.refresh_known();
             }
             pin = async { unlock.as_mut().expect("guarded").recv().await }, if unlock.is_some() => {
                 match pin {
@@ -562,7 +819,7 @@ where
                 if hub.on_client(event, helper.as_ref()).await.is_err() {
                     ended = Some("helper stopped reading");
                 }
-                queued.extend(hub.take_commands().into_iter().map(Command::from));
+                queued.extend(hub.take_commands());
             }
             offer = async { offers.as_mut().expect("guarded").recv().await }, if offers.is_some() => {
                 match offer {
@@ -593,6 +850,11 @@ where
         }
         if let Some(why) = quit {
             tracing::info!("{why} received");
+            if clear_live {
+                if let Some(serial) = wanted.clone() {
+                    table.set_live(&serial, false);
+                }
+            }
             cancel_start(&mut starting, why);
             close_session(&mut active, &mut hub).await;
             if let Some((serial, undo)) = undoing.take() {
@@ -626,101 +888,90 @@ where
                 tracing::info!(?cmd, "undo-setup running; command ignored");
                 continue;
             }
-            // The phone being served, started or retried.
-            let live = active
-                .as_ref()
-                .map(|(session, _)| session.serial().to_owned())
-                .or_else(|| starting.as_ref().map(|(serial, _)| serial.clone()))
-                .or_else(|| {
-                    retry_at.and_then(|_| target(configured.as_deref(), &connected, &paused, None))
-                });
+            let serial = match &cmd {
+                Command::Connect { serial, .. }
+                | Command::Disconnect { serial }
+                | Command::UndoSetup { serial } => serial.clone(),
+                Command::Quit => unreachable!("Quit is handled when it arrives"),
+            };
+            if configured.is_some_and(|c| c != serial) {
+                tracing::info!(serial, ?cmd, "not LANTERN_SERIAL; command ignored");
+                continue;
+            }
             match cmd {
-                Command::Disconnect => {
-                    let Some(serial) = live else {
-                        tracing::info!("disconnect: no phone is being served");
-                        continue;
-                    };
+                Command::Connect { serial, open } => {
+                    tracing::info!(serial, ?open, "connected in Lantern");
+                    table.set_off(&serial, false);
+                    let app = open.as_ref().map(|(pkg, user)| hub.app_name(pkg, *user));
+                    if let Some((pkg, user)) = open {
+                        let ready = active.as_ref().is_some_and(|(s, _)| s.serial() == serial);
+                        match (&opener, ready) {
+                            (Some(opener), true) => opener(&serial, &pkg, user),
+                            _ => {
+                                let until = Instant::now() + timing.pending_for;
+                                table
+                                    .pending
+                                    .insert(serial.clone(), Pending { pkg, user, until });
+                            }
+                        }
+                    }
+                    if !table.plugged(&serial) {
+                        let name = names.get(&serial).unwrap_or_else(|| serial.clone());
+                        connect_event(
+                            connect_events.as_ref(),
+                            ConnectEvent::PlugIn { serial, name, app },
+                        );
+                    } else if wanted.as_deref() == Some(serial.as_str()) {
+                        // Already wanted: a start in backoff is retried now.
+                        if active.is_none() && starting.is_none() && retry_at.is_some() {
+                            failures = 0;
+                            retry_at = Some(Instant::now());
+                        }
+                    } else {
+                        if let Some(old) = release!("another phone connects") {
+                            tracing::info!(serial = old, "switched to another phone");
+                            table.set_live(&old, false);
+                        }
+                        wanted = Some(serial);
+                        retry_at = Some(Instant::now());
+                    }
+                }
+                Command::Disconnect { serial } => {
                     tracing::info!(serial, "disconnected in Lantern");
-                    // Paused first: nothing may restart it while the session closes.
-                    pause(&mut paused, serial);
-                    retry_at = None;
-                    failures = 0;
-                    cancel_start(&mut starting, "disconnected in Lantern");
-                    // `bye`: the helper restores the phone.
-                    close_session(&mut active, &mut hub).await;
-                    // Another online phone is served now.
-                    serve_next(
-                        configured.as_deref(),
-                        &connected,
-                        &paused,
-                        &mut retry_at,
-                        &mut failures,
-                    );
-                }
-                Command::Connect => {
-                    // Only the phone the view shows: a served phone hides the paused ones.
-                    if live.is_some() {
-                        tracing::info!("connect: a phone is already being served");
-                        continue;
+                    // Flags first: nothing may restart it while the session closes.
+                    table.set_off(&serial, true);
+                    table.set_live(&serial, false);
+                    table.last_off = Some(serial.clone());
+                    table.pending.remove(&serial);
+                    if wanted.as_deref() == Some(serial.as_str()) {
+                        // `bye`: the helper restores the phone.
+                        release!("disconnected in Lantern");
                     }
-                    if let Some(serial) = paused.pop() {
-                        tracing::info!(serial, "connected in Lantern");
-                    }
-                    serve_next(
-                        configured.as_deref(),
-                        &connected,
-                        &paused,
-                        &mut retry_at,
-                        &mut failures,
-                    );
                 }
-                Command::UndoSetup => {
+                Command::UndoSetup { serial } => {
                     let Some(run) = &undo else {
                         tracing::warn!("undo-setup is not available in this daemon");
                         continue;
                     };
-                    let serial = live
-                        .or_else(|| paused.last().cloned())
-                        .filter(|serial| connected.contains(serial));
-                    let Some(serial) = serial else {
-                        tracing::info!("undo-setup: no phone online");
+                    if !table.plugged(&serial) {
+                        tracing::info!(serial, "undo-setup: that phone is not plugged in");
                         continue;
-                    };
+                    }
                     tracing::info!(serial, "undo-setup requested");
-                    pause(&mut paused, serial.clone());
-                    retry_at = None;
-                    failures = 0;
-                    cancel_start(&mut starting, "undo-setup");
-                    // The helper's connection is closed before the undo runs; `run_steps`
-                    // itself waits for helper processes still restoring the phone.
-                    close_session(&mut active, &mut hub).await;
+                    table.set_off(&serial, true);
+                    table.set_live(&serial, false);
+                    table.last_off = Some(serial.clone());
+                    table.pending.remove(&serial);
+                    if wanted.as_deref() == Some(serial.as_str()) {
+                        // The helper's connection is closed before the undo runs; `run_steps`
+                        // itself waits for helper processes still restoring the phone.
+                        release!("undo-setup");
+                    }
                     undoing = Some((serial.clone(), run(serial)));
                 }
                 Command::Quit => unreachable!("Quit is handled when it arrives"),
             }
         }
-    }
-}
-
-/// Adds `serial` to `paused` as its most recent phone.
-fn pause(paused: &mut Vec<String>, serial: String) {
-    paused.retain(|s| *s != serial);
-    paused.push(serial);
-}
-
-/// Schedules a start now (a fresh backoff) if an online phone that is not paused is a target.
-/// Called only when nothing is live, starting or undoing.
-fn serve_next(
-    configured: Option<&str>,
-    connected: &[String],
-    paused: &[String],
-    retry_at: &mut Option<Instant>,
-    failures: &mut u32,
-) {
-    if let Some(serial) = target(configured, connected, paused, None) {
-        tracing::info!(serial, "next online phone");
-        *failures = 0;
-        *retry_at = Some(Instant::now());
     }
 }
 
@@ -784,6 +1035,35 @@ fn undo_runner() -> UndoRunner {
             (ok, String::from_utf8_lossy(&out).trim_end().to_owned())
         })
     })
+}
+
+/// Opens a connect-and-open request's app: `lantern open --phone S [--user N] -- pkg`, not
+/// waiting for the window (as the unlock prompt's reopen does).
+fn opener() -> Option<Opener> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            tracing::warn!(%error, "unknown lantern executable; requested apps won't open");
+            return None;
+        }
+    };
+    Some(Arc::new(move |serial: &str, pkg: &str, user: u32| {
+        let exe = exe.clone();
+        let args = unlock::reopen_args(pkg, user, Some(serial));
+        let pkg = pkg.to_owned();
+        tokio::spawn(async move {
+            // desktop::spawn's systemctl lookup blocks: keep it off the async workers.
+            let spawned =
+                tokio::task::spawn_blocking(move || crate::desktop::spawn(&exe, &args)).await;
+            match spawned {
+                Ok(Ok(mut child)) => {
+                    let _ = child.wait().await;
+                }
+                Ok(Err(error)) => tracing::warn!(%error, pkg, "could not open the requested app"),
+                Err(error) => tracing::warn!(%error, pkg, "open task failed"),
+            }
+        });
+    }))
 }
 
 /// The catalogue lanternd serves from: the one-time menu migration ([`catalog::migrate`]) runs
@@ -876,11 +1156,7 @@ pub async fn run() -> Result<()> {
     // The tray: it reads the view and sends commands, never waiting on the run loop. Without
     // a session bus the sender is dropped here and the loop simply gets no tray commands.
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
-    let (view_tx, view_rx) = watch::channel(View {
-        phone: Phone::None,
-        name: None,
-        locked: false,
-    });
+    let (view_tx, view_rx) = watch::channel(View::default());
     // The unlock prompt on its own bus connection: PINs come back on `pin_rx` (one at a time),
     // lock events go to it. Without a session bus there is neither.
     let (pin_tx, pin_rx) = mpsc::channel::<(String, unlock::Pin)>(1);
@@ -892,6 +1168,14 @@ pub async fn run() -> Result<()> {
     };
     // The tray's Unlock row asks the same prompt (it never runs the dialog or sees a PIN).
     crate::tray::spawn(view_rx, settings.clone(), cmd_tx, request).await;
+    let mut timing = Timing::default();
+    if let Some(ms) = std::env::var("LANTERN_UNPLUG_GRACE_MS")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        tracing::info!(ms, "unplug grace from LANTERN_UNPLUG_GRACE_MS");
+        timing.unplug_grace = Duration::from_millis(ms);
+    }
     serve_with(
         listener,
         Parts {
@@ -907,6 +1191,11 @@ pub async fn run() -> Result<()> {
             view: Some(view_tx),
             unlock,
             lock_events,
+            state_dir: companion::state_dir(),
+            timing,
+            // The connect prompt comes with the plugged-in notifications.
+            connect_events: None,
+            opener: opener(),
         },
         configured,
         track_devices(),
@@ -925,64 +1214,6 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn online(serials: &[&str]) -> Vec<String> {
-        serials.iter().map(|serial| (*serial).to_owned()).collect()
-    }
-
-    #[test]
-    fn configured_serial_wins_over_single_device_default() {
-        assert_eq!(
-            select_serial(Some("chosen"), &online(&["only"]), None),
-            Some("chosen".into())
-        );
-    }
-
-    #[test]
-    fn unset_serial_uses_only_device() {
-        assert_eq!(
-            select_serial(None, &online(&["only"]), None),
-            Some("only".into())
-        );
-    }
-
-    #[test]
-    fn select_serial_prefers_current_then_first_online() {
-        assert_eq!(
-            select_serial(None, &online(&["b", "a"]), Some("a")),
-            Some("a".into())
-        );
-        assert_eq!(
-            select_serial(None, &online(&["b", "a"]), None),
-            Some("b".into())
-        );
-        assert_eq!(select_serial(None, &online(&[]), None), None);
-        assert_eq!(
-            select_serial(Some("x"), &online(&["a"]), None),
-            Some("x".into())
-        );
-        // A current phone that went offline gives way to the first online one.
-        assert_eq!(
-            select_serial(None, &online(&["b"]), Some("a")),
-            Some("b".into())
-        );
-    }
-
-    #[test]
-    fn target_skips_the_paused_phone() {
-        let both = online(&["a", "b"]);
-        let a = online(&["a"]);
-        assert_eq!(target(None, &both, &[], None), Some("a".into()));
-        assert_eq!(target(None, &both, &a, None), Some("b".into()));
-        assert_eq!(target(None, &both, &a, Some("a")), Some("b".into()));
-        assert_eq!(target(None, &a, &a, None), None);
-        // Every paused phone is skipped.
-        assert_eq!(target(None, &both, &online(&["b", "a"]), None), None);
-        // A configured phone is the only target: paused or offline means none.
-        assert_eq!(target(Some("a"), &both, &a, None), None);
-        assert_eq!(target(Some("x"), &both, &[], None), None);
-        assert_eq!(target(Some("b"), &both, &a, None), Some("b".into()));
-    }
 
     #[test]
     fn exit_code_separates_protocol_mismatch_from_runtime_failures() {

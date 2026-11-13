@@ -3,7 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 const USAGE: &str =
     "usage: lantern daemon | lantern open [--phone <serial>] [--user <android-user>] <package> \
-     | lantern status | lantern connect | lantern disconnect \
+     | lantern status | lantern connect [<serial>] | lantern disconnect [<serial>] \
      | lantern undo-setup [--serial <serial>]";
 
 /// Exit statuses: 0 ok, 1 runtime failure, 2 usage error, 3 (`daemon` only) helper protocol
@@ -65,16 +65,20 @@ fn cli() -> Result<u8> {
             };
             Ok(runtime(run(), |_| 1))
         }
-        [cmd @ ("connect" | "disconnect")] => {
+        [cmd @ ("connect" | "disconnect"), rest @ ..] if rest.len() <= 1 => {
             use lantern::daemon::ipc;
             use lantern_proto::DaemonCmd;
             let cmd = match *cmd {
                 "connect" => DaemonCmd::Connect,
                 _ => DaemonCmd::Disconnect,
             };
+            let serial = rest.first().copied();
+            if serial.is_some_and(|s| s.is_empty() || s.starts_with('-')) {
+                bail!("{USAGE}");
+            }
             let run = || -> Result<u8> {
                 let sock = ipc::socket_path_in(&ipc::runtime_dir()?);
-                let report = ipc::send_daemon_cmd(&sock, cmd)?;
+                let report = ipc::send_daemon_cmd(&sock, cmd, serial)?;
                 println!("{}", serde_json::to_string(&report)?);
                 Ok(0)
             };

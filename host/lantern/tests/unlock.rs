@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lantern::daemon::control::{Phone, View};
+use lantern::daemon::control::{PhoneView, View};
 use lantern::unlock::{self, LockEvent, Pin, Prompt};
-use lantern_proto::{CompanionState, LockReason};
+use lantern_proto::{CompanionState, LockReason, PhoneState};
 use tokio::sync::{mpsc, watch};
 use zbus::zvariant::OwnedValue;
 use zbus::{connection, Connection};
@@ -152,12 +152,15 @@ const NOTES_PATH: &str = "/org/freedesktop/Notifications";
 
 fn locked_view() -> View {
     View {
-        phone: Phone::Ready {
+        phones: vec![PhoneView {
             serial: "s1".into(),
+            name: Some("Test Phone".into()),
+            state: PhoneState::Ready,
+            plugged: true,
+            off: false,
+            locked: true,
             companion: Some((CompanionState::Ready, None)),
-        },
-        name: Some("Test Phone".into()),
-        locked: true,
+        }],
     }
 }
 
@@ -541,11 +544,8 @@ async fn pin_is_tagged_with_the_phone_clicked() {
     rig.click(id, "unlock").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     rig.view.send_modify(|view| {
-        view.phone = Phone::Ready {
-            serial: "s2".into(),
-            companion: None,
-        };
-        view.name = Some("Other".into());
+        view.phones[0].serial = "s2".into();
+        view.phones[0].name = Some("Other".into());
     });
     let (serial, got) = rig.next_tagged_pin().await;
     assert_eq!(serial, "s1");

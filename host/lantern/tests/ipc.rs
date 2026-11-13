@@ -1427,6 +1427,8 @@ async fn clipboard_off_syncs_nothing_either_way() {
     let (offers, offers_rx) = mpsc::channel(8);
     let path = runtime_dir().join("config").join("settings.toml");
     let settings = SettingsHandle::new(Some(path));
+    // A real settings file defaults to autoconnect off: switch it on so `dev` connects.
+    settings.set(Key::Autoconnect, true).unwrap();
     let daemon = start_daemon_parts(
         Some(port),
         Parts {
@@ -1663,8 +1665,11 @@ async fn open_of_other_phones_app_is_refused_after_sync() {
 
 // --- daemon control: Connect, Disconnect, Undo, Quit -----------------------------------------
 
-use lantern::daemon::control::{Command, Phone, UndoRunner, View};
-use lantern_proto::DaemonCmd;
+use lantern::daemon::companion;
+use lantern::daemon::control::{Command, ConnectEvent, Opener, PhoneView, UndoRunner, View};
+use lantern::daemon::phones::Timing;
+use lantern::settings::Settings;
+use lantern_proto::{DaemonCmd, PhoneState};
 use tokio::sync::watch;
 
 /// An in-process daemon whose device events, commands and view the test drives and reads.
@@ -1677,8 +1682,54 @@ struct Ctl {
     lookups: Arc<AtomicUsize>,
     /// The (summary, body) of every notification.
     notes: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// What the connect prompt got.
+    connect: mpsc::Receiver<ConnectEvent>,
+    /// Every `(serial, pkg, user)` the opener was asked to open.
+    opened: Arc<std::sync::Mutex<Vec<(String, String, u32)>>>,
+    /// The daemon's settings (`autoconnect`), if it has any.
+    settings: Option<SettingsHandle>,
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<anyhow::Result<()>>,
+}
+
+/// How a [`Ctl`] daemon is set up beyond its online phones.
+#[derive(Default)]
+struct Opts {
+    undo: Option<UndoRunner>,
+    /// The device records; `None`: flags in memory only.
+    state_dir: Option<PathBuf>,
+    /// `Some`: a settings part with this `autoconnect`; `None`: no settings (autoconnect on).
+    autoconnect: Option<bool>,
+    /// `None`: the default timing (10 s grace).
+    timing: Option<Timing>,
+    /// `$LANTERN_SERIAL`.
+    configured: Option<String>,
+}
+
+/// A 300 ms unplug grace and a 2 s connect-and-open window.
+fn fast_timing() -> Timing {
+    Timing {
+        unplug_grace: Duration::from_millis(300),
+        pending_for: Duration::from_secs(2),
+    }
+}
+
+/// Opts for the connect-rule tests: records in `state`, `autoconnect`, fast timing.
+fn rules(state: &Path, autoconnect: bool) -> Opts {
+    Opts {
+        state_dir: Some(state.to_owned()),
+        autoconnect: Some(autoconnect),
+        timing: Some(fast_timing()),
+        ..Default::default()
+    }
+}
+
+/// A fresh scratch state dir (never the real `~/.local/state/lantern`).
+fn scratch_state() -> PathBuf {
+    let n = DIRS.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("lantern-ipc-state-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 /// Every session goes to the fake helper on `port`, whichever serial it is for. The phone
@@ -1694,6 +1745,18 @@ fn start_ctl_with(
     undo: Option<UndoRunner>,
     more: impl FnOnce(&mut Parts),
 ) -> Ctl {
+    start_ctl_opts(
+        port,
+        online,
+        Opts {
+            undo,
+            ..Default::default()
+        },
+        more,
+    )
+}
+
+fn start_ctl_opts(port: u16, online: &[&str], opts: Opts, more: impl FnOnce(&mut Parts)) -> Ctl {
     let rt = runtime_dir();
     let listener = ipc::bind(&rt).unwrap();
     let sock = ipc::socket_path_in(&rt);
@@ -1705,15 +1768,26 @@ fn start_ctl_with(
         rx.recv().await.map(|event| (event, rx))
     });
     let (cmds, cmds_rx) = mpsc::channel(8);
-    let (view_tx, view) = watch::channel(View {
-        phone: Phone::None,
-        name: None,
-        locked: false,
-    });
+    let (view_tx, view) = watch::channel(View::default());
     let lookups = Arc::new(AtomicUsize::new(0));
     let counted = lookups.clone();
     let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let noted = notes.clone();
+    let (connect_tx, connect) = mpsc::channel(32);
+    let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let opens = opened.clone();
+    let opener: Opener = Arc::new(move |serial: &str, pkg: &str, user: u32| {
+        opens
+            .lock()
+            .unwrap()
+            .push((serial.to_owned(), pkg.to_owned(), user));
+    });
+    let settings = opts.autoconnect.map(|autoconnect| {
+        SettingsHandle::fixed(Settings {
+            autoconnect,
+            ..Settings::default()
+        })
+    });
     let mut parts = Parts {
         commands: Some(cmds_rx),
         view: Some(view_tx),
@@ -1721,13 +1795,18 @@ fn start_ctl_with(
             counted.fetch_add(1, Ordering::SeqCst);
             (serial == "dev").then(|| "Pixel".to_owned())
         })),
-        undo,
+        undo: opts.undo,
         notify: Some(Arc::new(move |summary: &str, body: &str| {
             noted
                 .lock()
                 .unwrap()
                 .push((summary.to_owned(), body.to_owned()));
         })),
+        settings: settings.clone(),
+        state_dir: opts.state_dir,
+        timing: opts.timing.unwrap_or_default(),
+        connect_events: Some(connect_tx),
+        opener: Some(opener),
         ..Default::default()
     };
     more(&mut parts);
@@ -1740,7 +1819,7 @@ fn start_ctl_with(
     let task = tokio::spawn(serve_with(
         listener,
         parts,
-        None,
+        opts.configured,
         events_rx,
         starter,
         async move {
@@ -1756,8 +1835,44 @@ fn start_ctl_with(
         view,
         lookups,
         notes,
+        connect,
+        opened,
+        settings,
         stop: Some(stop),
         task,
+    }
+}
+
+fn connect(serial: &str) -> Command {
+    Command::Connect {
+        serial: serial.into(),
+        open: None,
+    }
+}
+
+fn connect_and_open(serial: &str, pkg: &str, user: u32) -> Command {
+    Command::Connect {
+        serial: serial.into(),
+        open: Some((pkg.into(), user)),
+    }
+}
+
+fn disconnect(serial: &str) -> Command {
+    Command::Disconnect {
+        serial: serial.into(),
+    }
+}
+
+fn undo_setup(serial: &str) -> Command {
+    Command::UndoSetup {
+        serial: serial.into(),
+    }
+}
+
+fn plugged_in(serial: &str, name: &str) -> ConnectEvent {
+    ConnectEvent::PluggedIn {
+        serial: serial.into(),
+        name: name.into(),
     }
 }
 
@@ -1778,17 +1893,61 @@ impl Ctl {
             .unwrap();
     }
 
-    /// Waits until the view's phone matches.
-    async fn view_until(&mut self, ok: impl Fn(&Phone) -> bool) -> View {
-        let matched = timeout(STEP, self.view.wait_for(|v| ok(&v.phone)))
+    /// The view's entry for `serial` now.
+    fn phone(&self, serial: &str) -> Option<PhoneView> {
+        self.view.borrow().phone(serial).cloned()
+    }
+
+    /// Waits until the view matches.
+    async fn view_until(&mut self, ok: impl Fn(&View) -> bool) -> View {
+        let matched = timeout(STEP, self.view.wait_for(|v| ok(v)))
             .await
             .map(|view| view.unwrap().clone());
         matched.unwrap_or_else(|_| panic!("view never matched: {:?}", *self.view.borrow()))
     }
 
-    async fn ready(&mut self, serial: &str) -> View {
-        self.view_until(|p| matches!(p, Phone::Ready { serial: s, .. } if s == serial))
+    /// Waits until `serial` is in `state`; returns its entry.
+    async fn state_until(&mut self, serial: &str, state: PhoneState) -> PhoneView {
+        let view = self
+            .view_until(|v| v.phone(serial).is_some_and(|p| p.state == state))
+            .await;
+        view.phone(serial).unwrap().clone()
+    }
+
+    async fn ready(&mut self, serial: &str) -> PhoneView {
+        self.state_until(serial, PhoneState::Ready).await
+    }
+
+    /// The next connect event.
+    async fn event(&mut self) -> ConnectEvent {
+        timeout(STEP, self.connect.recv())
             .await
+            .expect("no connect event")
+            .unwrap()
+    }
+
+    /// Every connect event within 300 ms.
+    async fn events_for_a_while(&mut self) -> Vec<ConnectEvent> {
+        let mut got = Vec::new();
+        while let Ok(Some(event)) = timeout(Duration::from_millis(300), self.connect.recv()).await {
+            got.push(event);
+        }
+        got
+    }
+
+    /// No prompt (`PluggedIn`/`PlugIn`) arrives for a while; `Gone`s are fine.
+    async fn assert_no_prompt(&mut self) {
+        let events = self.events_for_a_while().await;
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e, ConnectEvent::Gone { .. })),
+            "unexpected prompt: {events:?}"
+        );
+    }
+
+    fn opened(&self) -> Vec<(String, String, u32)> {
+        self.opened.lock().unwrap().clone()
     }
 
     async fn shutdown(mut self) {
@@ -1801,9 +1960,21 @@ impl Ctl {
     }
 }
 
-fn paused(serial: &str) -> Phone {
-    Phone::Paused {
-        serial: serial.into(),
+/// `serial`'s record flags `(off, live)` (absent record: both false).
+fn flags(state: &Path, serial: &str) -> (bool, bool) {
+    companion::read_record(state, serial).map_or((false, false), |r| (r.off, r.live))
+}
+
+/// Polls the record until `ok` holds.
+async fn record_until(state: &Path, serial: &str, ok: impl Fn((bool, bool)) -> bool) {
+    let deadline = Instant::now() + STEP;
+    while !ok(flags(state, serial)) {
+        assert!(
+            Instant::now() < deadline,
+            "record never matched: {:?}",
+            companion::read_record(state, serial)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1822,6 +1993,7 @@ async fn expect_bye(helper: &mut FakeHelper) {
     helper.die();
 }
 
+/// A Disconnect switches the phone off; it stays off after a replug (autoconnect on).
 #[tokio::test]
 async fn disconnect_pauses_until_replug() {
     let (mut helper, port) = FakeHelper::spawn().await;
@@ -1830,22 +2002,26 @@ async fn disconnect_pauses_until_replug() {
     let ready = ctl.ready("dev").await;
     assert_eq!(ready.name.as_deref(), Some("Pixel"));
 
-    ctl.command(Command::Disconnect).await;
+    ctl.command(disconnect("dev")).await;
     expect_bye(&mut helper).await;
-    let view = ctl.view_until(|p| *p == paused("dev")).await;
-    assert_eq!(view.name.as_deref(), Some("Pixel"));
+    let off = ctl.state_until("dev", PhoneState::Off).await;
+    assert_eq!(off.name.as_deref(), Some("Pixel"));
+    assert!(off.off);
     let report = status(&ctl.sock).await;
     assert_eq!(
         (report.state, report.serial.as_deref()),
         (SessionState::Paused, Some("dev"))
     );
     assert_no_session(&mut helper).await;
-    assert_eq!(status(&ctl.sock).await.state, SessionState::Paused);
 
-    // Unplug and replug: served again.
+    // Unplug and replug: still off.
     ctl.offline("dev");
-    ctl.view_until(|p| *p == Phone::None).await;
+    ctl.state_until("dev", PhoneState::Unplugged).await;
     ctl.online("dev");
+    ctl.state_until("dev", PhoneState::Off).await;
+    assert_no_session(&mut helper).await;
+    // Connect serves it again.
+    ctl.command(connect("dev")).await;
     assert_eq!(helper.next_session().await, 1);
     ctl.ready("dev").await;
     // The name is cached, not read from the device record on every loop turn.
@@ -1853,7 +2029,7 @@ async fn disconnect_pauses_until_replug() {
         status(&ctl.sock).await;
     }
     let lookups = ctl.lookups.load(Ordering::SeqCst);
-    assert!(lookups <= 6, "names looked up {lookups} times");
+    assert!(lookups <= 8, "names looked up {lookups} times");
     ctl.shutdown().await;
 }
 
@@ -1863,19 +2039,23 @@ async fn online_while_paused_starts_nothing() {
     let mut ctl = start_ctl(port, &["dev"], None);
     helper.next_session().await;
     ctl.ready("dev").await;
-    ctl.command(Command::Disconnect).await;
+    ctl.command(disconnect("dev")).await;
     expect_bye(&mut helper).await;
-    ctl.view_until(|p| *p == paused("dev")).await;
+    ctl.state_until("dev", PhoneState::Off).await;
     // adb reports the phone again (e.g. track-devices reconnected) without an Offline.
     ctl.online("dev");
     assert_no_session(&mut helper).await;
     assert_eq!(
-        *ctl.view.borrow(),
-        View {
-            phone: paused("dev"),
+        ctl.phone("dev"),
+        Some(PhoneView {
+            serial: "dev".into(),
             name: Some("Pixel".into()),
-            locked: false
-        }
+            state: PhoneState::Off,
+            plugged: true,
+            off: true,
+            locked: false,
+            companion: None,
+        })
     );
     assert_eq!(status(&ctl.sock).await.state, SessionState::Paused);
     ctl.shutdown().await;
@@ -1887,12 +2067,13 @@ async fn connect_resumes_after_disconnect() {
     let mut ctl = start_ctl(port, &["dev"], None);
     helper.next_session().await;
     ctl.ready("dev").await;
-    ctl.command(Command::Disconnect).await;
+    ctl.command(disconnect("dev")).await;
     expect_bye(&mut helper).await;
-    ctl.view_until(|p| *p == paused("dev")).await;
-    ctl.command(Command::Connect).await;
+    ctl.state_until("dev", PhoneState::Off).await;
+    ctl.command(connect("dev")).await;
     assert_eq!(helper.next_session().await, 1);
-    ctl.ready("dev").await;
+    let ready = ctl.ready("dev").await;
+    assert!(!ready.off);
     status_until(&ctl.sock, |r| r.state == SessionState::Ready).await;
     ctl.shutdown().await;
 }
@@ -1946,10 +2127,9 @@ async fn undo_runs_without_a_session() {
     helper.next_session().await;
     ctl.ready("dev").await;
 
-    ctl.command(Command::UndoSetup).await;
+    ctl.command(undo_setup("dev")).await;
     assert_eq!(decode(&helper.next().await), Control::Bye);
-    ctl.view_until(|p| matches!(p, Phone::Undoing { serial } if serial == "dev"))
-        .await;
+    ctl.state_until("dev", PhoneState::Undoing).await;
     let (serial, closed) = timeout(STEP, calls.recv()).await.unwrap().unwrap();
     assert_eq!(serial, "dev");
     assert!(closed, "undo ran while the helper connection was open");
@@ -1958,14 +2138,14 @@ async fn undo_runs_without_a_session() {
     helper.die();
 
     // Ignored while undoing.
-    ctl.command(Command::Connect).await;
-    ctl.command(Command::Disconnect).await;
-    ctl.command(Command::UndoSetup).await;
+    ctl.command(connect("dev")).await;
+    ctl.command(disconnect("dev")).await;
+    ctl.command(undo_setup("dev")).await;
     assert_no_session(&mut helper).await;
-    assert!(matches!(ctl.view.borrow().phone, Phone::Undoing { .. }));
+    assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Undoing);
 
     release.add_permits(1);
-    ctl.view_until(|p| *p == paused("dev")).await;
+    ctl.state_until("dev", PhoneState::Off).await;
     assert_no_session(&mut helper).await;
     assert!(calls.try_recv().is_err(), "undo ran once");
     assert_eq!(
@@ -1976,7 +2156,7 @@ async fn undo_runs_without_a_session() {
         )]
     );
     // Connect afterwards sets the phone up again.
-    ctl.command(Command::Connect).await;
+    ctl.command(connect("dev")).await;
     assert_eq!(helper.next_session().await, 1);
     ctl.ready("dev").await;
     ctl.shutdown().await;
@@ -1997,8 +2177,8 @@ async fn quit_waits_for_a_running_undo() {
     let mut ctl = start_ctl(port, &["dev"], Some(undo));
     helper.next_session().await;
     ctl.ready("dev").await;
-    ctl.command(Command::UndoSetup).await;
-    ctl.view_until(|p| matches!(p, Phone::Undoing { .. })).await;
+    ctl.command(undo_setup("dev")).await;
+    ctl.state_until("dev", PhoneState::Undoing).await;
     ctl.command(Command::Quit).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!ctl.task.is_finished(), "Quit must wait for the undo");
@@ -2023,9 +2203,9 @@ async fn open_while_paused_gets_paused_error() {
     let mut ctl = start_ctl(port, &["dev"], None);
     helper.next_session().await;
     ctl.ready("dev").await;
-    ctl.command(Command::Disconnect).await;
+    ctl.command(disconnect("dev")).await;
     expect_bye(&mut helper).await;
-    ctl.view_until(|p| *p == paused("dev")).await;
+    ctl.state_until("dev", PhoneState::Off).await;
     let mut client = UnixStream::connect(&ctl.sock).await.unwrap();
     send(&mut client, &open("com.x", 0, None)).await;
     let reply = recv(&mut client).await.expect("an error reply");
@@ -2035,20 +2215,31 @@ async fn open_while_paused_gets_paused_error() {
     ctl.shutdown().await;
 }
 
-/// `lantern connect|disconnect` over the socket.
-async fn daemon_cmd(sock: &Path, cmd: DaemonCmd) -> StatusReport {
+/// `lantern connect|disconnect [<serial>]` over the socket: the daemon's reply.
+async fn daemon_cmd_reply(sock: &Path, cmd: DaemonCmd, serial: Option<&str>) -> Control {
     let mut client = UnixStream::connect(sock).await.unwrap();
     send(
         &mut client,
-        &control(0, Control::Daemon { cmd, serial: None }),
+        &control(
+            0,
+            Control::Daemon {
+                cmd,
+                serial: serial.map(str::to_owned),
+            },
+        ),
     )
     .await;
-    let reply = recv(&mut client).await.expect("a status report");
-    let Control::StatusReport(report) = decode(&reply) else {
-        panic!("expected status_report, got {:?}", decode(&reply));
-    };
+    let reply = recv(&mut client).await.expect("a reply");
     assert_eof(&mut client).await;
-    report
+    decode(&reply)
+}
+
+/// `lantern connect|disconnect` for the only plugged-in phone.
+async fn daemon_cmd(sock: &Path, cmd: DaemonCmd) -> StatusReport {
+    match daemon_cmd_reply(sock, cmd, None).await {
+        Control::StatusReport(report) => report,
+        other => panic!("expected status_report, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2060,13 +2251,13 @@ async fn daemon_cmd_over_socket() {
     let report = daemon_cmd(&ctl.sock, DaemonCmd::Disconnect).await;
     assert_eq!(report.serial.as_deref(), Some("dev"));
     expect_bye(&mut helper).await;
-    ctl.view_until(|p| *p == paused("dev")).await;
+    ctl.state_until("dev", PhoneState::Off).await;
     let report = status_until(&ctl.sock, |r| r.state == SessionState::Paused).await;
     assert_eq!(report.serial.as_deref(), Some("dev"));
     // The blocking client `lantern connect` uses.
     let sock = ctl.sock.clone();
     let reply =
-        tokio::task::spawn_blocking(move || ipc::send_daemon_cmd(&sock, DaemonCmd::Connect))
+        tokio::task::spawn_blocking(move || ipc::send_daemon_cmd(&sock, DaemonCmd::Connect, None))
             .await
             .unwrap()
             .unwrap();
@@ -2096,99 +2287,426 @@ async fn daemon_cmd_over_socket() {
     ctl.shutdown().await;
 }
 
-/// R4: the live phone goes away while another is online: the next one is served at once.
+/// Review Focus 2: with autoconnect off a plugged-in phone waits and Lantern asks once.
 #[tokio::test]
-async fn offline_of_live_phone_starts_the_next_online_phone() {
+async fn autoconnect_off_waits_and_prompts() {
     let (mut helper, port) = FakeHelper::spawn().await;
-    let mut ctl = start_ctl(port, &["a", "b"], None);
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    ctl.state_until("dev", PhoneState::Waiting).await;
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.events_for_a_while().await, [], "one prompt per plug-in");
+    assert_eq!(status(&ctl.sock).await.state, SessionState::Idle);
+    ctl.command(connect("dev")).await;
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    assert_eq!(
+        ctl.event().await,
+        ConnectEvent::Gone {
+            serial: "dev".into()
+        }
+    );
+    assert_eq!(flags(&state, "dev"), (false, true));
+    ctl.shutdown().await;
+}
+
+#[tokio::test]
+async fn autoconnect_on_connects_unless_off() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, true), |_| {});
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    ctl.command(disconnect("dev")).await;
+    expect_bye(&mut helper).await;
+    ctl.state_until("dev", PhoneState::Off).await;
+    assert_eq!(flags(&state, "dev"), (true, false));
+    // Unplugged longer than the grace, then plugged in: nothing, not even a prompt.
+    ctl.offline("dev");
+    tokio::time::sleep(2 * fast_timing().unplug_grace).await;
+    ctl.online("dev");
+    ctl.state_until("dev", PhoneState::Off).await;
+    assert_no_session(&mut helper).await;
+    ctl.assert_no_prompt().await;
+    ctl.shutdown().await;
+    // A new daemon on the same records: still off.
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, true), |_| {});
+    ctl.state_until("dev", PhoneState::Off).await;
+    assert_no_session(&mut helper).await;
+    ctl.assert_no_prompt().await;
+    ctl.command(connect("dev")).await;
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("dev").await;
+    assert_eq!(flags(&state, "dev"), (false, true));
+    ctl.shutdown().await;
+}
+
+/// A restart (stop signal) keeps `live`: the phone reconnects without asking.
+#[tokio::test]
+async fn live_flag_reconnects_after_restart_without_prompt() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    ctl.command(connect("dev")).await;
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    ctl.shutdown().await;
+    expect_bye(&mut helper).await;
+    assert_eq!(flags(&state, "dev"), (false, true), "a stop keeps live");
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("dev").await;
+    ctl.assert_no_prompt().await;
+    ctl.shutdown().await;
+}
+
+#[tokio::test]
+async fn quit_clears_live() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, true), |_| {});
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    assert_eq!(flags(&state, "dev"), (false, true));
+    ctl.command(Command::Quit).await;
+    timeout(Duration::from_secs(5), &mut ctl.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(flags(&state, "dev"), (false, false));
+}
+
+/// Autoconnect is read at plug-in: switching it on connects nothing until the next one.
+#[tokio::test]
+async fn autoconnect_switched_on_connects_nothing_now() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    ctl.state_until("dev", PhoneState::Waiting).await;
+    ctl.settings
+        .as_ref()
+        .unwrap()
+        .set(lantern::settings::Key::Autoconnect, true)
+        .unwrap();
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Waiting);
+    ctl.offline("dev");
+    ctl.online("dev");
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    ctl.shutdown().await;
+}
+
+/// Review Focus 4: offline and back within the grace reconnects without asking.
+#[tokio::test]
+async fn blip_never_prompts() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    ctl.command(connect("dev")).await;
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    for round in 1..=3 {
+        ctl.offline("dev");
+        expect_bye(&mut helper).await;
+        ctl.state_until("dev", PhoneState::Reconnecting).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ctl.online("dev");
+        assert_eq!(helper.next_session().await, round);
+        ctl.ready("dev").await;
+    }
+    ctl.assert_no_prompt().await;
+    assert_eq!(flags(&state, "dev"), (false, true));
+    ctl.shutdown().await;
+}
+
+#[tokio::test]
+async fn unplug_beyond_grace_clears_live() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    ctl.command(connect("dev")).await;
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    ctl.offline("dev");
+    expect_bye(&mut helper).await;
+    ctl.state_until("dev", PhoneState::Reconnecting).await;
+    ctl.state_until("dev", PhoneState::Unplugged).await;
+    record_until(&state, "dev", |(_, live)| !live).await;
+    while let Ok(event) = ctl.connect.try_recv() {
+        assert!(matches!(event, ConnectEvent::Gone { .. }), "{event:?}");
+    }
+    ctl.online("dev");
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
+
+/// Review Focus 2: a stale `live` flag (the phone stayed away for the grace after start) is
+/// cleared, so plugging it in later asks.
+#[tokio::test]
+async fn stale_live_flag_cleared_when_absent_at_start() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    companion::set_live(&state, "dev", true).unwrap();
+    let mut ctl = start_ctl_opts(port, &[], rules(&state, false), |_| {});
+    ctl.state_until("dev", PhoneState::Unplugged).await;
+    record_until(&state, "dev", |(_, live)| !live).await;
+    ctl.online("dev");
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Waiting);
+    ctl.shutdown().await;
+}
+
+/// `LANTERN_SERIAL`: that phone connects even off with autoconnect off; others are ignored.
+#[tokio::test]
+async fn configured_serial_bypasses_autoconnect_and_off() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    companion::set_off(&state, "dev", true).unwrap();
+    let mut opts = rules(&state, false);
+    opts.configured = Some("dev".into());
+    let mut ctl = start_ctl_opts(port, &["dev"], opts, |_| {});
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    ctl.online("b");
+    assert_no_session(&mut helper).await;
+    let events = ctl.events_for_a_while().await;
+    assert!(
+        events
+            .iter()
+            .all(|e| matches!(e, ConnectEvent::Gone { serial } if serial == "dev")),
+        "{events:?}"
+    );
+    assert_eq!(ctl.phone("b"), None);
+    assert_eq!(ctl.view.borrow().phones.len(), 1);
+    // Commands for another phone are ignored too.
+    ctl.command(connect("b")).await;
+    helper.assert_quiet().await;
+    assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Ready);
+    ctl.shutdown().await;
+}
+
+/// One phone live: checking b closes a without switching a off.
+#[tokio::test]
+async fn checking_b_switches_a_off_without_off_flag() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev", "b"], rules(&state, true), |_| {});
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    // b came online with dev wanted: asked, not connected (decision 4).
+    ctl.state_until("b", PhoneState::Waiting).await;
+    ctl.command(connect("b")).await;
+    expect_bye(&mut helper).await;
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("b").await;
+    assert_eq!(flags(&state, "dev"), (false, false));
+    assert_eq!(flags(&state, "b"), (false, true));
+    assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Waiting);
+    let events = ctl.events_for_a_while().await;
+    assert!(events.contains(&plugged_in("b", "b")), "{events:?}");
+    ctl.shutdown().await;
+}
+
+/// The live phone unplugged for good: the other plugged phone is not started.
+#[tokio::test]
+async fn live_phone_gone_starts_nothing() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["a", "b"], rules(&state, true), |_| {});
     assert_eq!(helper.next_session().await, 0);
     ctl.ready("a").await;
     ctl.offline("a");
     expect_bye(&mut helper).await;
-    assert_eq!(helper.next_session().await, 1);
-    let view = ctl.ready("b").await;
-    assert_eq!(view.name, None, "b has no recorded name");
-    ctl.shutdown().await;
-}
-
-/// A paused phone is never the next target: the next online phone that is not paused is.
-#[tokio::test]
-async fn offline_of_live_phone_skips_a_paused_phone() {
-    let (mut helper, port) = FakeHelper::spawn().await;
-    let mut ctl = start_ctl(port, &["a"], None);
-    assert_eq!(helper.next_session().await, 0);
-    ctl.ready("a").await;
-    ctl.command(Command::Disconnect).await;
-    expect_bye(&mut helper).await;
-    ctl.view_until(|p| *p == paused("a")).await;
-    // b comes online: a is paused, so b is served.
-    ctl.online("b");
-    assert_eq!(helper.next_session().await, 1);
-    ctl.ready("b").await;
-    ctl.online("c");
-    ctl.offline("b");
-    expect_bye(&mut helper).await;
-    assert_eq!(helper.next_session().await, 2);
-    ctl.ready("c").await;
-    let report = status(&ctl.sock).await;
-    assert_eq!(report.serial.as_deref(), Some("c"));
-    ctl.shutdown().await;
-}
-
-/// Every disconnected phone stays disconnected: pausing a second phone does not un-pause the
-/// first, so unplugging the second starts nothing.
-#[tokio::test]
-async fn second_disconnect_keeps_the_first_phone_paused() {
-    let (mut helper, port) = FakeHelper::spawn().await;
-    let mut ctl = start_ctl(port, &["a"], None);
-    assert_eq!(helper.next_session().await, 0);
-    ctl.ready("a").await;
-    ctl.command(Command::Disconnect).await;
-    expect_bye(&mut helper).await;
-    ctl.view_until(|p| *p == paused("a")).await;
-    ctl.online("b");
-    assert_eq!(helper.next_session().await, 1);
-    ctl.ready("b").await;
-    ctl.command(Command::Disconnect).await;
-    expect_bye(&mut helper).await;
-    // The most recent disconnected phone is shown.
-    ctl.view_until(|p| *p == paused("b")).await;
-    ctl.offline("b");
-    ctl.view_until(|p| *p == paused("a")).await;
+    ctl.state_until("a", PhoneState::Unplugged).await;
     assert_no_session(&mut helper).await;
-    assert_eq!(ctl.view.borrow().phone, paused("a"));
-    let report = status(&ctl.sock).await;
-    assert_eq!(
-        (report.state, report.serial.as_deref()),
-        (SessionState::Paused, Some("a"))
-    );
-    // Connect resumes the phone shown.
-    ctl.command(Command::Connect).await;
-    assert_eq!(helper.next_session().await, 2);
-    ctl.ready("a").await;
+    assert_eq!(ctl.phone("b").unwrap().state, PhoneState::Waiting);
+    assert_eq!(status(&ctl.sock).await.state, SessionState::Idle);
     ctl.shutdown().await;
 }
 
-/// Disconnect with another phone online: that phone is served at once.
+/// Two-phone rule: each phone's `off` is its own; neither starts after both replug.
 #[tokio::test]
-async fn disconnect_starts_the_other_online_phone() {
+async fn per_phone_off_flags_are_independent() {
     let (mut helper, port) = FakeHelper::spawn().await;
-    let mut ctl = start_ctl(port, &["a", "b"], None);
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["a"], rules(&state, true), |_| {});
     assert_eq!(helper.next_session().await, 0);
     ctl.ready("a").await;
-    ctl.command(Command::Disconnect).await;
+    ctl.command(disconnect("a")).await;
+    expect_bye(&mut helper).await;
+    ctl.state_until("a", PhoneState::Off).await;
+    ctl.online("b");
+    ctl.command(connect("b")).await;
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("b").await;
+    ctl.command(disconnect("b")).await;
+    expect_bye(&mut helper).await;
+    ctl.state_until("b", PhoneState::Off).await;
+    assert_eq!(ctl.phone("a").unwrap().state, PhoneState::Off);
+    ctl.offline("a");
+    ctl.offline("b");
+    tokio::time::sleep(2 * fast_timing().unplug_grace).await;
+    ctl.online("a");
+    ctl.online("b");
+    assert_no_session(&mut helper).await;
+    ctl.state_until("a", PhoneState::Off).await;
+    ctl.state_until("b", PhoneState::Off).await;
+    assert_eq!(flags(&state, "a"), (true, false));
+    assert_eq!(flags(&state, "b"), (true, false));
+    ctl.shutdown().await;
+}
+
+/// Review Focus 5: a connect-and-open opens its app once, on its phone, even after a blip.
+#[tokio::test]
+async fn pending_connect_opens_once() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &[], rules(&state, false), |_| {});
+    ctl.command(connect_and_open("b", "com.x", 0)).await;
+    assert_eq!(
+        ctl.event().await,
+        ConnectEvent::PlugIn {
+            serial: "b".into(),
+            name: "b".into(),
+            app: Some("com.x".into()),
+        }
+    );
+    ctl.online("b");
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("b").await;
+    assert_eq!(ctl.opened(), [("b".into(), "com.x".into(), 0)]);
+    // A blip and ready again: not opened again.
+    ctl.offline("b");
+    expect_bye(&mut helper).await;
+    ctl.state_until("b", PhoneState::Reconnecting).await;
+    ctl.online("b");
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("b").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ctl.opened().len(), 1);
+    ctl.assert_no_prompt().await;
+    ctl.shutdown().await;
+}
+
+/// Review Focus 5: a pending request for b never opens on a, which connects first.
+#[tokio::test]
+async fn pending_is_per_phone() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &[], rules(&state, false), |_| {});
+    ctl.command(connect_and_open("b", "com.x", 0)).await;
+    assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
+    ctl.online("a");
+    assert_eq!(ctl.event().await, plugged_in("a", "a"));
+    ctl.command(connect("a")).await;
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("a").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ctl.opened(), [], "nothing opens on a");
+    // b plugged in: its request connects it (switching a off) and opens on b.
+    ctl.online("b");
     expect_bye(&mut helper).await;
     assert_eq!(helper.next_session().await, 1);
     ctl.ready("b").await;
-    let report = status(&ctl.sock).await;
-    assert_eq!(report.serial.as_deref(), Some("b"));
+    assert_eq!(ctl.opened(), [("b".into(), "com.x".into(), 0)]);
     ctl.shutdown().await;
 }
 
-/// When an undo ends with another phone online, that phone is served; the undone one stays
-/// paused.
 #[tokio::test]
-async fn undo_end_starts_the_other_online_phone() {
+async fn pending_expires() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut opts = rules(&state, false);
+    opts.timing = Some(Timing {
+        unplug_grace: Duration::from_millis(300),
+        pending_for: Duration::from_millis(200),
+    });
+    let mut ctl = start_ctl_opts(port, &[], opts, |_| {});
+    ctl.command(connect_and_open("b", "com.x", 0)).await;
+    assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    ctl.online("b");
+    assert_eq!(ctl.event().await, plugged_in("b", "b"));
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.opened(), []);
+    ctl.shutdown().await;
+}
+
+#[tokio::test]
+async fn later_request_replaces() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &[], rules(&state, false), |_| {});
+    ctl.command(connect_and_open("b", "com.x", 0)).await;
+    ctl.command(connect_and_open("b", "com.y", 10)).await;
+    ctl.online("b");
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("b").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ctl.opened(), [("b".into(), "com.y".into(), 10)]);
+    ctl.shutdown().await;
+}
+
+/// An undo that always succeeds at once.
+fn instant_undo() -> (UndoRunner, mpsc::UnboundedReceiver<String>) {
+    let (calls_tx, calls) = mpsc::unbounded_channel();
+    let undo: UndoRunner = Arc::new(move |serial: String| {
+        let _ = calls_tx.send(serial);
+        Box::pin(async { (true, "companion: uninstalled".to_owned()) })
+    });
+    (undo, calls)
+}
+
+#[tokio::test]
+async fn undo_keeps_record_and_sets_off() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let (undo, mut calls) = instant_undo();
+    let mut opts = rules(&state, true);
+    opts.undo = Some(undo);
+    let mut ctl = start_ctl_opts(port, &["dev"], opts, |_| {});
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    ctl.command(undo_setup("dev")).await;
+    expect_bye(&mut helper).await;
+    assert_eq!(timeout(STEP, calls.recv()).await.unwrap().unwrap(), "dev");
+    let view = ctl.state_until("dev", PhoneState::Off).await;
+    assert!(view.off);
+    assert_eq!(flags(&state, "dev"), (true, false));
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
+
+#[tokio::test]
+async fn undo_of_waiting_phone_leaves_live_session() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let (undo, mut calls) = instant_undo();
+    let mut opts = rules(&state, true);
+    opts.undo = Some(undo);
+    let mut ctl = start_ctl_opts(port, &["a", "b"], opts, |_| {});
+    helper.next_session().await;
+    ctl.ready("a").await;
+    ctl.state_until("b", PhoneState::Waiting).await;
+    ctl.command(undo_setup("b")).await;
+    assert_eq!(timeout(STEP, calls.recv()).await.unwrap().unwrap(), "b");
+    helper.assert_quiet().await;
+    ctl.state_until("b", PhoneState::Off).await;
+    assert_eq!(ctl.phone("a").unwrap().state, PhoneState::Ready);
+    ctl.shutdown().await;
+}
+
+/// When an undo ends, nothing else starts: the other plugged phone keeps waiting.
+#[tokio::test]
+async fn undo_end_starts_nothing() {
     let (mut helper, port) = FakeHelper::spawn().await;
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let gate = release.clone();
@@ -2202,20 +2720,108 @@ async fn undo_end_starts_the_other_online_phone() {
     let mut ctl = start_ctl(port, &["a", "b"], Some(undo));
     assert_eq!(helper.next_session().await, 0);
     ctl.ready("a").await;
-    ctl.command(Command::UndoSetup).await;
+    ctl.command(undo_setup("a")).await;
     expect_bye(&mut helper).await;
-    ctl.view_until(|p| matches!(p, Phone::Undoing { serial } if serial == "a"))
-        .await;
+    ctl.state_until("a", PhoneState::Undoing).await;
     // Nothing starts while the undo runs.
     assert_no_session(&mut helper).await;
     release.add_permits(1);
+    ctl.state_until("a", PhoneState::Off).await;
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.phone("b").unwrap().state, PhoneState::Waiting);
+    ctl.shutdown().await;
+}
+
+#[tokio::test]
+async fn daemon_cmd_without_serial_needs_one_plugged() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let mut ctl = start_ctl(port, &["dev", "b"], None);
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    ctl.state_until("b", PhoneState::Waiting).await;
+    assert_eq!(
+        daemon_cmd_reply(&ctl.sock, DaemonCmd::Connect, None).await,
+        Control::error(
+            "several phones are plugged in: Pixel (dev), b (b); name one: lantern connect <serial>"
+        )
+    );
+    helper.assert_quiet().await;
+    // An explicit serial works.
+    let reply = daemon_cmd_reply(&ctl.sock, DaemonCmd::Disconnect, Some("dev")).await;
+    assert!(matches!(reply, Control::StatusReport(_)), "{reply:?}");
+    expect_bye(&mut helper).await;
+    ctl.state_until("dev", PhoneState::Off).await;
+    // One plugged in: that phone.
+    ctl.offline("dev");
+    ctl.state_until("dev", PhoneState::Unplugged).await;
+    daemon_cmd(&ctl.sock, DaemonCmd::Connect).await;
     assert_eq!(helper.next_session().await, 1);
     ctl.ready("b").await;
-    // b goes away: a is still paused, so nothing starts.
+    // None plugged in.
     ctl.offline("b");
     expect_bye(&mut helper).await;
-    ctl.view_until(|p| *p == paused("a")).await;
-    assert_no_session(&mut helper).await;
+    ctl.view_until(|v| v.phones.iter().all(|p| !p.plugged))
+        .await;
+    assert_eq!(
+        daemon_cmd_reply(&ctl.sock, DaemonCmd::Disconnect, None).await,
+        Control::error("no phone is plugged in")
+    );
+    ctl.shutdown().await;
+}
+
+#[tokio::test]
+async fn status_lists_every_phone() {
+    use lantern_proto::PhoneReport;
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    companion::set_off(&state, "old", true).unwrap();
+    let mut ctl = start_ctl_opts(port, &["dev", "b"], rules(&state, true), |_| {});
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    ctl.state_until("b", PhoneState::Waiting).await;
+    let report = status(&ctl.sock).await;
+    assert_eq!(report.state, SessionState::Ready);
+    let connected_at = report.phones[0].connected_at;
+    assert!(connected_at.is_some(), "{report:?}");
+    assert_eq!(
+        report.phones,
+        [
+            PhoneReport {
+                serial: "dev".into(),
+                name: Some("Pixel".into()),
+                state: PhoneState::Ready,
+                plugged: true,
+                off: false,
+                connected_at,
+            },
+            PhoneReport {
+                serial: "b".into(),
+                name: None,
+                state: PhoneState::Waiting,
+                plugged: true,
+                off: false,
+                connected_at: None,
+            },
+            PhoneReport {
+                serial: "old".into(),
+                name: None,
+                state: PhoneState::Unplugged,
+                plugged: false,
+                off: true,
+                connected_at: None,
+            },
+        ]
+    );
+    ctl.command(disconnect("dev")).await;
+    expect_bye(&mut helper).await;
+    ctl.state_until("dev", PhoneState::Off).await;
+    let report = status(&ctl.sock).await;
+    assert_eq!(
+        (report.state, report.serial.as_deref()),
+        (SessionState::Paused, Some("dev"))
+    );
+    assert_eq!(report.phones[0].state, PhoneState::Off);
+    assert!(report.phones[0].off);
     ctl.shutdown().await;
 }
 
@@ -2223,6 +2829,11 @@ async fn undo_end_starts_the_other_online_phone() {
 
 use lantern::unlock::{LockEvent, Pin};
 use lantern_proto::LockReason;
+
+/// The view's ready phone, if any.
+fn ready_phone(view: &View) -> Option<&PhoneView> {
+    view.phones.iter().find(|p| p.state == PhoneState::Ready)
+}
 
 /// A daemon with a view, a PIN channel and lock events, on the fake helper.
 struct Locky {
@@ -2234,11 +2845,7 @@ struct Locky {
 }
 
 async fn start_locky(port: u16) -> Locky {
-    let (view_tx, mut view) = watch::channel(View {
-        phone: Phone::None,
-        name: None,
-        locked: false,
-    });
+    let (view_tx, mut view) = watch::channel(View::default());
     let (pins, pins_rx) = mpsc::channel(1);
     let (events_tx, events) = mpsc::channel(16);
     let daemon = start_daemon_parts(
@@ -2250,13 +2857,10 @@ async fn start_locky(port: u16) -> Locky {
             ..Default::default()
         },
     );
-    timeout(
-        STEP,
-        view.wait_for(|v| matches!(v.phone, Phone::Ready { .. })),
-    )
-    .await
-    .expect("session never ready")
-    .unwrap();
+    timeout(STEP, view.wait_for(|v| ready_phone(v).is_some()))
+        .await
+        .expect("session never ready")
+        .unwrap();
     Locky {
         daemon,
         view,
@@ -2267,10 +2871,14 @@ async fn start_locky(port: u16) -> Locky {
 
 impl Locky {
     async fn locked_until(&mut self, locked: bool) {
-        timeout(STEP, self.view.wait_for(|v| v.locked == locked))
-            .await
-            .unwrap_or_else(|_| panic!("view.locked never became {locked}"))
-            .unwrap();
+        timeout(
+            STEP,
+            self.view
+                .wait_for(|v| v.live().is_some_and(|p| p.locked == locked)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("view.locked never became {locked}"))
+        .unwrap();
     }
 
     async fn event(&mut self) -> LockEvent {
@@ -2426,7 +3034,7 @@ async fn unlock_frame_not_logged() {
 async fn locked_sets_view_and_unlocked_clears() {
     let (helper, port) = FakeHelper::spawn().await;
     let mut locky = start_locky(port).await;
-    assert!(!locky.view.borrow().locked);
+    assert!(!locky.view.borrow().live().unwrap().locked);
     helper.send(control(
         0,
         Control::Locked {
@@ -2463,7 +3071,7 @@ async fn locked_sets_view_and_unlocked_clears() {
         },
     ));
     assert_eq!(locky.event().await, failed);
-    assert!(locky.view.borrow().locked);
+    assert!(locky.view.borrow().live().unwrap().locked);
     helper.send(control(
         0,
         Control::UnlockResult {
@@ -2596,7 +3204,7 @@ async fn pin_for_a_phone_no_longer_served_is_not_sent() {
     });
     assert_eq!(helper.next_session().await, 0);
     ctl.ready("dev").await;
-    ctl.offline("dev");
+    ctl.command(connect("b")).await;
     expect_bye(&mut helper).await;
     assert_eq!(helper.next_session().await, 1);
     ctl.ready("b").await;
@@ -2659,11 +3267,7 @@ async fn locked_burst_is_one_event() {
 #[tokio::test]
 async fn without_unlock_prompt_open_errors_are_kept() {
     let (mut helper, port) = FakeHelper::spawn().await;
-    let (view_tx, mut view) = watch::channel(View {
-        phone: Phone::None,
-        name: None,
-        locked: false,
-    });
+    let (view_tx, mut view) = watch::channel(View::default());
     let daemon = start_daemon_parts(
         Some(port),
         Parts {
@@ -2671,20 +3275,17 @@ async fn without_unlock_prompt_open_errors_are_kept() {
             ..Default::default()
         },
     );
-    timeout(
-        STEP,
-        view.wait_for(|v| matches!(v.phone, Phone::Ready { .. })),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    timeout(STEP, view.wait_for(|v| ready_phone(v).is_some()))
+        .await
+        .unwrap()
+        .unwrap();
     helper.send(control(
         0,
         Control::Locked {
             reason: LockReason::Open,
         },
     ));
-    timeout(STEP, view.wait_for(|v| v.locked))
+    timeout(STEP, view.wait_for(|v| v.live().is_some_and(|p| p.locked)))
         .await
         .unwrap()
         .unwrap();

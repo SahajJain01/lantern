@@ -83,6 +83,24 @@ fn stub_desktop_tools(bin: &std::path::Path) -> std::path::PathBuf {
     ran
 }
 
+/// A spawned `lantern daemon`, SIGTERMed and reaped when dropped (also on a failed assert).
+struct StopOnDrop(std::process::Child);
+
+impl StopOnDrop {
+    fn stop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
+            let _ = self.0.wait();
+        }
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// A session bus address nobody listens on, inside the test's scratch `dir`.
 fn no_bus(dir: &std::path::Path) -> String {
     format!("unix:path={}", dir.join("no-bus").display())
@@ -144,13 +162,39 @@ fn connect_and_disconnect_without_a_daemon_exit_1() {
             stderr.contains("lanternd is not running"),
             "stderr: {stderr}"
         );
-        let usage = Command::new(env!("CARGO_BIN_EXE_lantern"))
-            .args([cmd, "extra"])
-            .output()
-            .unwrap();
-        assert_eq!(usage.status.code(), Some(2), "{cmd} extra");
-        let text = String::from_utf8(usage.stderr).unwrap();
-        assert!(text.contains(&format!("lantern {cmd}")), "usage: {text}");
+    }
+}
+
+/// `lantern connect|disconnect [<serial>]`: one optional serial; a third argument is a usage
+/// error (exit 2) that never reaches a daemon. Every run gets a scratch runtime dir, so none
+/// can reach the desktop's lanternd.
+#[test]
+fn connect_takes_one_optional_serial() {
+    for cmd in ["connect", "disconnect"] {
+        let dir = scratch("cmd-serial");
+        let run = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_lantern"))
+                .args(args)
+                .env("XDG_RUNTIME_DIR", &dir)
+                .envs(scratch_xdg(&dir))
+                .output()
+                .unwrap()
+        };
+        // A serial is accepted: the command then needs a daemon.
+        let output = run(&[cmd, "20e9318"]);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{cmd} <serial>: {stderr}");
+        assert!(stderr.contains("lanternd is not running"), "{stderr}");
+        for args in [&[cmd, "a", "b"][..], &[cmd, "--serial"][..], &[cmd, ""][..]] {
+            let usage = run(args);
+            assert_eq!(usage.status.code(), Some(2), "{args:?}");
+            let text = String::from_utf8(usage.stderr).unwrap();
+            assert!(
+                text.contains(&format!("lantern {cmd} [<serial>]")),
+                "usage: {text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -210,7 +254,7 @@ fn status_prints_the_running_daemons_state_as_json() {
         .envs(scratch_xdg(&dir))
         .output()
         .unwrap();
-    // `lantern disconnect` with nothing live: the report, exit 0, still idle.
+    // `lantern disconnect` with no phone plugged in: lanternd's error, exit 1.
     let disconnect = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("disconnect")
         .env("XDG_RUNTIME_DIR", &dir)
@@ -220,9 +264,12 @@ fn status_prints_the_running_daemons_state_as_json() {
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let exit = daemon.wait().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(disconnect.status.code(), Some(0));
-    let reply: serde_json::Value = serde_json::from_slice(&disconnect.stdout).unwrap();
-    assert_eq!(reply["state"], "idle");
+    let refused = String::from_utf8_lossy(&disconnect.stderr);
+    assert_eq!(disconnect.status.code(), Some(1), "{refused}");
+    assert!(
+        refused.contains("lanternd: no phone is plugged in"),
+        "{refused}"
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(
         output.status.code(),
@@ -443,8 +490,12 @@ fn undo_setup_refuses_live_session() {
     std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
     // Never reach the desktop's notification daemon or menu cache from a test.
     stub_desktop_tools(&bin);
+    // The phone connects as soon as it is plugged in (the default asks first).
+    let settings = dir.join("config").join("lantern").join("settings.toml");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "autoconnect = true\n").unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
+    let daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env("XDG_RUNTIME_DIR", &dir)
         .envs(scratch_xdg(&dir))
@@ -452,9 +503,12 @@ fn undo_setup_refuses_live_session() {
         .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
         .env("PATH", &path)
         .env_remove("LANTERN_SERIAL")
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
+    // Stopped even if an assertion below fails (no daemon outlives the test).
+    let mut daemon = StopOnDrop(daemon);
     let deadline = Instant::now() + Duration::from_secs(5);
     let starting = loop {
         let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
@@ -480,8 +534,7 @@ fn undo_setup_refuses_live_session() {
         .output()
         .unwrap();
     let calls_after = std::fs::read_to_string(&log).unwrap_or_default();
-    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
-    let _ = daemon.wait();
+    daemon.stop();
     let _ = std::fs::remove_dir_all(&dir);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
