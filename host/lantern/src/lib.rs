@@ -6,4 +6,5 @@ pub mod notify;
 pub mod settings;
 pub mod tray;
 pub mod undo;
+pub mod unlock;
 pub mod window;

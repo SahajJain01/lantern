@@ -2,12 +2,12 @@
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
     python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20
-    python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
+    python3 tools/device_test.py --manual                            # also 8, 14, 21 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
 
-Items (20; 18 automatic, 8 and 14 only with --manual):
+Items (21; 18 automatic, 8, 14 and 21 only with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -18,13 +18,14 @@ Items (20; 18 automatic, 8 and 14 only with --manual):
      8 usb_yank (manual)                   18 keyboard_setting_off
      9 companion_linked                    19 disconnect_and_connect
     10 catalogue_tracks_phone              20 tray_menu (real session bus, unlocked desktop)
+                                           21 unlock_prompt (manual, PIN phone, Sahaj types)
 A full automatic run prints `18/18 PASS` when everything passes.
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
-Klipper's D-Bus (items 13, 17). Opens only com.android.settings, org.lineageos.jelly and the
-companion's test screen (enabled only during items 10, 12, 13 and 17), each for a few seconds,
-and touches no other window. Items 13 and 17 save the PC clipboard's text and put it back
+Klipper's D-Bus (items 13, 17, 21). Opens only com.android.settings, org.lineageos.jelly and the
+companion's test screen (enabled only during items 10, 12, 13, 17 and 21), each for a few seconds,
+and touches no other window. Items 13, 17 and 21 save the PC clipboard's text and put it back
 afterwards; items 17 and 18 also save ~/.config/lantern/settings.toml and restore it (or remove it
 if it was absent); item 18 restarts lanternd with the keyboard off and back on; item 19
 disconnects the phone in Lantern for ~15 s and connects it again; item 20 does the same through
@@ -1310,6 +1311,132 @@ class Suite:
              else f"no screenshot (spectacle -> {r.returncode}: {r.stderr.strip()})")
 
 
+    def unlock_prompt(self):
+        """Manual, PIN-locked phone (Motorola ZD222LMDFV: run with LANTERN_SERIAL=ZD222LMDFV and
+        lanternd serving it). Sahaj types the PIN into the real KDE dialog; this item never sees
+        or prints it. Locks the phone, copies a tag on the PC and expects "Unlock your <name>"
+        (a Notify on the session bus) within 3 s; after Sahaj submits the right PIN the phone
+        unlocks within 5 s, the tag is on the phone's clipboard (pasted into the test screen)
+        and the panel is off again. Then a wrong-PIN pass: "That PIN didn't unlock", exactly
+        one `unlock: still locked` in the helper log, the panel off, and Sahaj unlocks through
+        "Try again". The PC clipboard and the test screen are restored afterwards."""
+        check(SERIAL == "ZD222LMDFV",
+              f"item 21 needs the PIN-locked Motorola: LANTERN_SERIAL=ZD222LMDFV (got {SERIAL}), "
+              "and `systemctl --user set-environment LANTERN_SERIAL=ZD222LMDFV` + restart lanternd")
+        wait_ready(15)
+        st = status()
+        check(st.get("serial") == SERIAL, f"lanternd serves {st.get('serial')}, not {SERIAL}")
+        name = adb("shell", "settings", "get", "global", "device_name").strip() or SERIAL
+        note(f"phone name: {name}")
+
+        def locked():
+            for line in adb("shell", "dumpsys", "trust").splitlines():
+                if "(current)" in line:
+                    m = re.search(r"deviceLocked=([01])\b", line)
+                    return m.group(1) == "1" if m else None
+            return None
+
+        def lock():
+            adb("shell", "input", "keyevent", "KEYCODE_SLEEP")
+            _, secs = wait_until("deviceLocked=1", 15, lambda: locked() is True, interval=0.3)
+            note(f"phone locked {secs:.1f} s after KEYCODE_SLEEP")
+
+        # Notify calls on the real session bus. Only matched summaries are ever printed.
+        mon_log = LOG_DIR / "notifications.log"
+        mon_f = open(mon_log, "w")
+        monitor = subprocess.Popen(["busctl", "--user", "monitor", "org.freedesktop.Notifications"],
+                                   stdout=mon_f, stderr=subprocess.STDOUT)
+
+        def summaries():
+            text = mon_log.read_text(errors="replace")
+            return re.findall(r'STRING "((?:Unlock your|That PIN didn\'t unlock|Couldn\'t unlock) '
+                              r'[^"]*)";', text)
+
+        def notified(prefix, before):
+            got = [x for x in summaries()[before:] if x.startswith(prefix)]
+            return got
+
+        def ask(msg):
+            print(f"    >>> {msg}", flush=True)
+
+        saved = klipper("getClipboardContents")
+        saved = saved[:-1] if saved.endswith("\n") else saved
+        note(f"saved the PC clipboard text ({len(saved)} chars)")
+        tag = f"lantern-unlock-{os.getpid()}{int(time.time()) % 100000}"
+        ok = False
+        try:
+            time.sleep(1)  # the monitor is subscribed
+            # 1. Right PIN.
+            lock()
+            before = len(summaries())
+            klipper("setClipboardContents", tag)
+            copied = time.monotonic()
+            got, _ = wait_until("'Unlock your' notification", 10,
+                                lambda: notified("Unlock your", before), interval=0.1)
+            lag = time.monotonic() - copied
+            note(f"Notify {got[0]!r} {lag:.1f} s after the copy")
+            check(got[0] == f"Unlock your {name}", f"summary {got[0]!r}")
+            check(lag <= 3.0, f"notification after {lag:.1f} s (> 3 s)")
+            ask(f"Click 'Enter PIN…' in the notification and type {name}'s PIN.")
+            journal_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _, secs = wait_until("deviceLocked=0 after the PIN", 180, lambda: locked() is False,
+                                 interval=0.2)
+            unlocked_at = time.time()
+            sent = [l for l in sh("journalctl", "--user", "-u", UNIT, "--since", journal_since,
+                                  "-o", "short-unix", "--no-pager").splitlines()
+                    if "unlock sent to the helper" in l]
+            check(sent, "no 'unlock sent to the helper' in lanternd's journal")
+            took = unlocked_at - float(sent[-1].split()[0])
+            note(f"deviceLocked=0 {took:.1f} s after lanternd sent the unlock")
+            check(took <= 5.0, f"unlocked {took:.1f} s after the unlock was sent (> 5 s)")
+            wait_until("panel off again", 5,
+                                  lambda: phone_state()["panel"] == "Off", interval=0.3)
+            note("panel off again after the unlock")
+            _, since = self._test_window("unlock-paste", "tap:0.5,0.15;key:Ctrl+V;close", 40)
+            texts = [m for _, m in logcat_since(since, ["LanternTest"])]
+            for t in texts:
+                note(f"LanternTest: {t}")
+            check(f"text={tag}" in texts, "the PC copy made while locked is not on the phone")
+            # 2. Wrong PIN, then the right one through "Try again".
+            lock()
+            since = phone_now()
+            before = len(summaries())
+            klipper("setClipboardContents", tag + "-2")
+            wait_until("'Unlock your' notification (second stretch)", 10,
+                       lambda: notified("Unlock your", before), interval=0.1)
+            ask("Click 'Enter PIN…' and type a WRONG PIN.")
+            got, _ = wait_until("'That PIN didn't unlock'", 180,
+                                lambda: notified("That PIN didn't unlock", before), interval=0.2)
+            note(f"Notify {got[0]!r}")
+            check(got[0] == f"That PIN didn't unlock {name}", f"summary {got[0]!r}")
+            check(locked() is True, "the phone unlocked with a wrong PIN?")
+            still = [m for _, m in logcat_since(since, ["lantern"]) if m == "unlock: still locked"]
+            check(len(still) == 1, f"{len(still)} 'unlock: still locked' lines, want 1")
+            wait_until("panel off after the wrong PIN", 5,
+                       lambda: phone_state()["panel"] == "Off", interval=0.3)
+            note("panel off after the wrong PIN")
+            ask("Click 'Try again' and type the right PIN.")
+            wait_until("deviceLocked=0 after 'Try again'", 180, lambda: locked() is False,
+                       interval=0.2)
+            note("unlocked through 'Try again'")
+            ok = True
+        finally:
+            def restore():
+                klipper("setClipboardContents", saved)
+                note("restored the PC clipboard text")
+
+            def stop_monitor():
+                monitor.terminate()
+                try:
+                    monitor.wait(5)
+                except subprocess.TimeoutExpired:
+                    monitor.kill()
+                mon_f.close()
+            cleanup(ok, ("restore the PC clipboard", restore),
+                    ("stop the notification monitor", stop_monitor),
+                    ("disable the test screen", lambda: test_activity(False)))
+
+
 ITEMS = [
     "session_starts_on_plug",
     "open_settings_creates_one_display",
@@ -1331,8 +1458,10 @@ ITEMS = [
     "keyboard_setting_off",
     "disconnect_and_connect",
     "tray_menu",
+    "unlock_prompt",
 ]
-MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
+# Need a person: pull the cable (8, 14) or type the phone's PIN (21).
+MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt"}
 
 
 def desktop_locked():
@@ -1353,7 +1482,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manual", action="store_true",
-                    help="also run items 8 and 14 (USB unplug; prompts)")
+                    help="also run items 8, 14 and 21 (USB unplug, typing the PIN; prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
     ap.add_argument("--only", nargs="*", help="run only these items (numbers or names)")
     ap.add_argument("--nested", action="store_true",
@@ -1427,7 +1556,7 @@ def main():
                 print(f"WARNING: nested KWin stop failed: {e}", flush=True)
                 shutil.rmtree(NESTED.home, ignore_errors=True)
         if {"catalogue_tracks_phone", "ime_unicode_text", "clipboard_both_ways",
-            "clipboard_setting_off"} & set(items):
+            "clipboard_setting_off", "unlock_prompt"} & set(items):
             try:  # the test screen is never left enabled
                 test_activity(False)
             except Exception as e:

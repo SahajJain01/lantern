@@ -74,6 +74,9 @@ pub struct View {
     pub phone: Phone,
     /// The phone's recorded name (`companion::Names`), if it has one.
     pub name: Option<String>,
+    /// The phone's PIN lock is in the way: from the helper's `locked` until `unlocked`, a
+    /// successful `unlock_result`, or the end of the session.
+    pub locked: bool,
 }
 
 /// Removes Lantern from the phone with this serial: `(all steps ok, output lines joined with

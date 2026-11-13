@@ -1644,6 +1644,7 @@ fn start_ctl(port: u16, online: &[&str], undo: Option<UndoRunner>) -> Ctl {
     let (view_tx, view) = watch::channel(View {
         phone: Phone::None,
         name: None,
+        locked: false,
     });
     let lookups = Arc::new(AtomicUsize::new(0));
     let counted = lookups.clone();
@@ -1807,7 +1808,8 @@ async fn online_while_paused_starts_nothing() {
         *ctl.view.borrow(),
         View {
             phone: paused("dev"),
-            name: Some("Pixel".into())
+            name: Some("Pixel".into()),
+            locked: false
         }
     );
     assert_eq!(status(&ctl.sock).await.state, SessionState::Paused);
@@ -2145,4 +2147,364 @@ async fn undo_end_starts_the_other_online_phone() {
     ctl.view_until(|p| *p == paused("a")).await;
     assert_no_session(&mut helper).await;
     ctl.shutdown().await;
+}
+
+// --- the PIN lock: locked/unlocked, unlock{pin}, opens the lock blocked ---------------------
+
+use lantern::unlock::{LockEvent, Pin};
+use lantern_proto::LockReason;
+
+/// A daemon with a view, a PIN channel and lock events, on the fake helper.
+struct Locky {
+    daemon: Daemon,
+    view: watch::Receiver<View>,
+    pins: mpsc::Sender<Pin>,
+    events: mpsc::Receiver<LockEvent>,
+}
+
+async fn start_locky(port: u16) -> Locky {
+    let (view_tx, mut view) = watch::channel(View {
+        phone: Phone::None,
+        name: None,
+        locked: false,
+    });
+    let (pins, pins_rx) = mpsc::channel(1);
+    let (events_tx, events) = mpsc::channel(16);
+    let daemon = start_daemon_parts(
+        Some(port),
+        Parts {
+            view: Some(view_tx),
+            unlock: Some(pins_rx),
+            lock_events: Some(events_tx),
+            ..Default::default()
+        },
+    );
+    timeout(
+        STEP,
+        view.wait_for(|v| matches!(v.phone, Phone::Ready { .. })),
+    )
+    .await
+    .expect("session never ready")
+    .unwrap();
+    Locky {
+        daemon,
+        view,
+        pins,
+        events,
+    }
+}
+
+impl Locky {
+    async fn locked_until(&mut self, locked: bool) {
+        timeout(STEP, self.view.wait_for(|v| v.locked == locked))
+            .await
+            .unwrap_or_else(|_| panic!("view.locked never became {locked}"))
+            .unwrap();
+    }
+
+    async fn event(&mut self) -> LockEvent {
+        timeout(STEP, self.events.recv())
+            .await
+            .expect("no lock event")
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn unlock_frame_reaches_helper_once() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let locky = start_locky(port).await;
+    locky
+        .pins
+        .send(Pin::parse("24680\n".into()).unwrap())
+        .await
+        .unwrap();
+    let frame = helper.next().await;
+    assert_eq!(frame.stream, 0);
+    match decode(&frame) {
+        Control::Unlock { pin } => assert_eq!(pin.expose(), "24680"),
+        other => panic!("expected unlock, got {other:?}"),
+    }
+    assert_eq!(frame.payload, br#"{"t":"unlock","pin":"24680"}"#);
+    helper.assert_quiet().await;
+    locky.daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn unlock_without_session_is_dropped_with_a_notice() {
+    let rt = runtime_dir();
+    let listener = ipc::bind(&rt).unwrap();
+    let notes = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let noted = notes.clone();
+    let (pins, pins_rx) = mpsc::channel(1);
+    let (stop, stop_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(serve_with(
+        listener,
+        Parts {
+            unlock: Some(pins_rx),
+            notify: Some(Arc::new(move |summary: &str, body: &str| {
+                noted
+                    .lock()
+                    .unwrap()
+                    .push((summary.to_owned(), body.to_owned()));
+            })),
+            ..Default::default()
+        },
+        None,
+        stream::pending::<DeviceEvent>(),
+        |_serial: String| async move { anyhow::bail!("no phone in this test") },
+        async move {
+            let _ = stop_rx.await;
+            "test-stop"
+        },
+        fast_policy(),
+    ));
+    pins.send(Pin::parse("1357".into()).unwrap()).await.unwrap();
+    let deadline = Instant::now() + STEP;
+    while notes.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no notice");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let notes = notes.lock().unwrap().clone();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].0, "Your phone isn't connected");
+    assert!(!notes[0].0.contains("1357") && !notes[0].1.contains("1357"));
+    let _ = stop.send(());
+    timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// Collects everything a `tracing` fmt subscriber writes.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn unlock_frame_not_logged() {
+    const DIGITS: &str = "80417395";
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    // A current-thread test runtime: every task logs on this thread.
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let mut locky = start_locky(port).await;
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Clipboard,
+        },
+    ));
+    locky.locked_until(true).await;
+    locky
+        .pins
+        .send(Pin::parse(format!("{DIGITS}\n")).unwrap())
+        .await
+        .unwrap();
+    let frame = helper.next().await;
+    assert!(matches!(decode(&frame), Control::Unlock { .. }));
+    helper.send(control(
+        0,
+        Control::UnlockResult {
+            ok: false,
+            reason: Some("wrong PIN".into()),
+        },
+    ));
+    // A malformed unlock-shaped frame from the helper (a number where a string goes) is not
+    // quoted in any decode error either.
+    helper.send(Frame {
+        kind: Kind::Control,
+        stream: 0,
+        payload: format!(r#"{{"t":"unlock","pin":{DIGITS}}}"#).into_bytes(),
+    });
+    loop {
+        if let LockEvent::Result { ok: false, .. } = locky.event().await {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    locky.daemon.shutdown().await;
+    let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("unlock"), "nothing captured: {text}");
+    assert!(
+        !text.contains(DIGITS),
+        "the PIN reached a log line:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn locked_sets_view_and_unlocked_clears() {
+    let (helper, port) = FakeHelper::spawn().await;
+    let mut locky = start_locky(port).await;
+    assert!(!locky.view.borrow().locked);
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Clipboard,
+        },
+    ));
+    locky.locked_until(true).await;
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Locked(LockReason::Clipboard)
+    );
+    helper.send(control(0, Control::Unlocked));
+    locky.locked_until(false).await;
+    assert_eq!(locky.event().await, LockEvent::Unlocked);
+
+    // A successful unlock_result also ends it; a failed one does not.
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Open,
+        },
+    ));
+    locky.locked_until(true).await;
+    assert_eq!(locky.event().await, LockEvent::Locked(LockReason::Open));
+    let failed = LockEvent::Result {
+        ok: false,
+        reason: Some("wrong PIN".into()),
+    };
+    helper.send(control(
+        0,
+        Control::UnlockResult {
+            ok: false,
+            reason: Some("wrong PIN".into()),
+        },
+    ));
+    assert_eq!(locky.event().await, failed);
+    assert!(locky.view.borrow().locked);
+    helper.send(control(
+        0,
+        Control::UnlockResult {
+            ok: true,
+            reason: None,
+        },
+    ));
+    locky.locked_until(false).await;
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Result {
+            ok: true,
+            reason: None
+        }
+    );
+
+    // The end of the session ends it too.
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Clipboard,
+        },
+    ));
+    locky.locked_until(true).await;
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Locked(LockReason::Clipboard)
+    );
+    helper.die();
+    locky.locked_until(false).await;
+    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    locky.daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_failed_while_locked_gets_phone_locked() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let mut locky = start_locky(port).await;
+    let sock = locky.daemon.sock.clone();
+    let open_blocked = |pkg: &'static str, user: u32| {
+        let sock = sock.clone();
+        async move {
+            let mut client = UnixStream::connect(&sock).await.unwrap();
+            send(&mut client, &open(pkg, user, None)).await;
+            client
+        }
+    };
+    let mut client = open_blocked("com.foo", 0).await;
+    let fwd = helper.next().await;
+    let win = fwd.stream;
+    assert!(matches!(decode(&fwd), Control::Open { .. }));
+    // The helper's order: locked{open}, then the window's error and closed.
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Open,
+        },
+    ));
+    helper.send(control(
+        win,
+        Control::error("open com.foo failed: SecurityException"),
+    ));
+    let closed = control(
+        win,
+        Control::Closed {
+            reason: CloseReason::Error,
+        },
+    );
+    helper.send(closed.clone());
+    assert_eq!(
+        recv(&mut client).await.as_ref().map(decode),
+        Some(Control::error(ipc::PHONE_LOCKED))
+    );
+    assert_eq!(recv(&mut client).await, Some(closed));
+    assert_eof(&mut client).await;
+    assert_eq!(locky.event().await, LockEvent::Locked(LockReason::Open));
+
+    // The same app blocked twice and another user's app: one entry each.
+    for (pkg, user) in [("com.foo", 0), ("com.bar", 10)] {
+        let mut client = open_blocked(pkg, user).await;
+        let win = helper.next().await.stream;
+        helper.send(control(win, Control::error("open failed")));
+        helper.send(control(
+            win,
+            Control::Closed {
+                reason: CloseReason::Error,
+            },
+        ));
+        assert_eq!(
+            recv(&mut client).await.as_ref().map(decode),
+            Some(Control::error(ipc::PHONE_LOCKED))
+        );
+    }
+
+    helper.send(control(0, Control::Unlocked));
+    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Reopen(vec![("com.foo".into(), 0), ("com.bar".into(), 10)])
+    );
+
+    // Unlocked now: a failed open keeps the phone's own error and is not reopened.
+    let mut client = open_blocked("com.baz", 0).await;
+    let win = helper.next().await.stream;
+    let error = control(win, Control::error("no launch intent for com.baz"));
+    helper.send(error.clone());
+    assert_eq!(recv(&mut client).await, Some(error));
+    helper.send(control(0, Control::Unlocked));
+    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    assert!(
+        timeout(Duration::from_millis(300), locky.events.recv())
+            .await
+            .is_err(),
+        "nothing to reopen"
+    );
+    locky.daemon.shutdown().await;
 }

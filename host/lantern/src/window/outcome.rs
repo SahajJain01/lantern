@@ -21,6 +21,9 @@ pub enum Notice {
     NotOnThisPhone,
     /// The user disconnected the phone in Lantern ("Lantern is disconnected").
     Paused,
+    /// The phone's PIN lock blocked the open. lanternd shows the unlock notification and
+    /// reopens the app after the unlock, so the window shows none of its own.
+    Locked,
 }
 
 #[derive(Debug, Default)]
@@ -92,9 +95,18 @@ impl OpenState {
     /// Which "Connect your …" notification `error{msg}` on `stream` calls for: only the daemon
     /// refusing our open (stream 0, before `opened`) because no phone is connected, the
     /// connected one lacks the app, or the user disconnected the phone in Lantern.
+    ///
+    /// [`Notice::Locked`] is the daemon's replacement for the phone's error on our window's
+    /// stream when the PIN lock blocked our open (before `opened`).
     pub fn notice(&self, stream: u32, msg: &str) -> Option<Notice> {
-        use crate::daemon::ipc::{NOT_CONNECTED, NOT_ON_THIS_PHONE, PAUSED};
-        if stream != 0 || self.win.is_some() {
+        use crate::daemon::ipc::{NOT_CONNECTED, NOT_ON_THIS_PHONE, PAUSED, PHONE_LOCKED};
+        if self.win.is_some() {
+            return None;
+        }
+        if msg == PHONE_LOCKED {
+            return Some(Notice::Locked);
+        }
+        if stream != 0 {
             return None;
         }
         match msg {
@@ -221,6 +233,19 @@ mod tests {
         opened.opened(1);
         assert_eq!(opened.notice(0, "phone not connected"), None);
         assert_eq!(opened.notice(0, "app not on this phone"), None);
+    }
+
+    #[test]
+    fn phone_locked_open_is_a_locked_notice_and_exits_1() {
+        let mut s = OpenState::default();
+        assert_eq!(s.notice(4, "phone locked"), Some(Notice::Locked));
+        assert_eq!(s.notice(0, "phone locked"), Some(Notice::Locked));
+        assert_eq!(s.notice(4, "open com.foo failed: x"), None);
+        assert_eq!(s.on_error(4, "phone locked".into()), None);
+        assert_eq!(s.on_closed(4, CloseReason::Error), failed("phone locked"));
+        let mut opened = OpenState::default();
+        opened.opened(4);
+        assert_eq!(opened.notice(4, "phone locked"), None);
     }
 
     #[test]

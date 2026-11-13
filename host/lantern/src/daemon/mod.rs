@@ -29,6 +29,7 @@ use crate::daemon::companion::Names;
 use crate::daemon::control::{Command, Notifier, Phone, UndoRunner, View};
 use crate::daemon::session::{start_with_companion, HandshakeError};
 use crate::settings::{self, SettingsHandle};
+use crate::unlock::{self, LockEvent};
 
 /// The phone to serve: `configured` (`$LANTERN_SERIAL`) if set, else `current` (the live
 /// session's phone) while it is online, else the first of `online` (kept in the order devices
@@ -117,6 +118,11 @@ pub struct Parts {
     pub undo: Option<UndoRunner>,
     /// Desktop notifications (the undo result).
     pub notify: Option<Notifier>,
+    /// PINs from the unlock prompt: each goes to the live session's helper as one `unlock`
+    /// frame (with no session it is dropped).
+    pub unlock: Option<mpsc::Receiver<unlock::Pin>>,
+    /// Gets the helper's `locked`/`unlocked`/`unlock_result` and the opens to redo.
+    pub lock_events: Option<mpsc::Sender<LockEvent>>,
 }
 
 /// The parts of [`Parts`] the run loop itself uses.
@@ -127,6 +133,7 @@ struct Controls {
     names: Option<Names>,
     undo: Option<UndoRunner>,
     notify: Option<Notifier>,
+    unlock: Option<mpsc::Receiver<unlock::Pin>>,
 }
 
 /// [`serve`] with the daemon's optional [`Parts`].
@@ -154,8 +161,13 @@ where
         names,
         undo,
         notify,
+        unlock,
+        lock_events,
     } = parts;
     let mut hub = Hub::new(Some(listener));
+    if let Some(events) = lock_events {
+        hub.set_lock_events(events);
+    }
     if let Some(catalog) = catalog {
         hub.set_catalog(catalog);
     }
@@ -172,6 +184,7 @@ where
         names,
         undo,
         notify,
+        unlock,
     };
     let path = hub.socket_path();
     let result = drive(
@@ -315,6 +328,7 @@ where
         names,
         undo,
         notify,
+        mut unlock,
     } = controls;
     let mut names = NameCache {
         names,
@@ -377,7 +391,11 @@ where
                 Phone::None
             };
             let name = phone.serial().and_then(|serial| names.get(serial));
-            let next = View { phone, name };
+            let next = View {
+                phone,
+                name,
+                locked: hub.locked(),
+            };
             view.send_if_modified(|current| {
                 if *current == next {
                     return false;
@@ -508,6 +526,41 @@ where
                 }
                 // Another online phone is served now.
                 serve_next(configured.as_deref(), &connected, &paused, &mut retry_at, &mut failures);
+            }
+            pin = async { unlock.as_mut().expect("guarded").recv().await }, if unlock.is_some() => {
+                match pin {
+                    Some(pin) => match active.as_ref() {
+                        Some((session, _)) => {
+                            let helper = session.tx.clone();
+                            if hub.send_unlock(pin, &helper).await.is_err() {
+                                ended = Some("helper stopped reading");
+                            }
+                        }
+                        None => {
+                            drop(pin);
+                            let serial = starting
+                                .as_ref()
+                                .map(|(serial, _)| serial.clone())
+                                .or_else(|| paused.last().cloned())
+                                .or_else(|| connected.first().cloned());
+                            let name = serial.as_deref().map(|serial| {
+                                names.get(serial).unwrap_or_else(|| serial.to_owned())
+                            });
+                            tracing::info!(serial, "unlock: no live session; PIN dropped");
+                            if let Some(notify) = &notify {
+                                let name = name.unwrap_or_else(|| "Your phone".to_owned());
+                                notify(
+                                    &format!("{name} isn't connected"),
+                                    "Lantern didn't send the PIN. Connect the phone and try again.",
+                                );
+                            }
+                        }
+                    },
+                    None => {
+                        tracing::debug!("unlock channel closed");
+                        unlock = None;
+                    }
+                }
             }
             event = hub.next_event() => {
                 let helper = active.as_ref().map(|(session, _)| session.tx.clone());
@@ -779,7 +832,17 @@ pub async fn run() -> Result<()> {
     let (view_tx, view_rx) = watch::channel(View {
         phone: Phone::None,
         name: None,
+        locked: false,
     });
+    // The unlock prompt on its own bus connection: PINs come back on `pin_rx` (one at a time),
+    // lock events go to it. Without a session bus there is neither.
+    let (pin_tx, pin_rx) = mpsc::channel(1);
+    let (lock_tx, lock_rx) = mpsc::channel(16);
+    let prompt = crate::unlock::spawn(lock_rx, view_rx.clone(), pin_tx).await;
+    let (unlock, lock_events) = match prompt {
+        Some(_) => (Some(pin_rx), Some(lock_tx)),
+        None => (None, None),
+    };
     crate::tray::spawn(view_rx, settings.clone(), cmd_tx).await;
     serve_with(
         listener,
@@ -794,6 +857,8 @@ pub async fn run() -> Result<()> {
             })),
             commands: Some(cmd_rx),
             view: Some(view_tx),
+            unlock,
+            lock_events,
         },
         configured,
         track_devices(),

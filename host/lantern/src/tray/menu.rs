@@ -224,6 +224,7 @@ mod tests {
         View {
             phone,
             name: Some("Test Phone".to_owned()),
+            locked: false,
         }
     }
 
@@ -285,6 +286,7 @@ mod tests {
         let v = View {
             phone: Phone::None,
             name: None,
+            locked: false,
         };
         let mut want = vec![label(1, "No phone connected")];
         want.extend(tail(false));
@@ -407,6 +409,7 @@ mod tests {
                 serial: serial("20e9318"),
             },
             name: None,
+            locked: false,
         };
         assert_eq!(status_line(&v), "Disconnected from 20e9318");
     }
@@ -481,6 +484,7 @@ mod tests {
         let none = rows(&View {
             phone: Phone::None,
             name: None,
+            locked: false,
         });
         assert_eq!(action(&none, 3), None);
         assert_eq!(action(&none, 10), None, "undo is disabled without a phone");

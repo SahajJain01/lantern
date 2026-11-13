@@ -5,6 +5,7 @@
 //! variables, so a variable missing from our own environment is taken from the user manager
 //! (`systemctl --user show-environment`).
 
+use std::ffi::OsStr;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -84,13 +85,24 @@ fn systemd_environment() -> Option<String> {
 }
 
 /// Runs a desktop command with [`session_env`], stdin null; it outlives a dropped handle.
-pub fn spawn(program: &str, args: &[&str]) -> std::io::Result<tokio::process::Child> {
+pub fn spawn<S: AsRef<OsStr>>(
+    program: impl AsRef<OsStr>,
+    args: &[S],
+) -> std::io::Result<tokio::process::Child> {
     tokio::process::Command::new(program)
         .args(args)
         .envs(session_env())
         .stdin(Stdio::null())
         .kill_on_drop(false)
         .spawn()
+}
+
+/// A blocking desktop command with [`session_env`] and stdin null, for a caller that reads
+/// its output (the PIN dialog). Building it may block on systemctl.
+pub fn command<S: AsRef<OsStr>>(program: impl AsRef<OsStr>, args: &[S]) -> Command {
+    let mut command = Command::new(program);
+    command.args(args).envs(session_env()).stdin(Stdio::null());
+    command
 }
 
 #[cfg(test)]
@@ -109,7 +121,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_runs_the_command() {
-        let mut child = spawn("true", &[]).unwrap();
+        let mut child = spawn("true", &[] as &[&str]).unwrap();
         assert!(child.wait().await.unwrap().success());
     }
 }

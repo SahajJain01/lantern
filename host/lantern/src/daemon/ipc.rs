@@ -10,7 +10,7 @@
 //! The helper side is never blocked by a client: each client has a bounded outbound queue, and a
 //! client that overflows it is dropped exactly as if it had disconnected (close = quit).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -25,12 +25,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 use super::catalog::{AppEntry, Catalog};
 use super::registry::{Claim, Registry};
 use crate::clipboard::{ClipHandle, ClipSync, PcOffer};
 use crate::settings::Settings;
+use crate::unlock::{LockEvent, Pin};
 
 /// Frames queued per client before it counts as stuck (~4 s of 60 fps video).
 pub const CLIENT_QUEUE: usize = 240;
@@ -47,6 +48,11 @@ pub const NOT_CONNECTED: &str = "phone not connected";
 pub const NOT_ON_THIS_PHONE: &str = "app not on this phone";
 /// The user disconnected the phone in Lantern (tray or `lantern disconnect`).
 pub const PAUSED: &str = "phone disconnected in Lantern";
+/// Replaces the helper's error for an open that failed while the phone's PIN lock was in the
+/// way: lanternd shows the unlock notification and reopens the app after the unlock.
+pub const PHONE_LOCKED: &str = "phone locked";
+/// How long an open the lock blocked waits for the unlock before it is forgotten.
+pub const REOPEN_WITHIN: Duration = Duration::from_secs(120);
 
 pub fn socket_path_in(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("lantern").join("daemon.sock")
@@ -337,6 +343,14 @@ pub struct Hub {
     clip_was_on: bool,
     /// `lantern connect|disconnect` commands not yet taken by the run loop.
     commands: Vec<DaemonCmd>,
+    /// The phone's PIN lock is in the way (`locked` .. `unlocked`); false between sessions.
+    locked: bool,
+    /// Where `locked`/`unlocked`/`unlock_result` go (the unlock prompt), if anywhere.
+    lock_events: Option<mpsc::Sender<LockEvent>>,
+    /// Windows that got `opened` (an `error` before it is a failed open).
+    opened: HashSet<u32>,
+    /// Opens the lock blocked, oldest first, one per app: reopened after the unlock.
+    reopens: Vec<(String, u32, Instant)>,
 }
 
 impl Hub {
@@ -360,7 +374,64 @@ impl Hub {
             settings: None,
             clip_was_on: true,
             commands: Vec::new(),
+            locked: false,
+            lock_events: None,
+            opened: HashSet::new(),
+            reopens: Vec::new(),
         }
+    }
+
+    /// The helper's lock messages go to `events` as [`LockEvent`]s.
+    pub fn set_lock_events(&mut self, events: mpsc::Sender<LockEvent>) {
+        self.lock_events = Some(events);
+    }
+
+    /// Whether the phone's PIN lock is in the way (for [`super::control::View::locked`]).
+    pub fn locked(&self) -> bool {
+        self.locked
+    }
+
+    /// Hands `event` to the unlock prompt without waiting; a full queue drops it.
+    fn lock_event(&self, event: LockEvent) {
+        if let Some(events) = &self.lock_events {
+            if let Err(error) = events.try_send(event) {
+                tracing::warn!(%error, "unlock prompt not listening; lock event dropped");
+            }
+        }
+    }
+
+    /// The stretch ended in an unlock: the opens it blocked within [`REOPEN_WITHIN`] go to
+    /// the prompt to be reopened.
+    fn unlocked(&mut self) {
+        self.locked = false;
+        let reopens: Vec<(String, u32)> = std::mem::take(&mut self.reopens)
+            .into_iter()
+            .filter(|(_, _, at)| at.elapsed() < REOPEN_WITHIN)
+            .map(|(pkg, user, _)| (pkg, user))
+            .collect();
+        if !reopens.is_empty() {
+            self.lock_event(LockEvent::Reopen(reopens));
+        }
+    }
+
+    /// Remembers `pkg`/`user` for a reopen after the unlock (once per app; stale ones go).
+    fn blocked_open(&mut self, pkg: String, user: u32) {
+        self.reopens
+            .retain(|(p, u, at)| at.elapsed() < REOPEN_WITHIN && !(*p == pkg && *u == user));
+        self.reopens.push((pkg, user, Instant::now()));
+    }
+
+    /// Sends `pin` to the helper as one `unlock` frame on stream 0. Neither the frame nor
+    /// the PIN is logged.
+    pub async fn send_unlock(
+        &mut self,
+        pin: Pin,
+        helper: &mpsc::Sender<Frame>,
+    ) -> Result<(), HelperWedged> {
+        let frame = control(0, Control::Unlock { pin: pin.secret() });
+        drop(pin);
+        tracing::info!("unlock sent to the helper");
+        to_helper(helper, frame).await
     }
 
     /// The `lantern connect|disconnect` commands received since the last call, oldest first.
@@ -537,6 +608,7 @@ impl Hub {
 
     /// Forgets window `win` (registry and status).
     fn release(&mut self, win: u32) {
+        self.opened.remove(&win);
         self.windows.remove(&win);
         self.info.remove(&win);
         self.registry.release(win);
@@ -880,6 +952,27 @@ impl Hub {
                     self.on_catalogue(c);
                 }
                 Ok(Control::Clip { text }) => self.on_phone_clip(text),
+                Ok(Control::Locked { reason }) => {
+                    tracing::info!(?reason, "phone locked");
+                    self.locked = true;
+                    self.lock_event(LockEvent::Locked(reason));
+                }
+                Ok(Control::Unlocked) => {
+                    tracing::info!("phone unlocked");
+                    self.lock_event(LockEvent::Unlocked);
+                    self.unlocked();
+                }
+                Ok(Control::UnlockResult { ok, reason }) => {
+                    tracing::info!(
+                        ok,
+                        reason = reason.as_deref().unwrap_or(""),
+                        "unlock result"
+                    );
+                    self.lock_event(LockEvent::Result { ok, reason });
+                    if ok {
+                        self.unlocked();
+                    }
+                }
                 // Never dump whole frames: some carry icons or clipboard text.
                 Ok(_) => tracing::debug!(
                     t = control_type(&frame.payload),
@@ -897,9 +990,32 @@ impl Hub {
         let Some(&cid) = self.windows.get(&win) else {
             return Ok(());
         };
-        let closed = frame.kind == Kind::Control
-            && matches!(Control::decode(&frame.payload), Ok(Control::Closed { .. }));
-        if closed {
+        let decoded = (frame.kind == Kind::Control)
+            .then(|| Control::decode(&frame.payload).ok())
+            .flatten();
+        let mut frame = frame;
+        match &decoded {
+            Some(Control::Opened { .. }) => {
+                self.opened.insert(win);
+            }
+            // The open failed while the lock was in the way (the helper sends `locked{open}`
+            // before this error): the client is told so and the app reopened after the unlock.
+            Some(Control::Error { .. }) if self.locked && !self.opened.contains(&win) => {
+                if let Some(info) = self.info.get(&win) {
+                    tracing::info!(
+                        cid,
+                        win,
+                        pkg = info.pkg,
+                        user = info.user,
+                        "open blocked by the phone's lock"
+                    );
+                    self.blocked_open(info.pkg.clone(), info.user);
+                }
+                frame = control(win, Control::error(PHONE_LOCKED));
+            }
+            _ => {}
+        }
+        if matches!(decoded, Some(Control::Closed { .. })) {
             tracing::info!(cid, win, "window closed by helper");
             self.release(win);
             if let Some(client) = self.clients.get_mut(&cid) {
@@ -925,6 +1041,11 @@ impl Hub {
         self.registry = Registry::default();
         self.companion = None;
         self.clip_sync = ClipSync::default();
+        self.opened.clear();
+        // The stretch ends with the session; the blocked opens wait for the next unlock.
+        if std::mem::take(&mut self.locked) {
+            self.lock_event(LockEvent::Unlocked);
+        }
     }
 }
 

@@ -522,6 +522,7 @@ mod tests {
                 view: View {
                     phone: crate::daemon::control::Phone::None,
                     name: None,
+                    locked: false,
                 },
                 settings: Settings::default(),
                 settings_error: false,

@@ -98,6 +98,7 @@ fn ready() -> View {
             companion: Some((CompanionState::Ready, None)),
         },
         name: Some("Test Phone".into()),
+        locked: false,
     }
 }
 
@@ -339,6 +340,7 @@ async fn view_change_emits_layout_updated() {
             serial: "s1".into(),
         },
         name: Some("Test Phone".into()),
+        locked: false,
     });
     let signal = tokio::time::timeout(Duration::from_secs(2), signals.next())
         .await

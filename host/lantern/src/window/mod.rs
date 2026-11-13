@@ -545,8 +545,13 @@ impl App {
         match c {
             Control::Error { msg, .. } => {
                 tracing::error!(stream, msg, "error from phone");
-                if let Some(notice) = self.state.notice(stream, &msg) {
-                    notify_connect_phone(&self.id, notice);
+                match self.state.notice(stream, &msg) {
+                    // lanternd shows the unlock notification and reopens us after the unlock.
+                    Some(Notice::Locked) => {
+                        tracing::warn!("phone locked; enter its PIN in Lantern's notification")
+                    }
+                    Some(notice) => notify_connect_phone(&self.id, notice),
+                    None => {}
                 }
                 if let Some(exit) = self.state.on_error(stream, msg) {
                     self.finish(el, exit);
@@ -887,7 +892,7 @@ fn notify_connect_phone(id: &identity::Identity, notice: Notice) {
         return;
     }
     let here = match notice {
-        Notice::NoPhone | Notice::Paused => None,
+        Notice::NoPhone | Notice::Paused | Notice::Locked => None,
         Notice::NotOnThisPhone => ipc::runtime_dir()
             .and_then(|dir| ipc::query_status(&ipc::socket_path_in(&dir)))
             .ok()
