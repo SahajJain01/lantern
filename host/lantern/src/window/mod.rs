@@ -1,7 +1,9 @@
-//! `lantern open [--user N] <pkg>`: one process per app window.
+//! `lantern open [--phone S] [--user N] <pkg>`: one process per app window.
 //!
-//! Connects to lanternd, sends `open`, and on `opened` shows a Wayland window (app_id
-//! `lantern.<pkg>`, or `lantern.<pkg>-u<N>` for Android user N > 0; see [`identity`]) that
+//! Without `--phone` it first picks the phone ([`resolve`]: the live phone that has the app,
+//! else the phone with the app that connected last). It connects to lanternd, sends `open`
+//! naming that phone, and on `opened` shows a Wayland window (app_id per [`window_names`]:
+//! `lantern.<pkg>[-u<N>]`, suffixed `-p<tag>` on a phone other than the primary) that
 //! renders the app's video and forwards input. Threads: the winit event
 //! loop (main), a socket reader that also decodes video (latest frame wins), and a socket writer.
 
@@ -14,6 +16,7 @@ pub mod input;
 pub mod keymap;
 pub mod outcome;
 pub mod render;
+pub mod resolve;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::AsRawFd;
@@ -553,6 +556,12 @@ impl App {
                     Some(Notice::Locked) => {
                         tracing::warn!("phone locked; enter its PIN in Lantern's notification")
                     }
+                    // lanternd's connect prompt shows "Connect your <phone>" with Connect.
+                    Some(Notice::Offered) => {
+                        let serial = self.id.phone.clone().unwrap_or_default();
+                        let name = crate::daemon::companion::names()(&serial).unwrap_or(serial);
+                        tracing::info!("connect notice: {}", outcome::offered_summary(&name));
+                    }
                     Some(notice) => notify_connect_phone(&self.id, notice),
                     None => {}
                 }
@@ -877,11 +886,44 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// The phone `lantern open` without `--phone` uses: [`resolve::resolve`] over lanternd's phones
+/// (`lantern status` on `sock`) and the phones whose menu entries list the app. `None`: no
+/// phone to name (lanternd unreachable, or nothing known and none live); the open then goes
+/// without one, as before.
+fn pick_phone(sock: &Path, pkg: &str, user: u32) -> Option<String> {
+    let report = match ipc::query_status(sock) {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::debug!(
+                error = format!("{error:#}"),
+                "no lanternd status; open names no phone"
+            );
+            return None;
+        }
+    };
+    let have = match crate::daemon::catalog::Dirs::from_env() {
+        Ok(dirs) => crate::daemon::catalog::phones_with(&dirs, pkg, user),
+        Err(error) => {
+            tracing::warn!(error = format!("{error:#}"), "menu entries unreadable");
+            Vec::new()
+        }
+    };
+    let target = resolve::resolve(&report.phones, &have);
+    tracing::info!(?target, ?have, "picked the phone");
+    match target {
+        resolve::Target::Phone(serial) | resolve::Target::Connect(Some(serial)) => Some(serial),
+        resolve::Target::Connect(None) => None,
+    }
+}
+
 /// "Connect your …": the app (named as in its menu entry, with its icon) opens once a phone
 /// that has it is plugged in, named from the device records. For [`Notice::NotOnThisPhone`]
 /// the connected phone comes from `lantern status` (none if that fails). [`Notice::Paused`]
 /// gets "Lantern is disconnected" instead. The exit status is unaffected.
 fn notify_connect_phone(id: &identity::Identity, notice: Notice) {
+    if !notice.own_notification() {
+        return;
+    }
     if notice == Notice::Paused {
         let (summary, body, icon) = match crate::daemon::catalog::Dirs::from_env() {
             Ok(dirs) => crate::daemon::catalog::paused_notice(&dirs, &id.pkg, id.user),
@@ -896,7 +938,7 @@ fn notify_connect_phone(id: &identity::Identity, notice: Notice) {
         return;
     }
     let here = match notice {
-        Notice::NoPhone | Notice::Paused | Notice::Locked => None,
+        Notice::NoPhone | Notice::Paused | Notice::Locked | Notice::Offered => None,
         Notice::NotOnThisPhone => ipc::runtime_dir()
             .and_then(|dir| ipc::query_status(&ipc::socket_path_in(&dir)))
             .ok()
@@ -943,6 +985,7 @@ fn window_names(id: &identity::Identity, state_dir: Option<&Path>) -> (String, S
 
 /// Runs `lantern open [--phone S] [--user N] <pkg>`; returns the process exit code.
 pub fn run(id: &identity::Identity) -> Result<i32> {
+    let mut id = id.clone();
     // Our launch token goes to the daemon (for an already-open window) and to our own window;
     // children must not inherit it.
     let launch_token = std::env::var("XDG_ACTIVATION_TOKEN")
@@ -952,11 +995,15 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
     std::env::remove_var("DESKTOP_STARTUP_ID");
 
     let sock_path = ipc::socket_path_in(&ipc::runtime_dir()?);
+    if id.phone.is_none() {
+        // From here on the window acts as `--phone <serial>` (names, size key, `open.phone`).
+        id.phone = pick_phone(&sock_path, &id.pkg, id.user);
+    }
     let sock = match UnixStream::connect(&sock_path) {
         Ok(sock) => sock,
         Err(error) => {
             if outcome::daemon_unreachable(&error) {
-                notify_connect_phone(id, Notice::NoPhone);
+                notify_connect_phone(&id, Notice::NoPhone);
             }
             return Err(error).with_context(|| {
                 format!(
@@ -986,9 +1033,9 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
     let debug_steps = std::env::var("LANTERN_DEBUG_INPUT")
         .map(|s| parse_debug_steps(&s))
         .unwrap_or_default();
-    let (app_id, size_key) = window_names(id, crate::daemon::companion::state_dir().as_deref());
+    let (app_id, size_key) = window_names(&id, crate::daemon::companion::state_dir().as_deref());
     let mut app = App {
-        id: id.clone(),
+        id,
         app_id,
         tx,
         slot,
@@ -1128,7 +1175,7 @@ mod tests {
                 "com.a:10@20e9318".to_owned()
             )
         );
-        // Without --phone (until Task 5) the names are today's.
+        // Without a phone (none resolved) the names are today's.
         assert_eq!(
             window_names(&on(None), Some(&dir)),
             ("lantern.com.a-u10".to_owned(), "com.a:10".to_owned())

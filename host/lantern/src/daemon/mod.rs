@@ -117,7 +117,9 @@ pub struct Parts {
     pub state_dir: Option<PathBuf>,
     /// The unplug grace and how long a connect-and-open request waits.
     pub timing: Timing,
-    /// Gets the "plugged in" / "plug it in" prompts (`try_send`: a full channel drops one).
+    /// Gets the "plugged in" / "plug it in" / refused-open prompts (`try_send`: a full channel
+    /// drops one). Set only when the connect prompt runs: it also makes an open for a phone that
+    /// isn't connected an offer to connect it ([`Hub::set_connect_events`]).
     pub connect_events: Option<mpsc::Sender<ConnectEvent>>,
     /// Opens the app of a connect-and-open request once its phone is ready.
     pub opener: Option<Opener>,
@@ -174,6 +176,9 @@ where
     } = parts;
     let mut hub = Hub::new(Some(listener));
     hub.set_state_dir(state_dir.clone());
+    if connect_events.is_some() {
+        hub.set_connect_events();
+    }
     if let Some(events) = lock_events {
         hub.set_lock_events(events);
     }
@@ -846,6 +851,14 @@ where
                     ended = Some("helper stopped reading");
                 }
                 queued.extend(hub.take_commands());
+                for (serial, pkg, user) in hub.take_refused() {
+                    let name = names.get(&serial).unwrap_or_else(|| serial.clone());
+                    let app = hub.app_name(&pkg, user);
+                    connect_event(
+                        connect_events.as_ref(),
+                        ConnectEvent::OpenRefused { serial, name, app, pkg, user },
+                    );
+                }
             }
             offer = async { offers.as_mut().expect("guarded").recv().await }, if offers.is_some() => {
                 match offer {
@@ -1221,7 +1234,8 @@ pub async fn run() -> Result<()> {
             lock_events,
             state_dir: companion::state_dir(),
             timing,
-            // The connect prompt comes with the plugged-in notifications.
+            // The connect prompt comes with the plugged-in notifications. Setting this also
+            // turns opens for a phone that isn't connected into offers (`CONNECT_OFFERED`).
             connect_events: None,
             opener: opener(),
         },

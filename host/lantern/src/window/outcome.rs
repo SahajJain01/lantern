@@ -24,6 +24,22 @@ pub enum Notice {
     /// The phone's PIN lock blocked the open. lanternd shows the unlock notification and
     /// reopens the app after the unlock, so the window shows none of its own.
     Locked,
+    /// The open's phone isn't connected and lanternd's connect prompt offered to connect it
+    /// ("Connect your <phone>" with a Connect button), so the window shows none of its own.
+    Offered,
+}
+
+impl Notice {
+    /// Whether the window shows a notification of its own for this notice (lanternd shows
+    /// [`Notice::Locked`]'s and [`Notice::Offered`]'s).
+    pub fn own_notification(self) -> bool {
+        !matches!(self, Notice::Locked | Notice::Offered)
+    }
+}
+
+/// The summary of lanternd's notice for [`Notice::Offered`] (the window logs it).
+pub fn offered_summary(name: &str) -> String {
+    format!("Connect your {name}")
 }
 
 #[derive(Debug, Default)]
@@ -94,12 +110,15 @@ impl OpenState {
 
     /// Which "Connect your …" notification `error{msg}` on `stream` calls for: only the daemon
     /// refusing our open (stream 0, before `opened`) because no phone is connected, the
-    /// connected one lacks the app, or the user disconnected the phone in Lantern.
+    /// connected one lacks the app, the user disconnected the phone in Lantern, or lanternd
+    /// offered to connect the phone the open named.
     ///
     /// [`Notice::Locked`] is the daemon's replacement for the phone's error on our window's
     /// stream when the PIN lock blocked our open (before `opened`).
     pub fn notice(&self, stream: u32, msg: &str) -> Option<Notice> {
-        use crate::daemon::ipc::{NOT_CONNECTED, NOT_ON_THIS_PHONE, PAUSED, PHONE_LOCKED};
+        use crate::daemon::ipc::{
+            CONNECT_OFFERED, NOT_CONNECTED, NOT_ON_THIS_PHONE, PAUSED, PHONE_LOCKED,
+        };
         if self.win.is_some() {
             return None;
         }
@@ -113,6 +132,7 @@ impl OpenState {
             NOT_CONNECTED => Some(Notice::NoPhone),
             NOT_ON_THIS_PHONE => Some(Notice::NotOnThisPhone),
             PAUSED => Some(Notice::Paused),
+            CONNECT_OFFERED => Some(Notice::Offered),
             _ => None,
         }
     }
@@ -246,6 +266,36 @@ mod tests {
         let mut opened = OpenState::default();
         opened.opened(4);
         assert_eq!(opened.notice(4, "phone locked"), None);
+    }
+
+    /// lanternd offered to connect the open's phone (its connect prompt shows the notice): the
+    /// window shows none of its own, logs the summary and exits 1.
+    #[test]
+    fn offered_is_a_notice_without_own_notification() {
+        let mut s = OpenState::default();
+        assert_eq!(
+            crate::daemon::ipc::CONNECT_OFFERED,
+            "phone not connected; Lantern offered to connect it"
+        );
+        assert_eq!(
+            s.notice(0, crate::daemon::ipc::CONNECT_OFFERED),
+            Some(Notice::Offered)
+        );
+        assert!(!Notice::Offered.own_notification());
+        assert!(!Notice::Locked.own_notification());
+        for notice in [Notice::NoPhone, Notice::NotOnThisPhone, Notice::Paused] {
+            assert!(notice.own_notification(), "{notice:?}");
+        }
+        assert_eq!(offered_summary("Pixel"), "Connect your Pixel");
+        assert_eq!(
+            s.on_error(0, crate::daemon::ipc::CONNECT_OFFERED.into()),
+            failed("phone not connected; Lantern offered to connect it")
+        );
+        // Only lanternd's refusal of our open: not on a window's stream, not after `opened`.
+        assert_eq!(s.notice(3, crate::daemon::ipc::CONNECT_OFFERED), None);
+        let mut opened = OpenState::default();
+        opened.opened(1);
+        assert_eq!(opened.notice(0, crate::daemon::ipc::CONNECT_OFFERED), None);
     }
 
     #[test]

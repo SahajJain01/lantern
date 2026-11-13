@@ -24,21 +24,14 @@ fn usage_error_exits_2() {
 
 #[test]
 fn open_without_a_daemon_exits_1() {
-    let dir = std::env::temp_dir().join(format!("lantern-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
-        .args(["open", "com.example"])
-        .env("XDG_RUNTIME_DIR", &dir)
-        .envs(scratch_xdg(&dir))
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+    let (output, sent) = open_without_daemon("open-none", &["open", "com.example"]);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(
         stderr.contains("lanternd is not running"),
         "stderr: {stderr}"
     );
+    assert!(sent.contains("Connect your phone"), "notify-send: {sent:?}");
 }
 
 #[test]
@@ -317,19 +310,71 @@ fn open_with_user_reaches_the_daemon_step() {
         &["open", "--user=10", "com.example"],
         &["open", "com.example", "--user", "0"],
     ] {
-        let dir = scratch("open-user-ok");
-        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
-            .args(args)
-            .env("XDG_RUNTIME_DIR", &dir)
-            .envs(scratch_xdg(&dir))
-            .output()
-            .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        let (output, _) = open_without_daemon("open-user-ok", args);
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert_eq!(output.status.code(), Some(1), "{args:?} stderr: {stderr}");
         assert!(
             stderr.contains("lanternd is not running"),
             "{args:?} stderr: {stderr}"
+        );
+    }
+}
+
+/// Runs `lantern open <args>` with no daemon, in scratch XDG dirs, a dead session bus and a
+/// recording `notify-send` stub (a test never shows a notification on the desktop); returns
+/// (output, the notify-send argument lines).
+fn open_without_daemon(tag: &str, args: &[&str]) -> (std::process::Output, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch(tag);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    stub_desktop_tools(&bin);
+    let notes = dir.join("notify-send.args");
+    let stub = bin.join("notify-send");
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 0\n", notes.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .args(args)
+        .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
+        .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    // notify-send is reaped off-thread; give a late write a moment.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !notes.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sent = std::fs::read_to_string(&notes).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    (output, sent)
+}
+
+#[test]
+fn open_with_phone_reaches_the_daemon_step() {
+    // A valid `--phone` parses; with no daemon it fails at runtime (1), not as usage (2), and
+    // shows the \"Connect your phone\" notice (through the stub).
+    for args in [
+        &["open", "--phone", "20e9318", "com.example"][..],
+        &["open", "--phone=ZD222LMDFV", "--user", "10", "com.example"],
+        &["open", "com.example", "--phone", "a:b"],
+    ] {
+        let (output, sent) = open_without_daemon("open-phone-ok", args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?} stderr: {stderr}");
+        assert!(
+            stderr.contains("lanternd is not running"),
+            "{args:?} stderr: {stderr}"
+        );
+        assert!(
+            sent.contains("Connect your phone"),
+            "{args:?} notify-send: {sent:?}"
         );
     }
 }
@@ -445,7 +490,9 @@ fn failed_open_prints_the_error_once_and_exits_1() {
         Ok(String::from_utf8(payload).unwrap())
     });
     let child = Command::new(env!("CARGO_BIN_EXE_lantern"))
-        .args(["open", "com.example"])
+        // Named: without a phone the window first asks for `lantern status`, which this fake
+        // daemon doesn't answer.
+        .args(["open", "--phone", "dev", "com.example"])
         .env("XDG_RUNTIME_DIR", &dir)
         .envs(scratch_xdg(&dir))
         .env("WAYLAND_DISPLAY", &wayland)

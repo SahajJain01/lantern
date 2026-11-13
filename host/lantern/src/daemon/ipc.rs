@@ -4,6 +4,8 @@
 //! the daemon claims `pkg:user` in the [`Registry`]:
 //! - New window `N`: the Open (minus `activation_token` and `phone`) goes to the helper on
 //!   stream `N`, and from then on frames on stream `N` pass through unchanged in both directions.
+//! - An Open naming a `phone` other than the live session's is refused: with the connect prompt
+//!   running, lanternd offers to connect that phone ([`CONNECT_OFFERED`]).
 //! - Already open: the existing window's client gets `focus{activation_token}` on its stream,
 //!   the new client gets `focus` (stream = existing id) and is closed.
 //!
@@ -19,7 +21,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use lantern_proto::{
     read_frame_async, write_frame_async, CompanionState, Control, DaemonCmd, Frame, InputEvent,
-    Kind, SessionState, StatusReport, WindowInfo, MAX_CLIP, MAX_IME_TEXT,
+    Kind, PhoneState, SessionState, StatusReport, WindowInfo, MAX_CLIP, MAX_IME_TEXT,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::error::TrySendError;
@@ -49,6 +51,9 @@ pub const NOT_CONNECTED: &str = "phone not connected";
 pub const NOT_ON_THIS_PHONE: &str = "app not on this phone";
 /// The user disconnected the phone in Lantern (tray or `lantern disconnect`).
 pub const PAUSED: &str = "phone disconnected in Lantern";
+/// The open named a phone that isn't connected, and lanternd's connect prompt offered to connect
+/// it ("Connect your <phone>" with a Connect button): the window shows no notice of its own.
+pub const CONNECT_OFFERED: &str = "phone not connected; Lantern offered to connect it";
 /// Replaces the helper's error for an open that failed while the phone's PIN lock was in the
 /// way: lanternd shows the unlock notification and reopens the app after the unlock.
 pub const PHONE_LOCKED: &str = "phone locked";
@@ -366,6 +371,10 @@ pub struct Hub {
     /// Opens the lock blocked, oldest first, one per app and phone (serial, pkg, user, when):
     /// reopened after an unlock of that phone.
     reopens: Vec<(String, String, u32, Instant)>,
+    /// The connect prompt runs: an open for a phone that isn't connected is offered to it.
+    connect_prompt: bool,
+    /// Opens refused with [`CONNECT_OFFERED`] not yet taken by the run loop: (serial, pkg, user).
+    refused: Vec<(String, String, u32)>,
 }
 
 impl Hub {
@@ -395,7 +404,22 @@ impl Hub {
             lock_events: None,
             opened: HashSet::new(),
             reopens: Vec::new(),
+            connect_prompt: false,
+            refused: Vec::new(),
         }
+    }
+
+    /// The connect prompt runs: an open naming a phone that isn't connected (but is plugged in
+    /// or known) is answered with [`CONNECT_OFFERED`] and queued for [`Self::take_refused`],
+    /// instead of the old [`NOT_CONNECTED`]/[`PAUSED`].
+    pub fn set_connect_events(&mut self) {
+        self.connect_prompt = true;
+    }
+
+    /// The opens refused with [`CONNECT_OFFERED`] since the last call, oldest first:
+    /// (serial, pkg, user), for the prompt's `OpenRefused`.
+    pub fn take_refused(&mut self) -> Vec<(String, String, u32)> {
+        std::mem::take(&mut self.refused)
     }
 
     /// The helper's lock messages go to `events` as [`LockEvent`]s.
@@ -929,8 +953,7 @@ impl Hub {
             h,
             dpi,
             activation_token,
-            // Which phone the window wants: lanternd's own until it routes by phone.
-            phone: _,
+            phone,
         }) = open
         else {
             tracing::warn!(cid, "first client frame was not open on stream 0");
@@ -949,6 +972,13 @@ impl Hub {
             self.reply_and_finish(cid, control(0, Control::error(msg)));
             return Ok(());
         }
+        // The window chose the live phone: it goes there whatever the catalogue says.
+        let chosen = helper.is_some() && phone.is_some() && phone.as_deref() == self.serial();
+        if let Some(serial) = phone.filter(|_| !chosen) {
+            let msg = self.refuse_for_phone(cid, serial, pkg, user);
+            self.reply_and_finish(cid, control(0, Control::error(msg)));
+            return Ok(());
+        }
         let Some(helper) = helper else {
             let msg = match self.session.0 {
                 SessionState::Paused => PAUSED,
@@ -957,7 +987,7 @@ impl Hub {
             self.reply_and_finish(cid, control(0, Control::error(msg)));
             return Ok(());
         };
-        if self.not_on_this_phone(&pkg, user) {
+        if !chosen && self.not_on_this_phone(&pkg, user) {
             tracing::info!(cid, pkg, user, "app not on this phone; refusing the open");
             self.reply_and_finish(cid, control(0, Control::error(NOT_ON_THIS_PHONE)));
             return Ok(());
@@ -1019,6 +1049,44 @@ impl Hub {
                 );
                 Ok(())
             }
+        }
+    }
+
+    /// The refusal of an open naming `serial`, which isn't the live phone. With the connect
+    /// prompt, a phone the view lists (and isn't being undone) is offered: the open is queued for
+    /// the prompt. Otherwise [`PAUSED`] for a phone switched off in Lantern, else
+    /// [`NOT_CONNECTED`]; a serial lanternd doesn't know is never offered (no record, no row).
+    fn refuse_for_phone(
+        &mut self,
+        cid: u64,
+        serial: String,
+        pkg: String,
+        user: u32,
+    ) -> &'static str {
+        let state = self.view.phone(&serial).map(|p| p.state);
+        if self.connect_prompt && state.is_some_and(|s| s != PhoneState::Undoing) {
+            tracing::info!(
+                cid,
+                serial,
+                pkg,
+                user,
+                "open for a phone that isn't connected; offering to connect it"
+            );
+            self.refused.push((serial, pkg, user));
+            return CONNECT_OFFERED;
+        }
+        tracing::info!(
+            cid,
+            serial,
+            pkg,
+            user,
+            ?state,
+            "open for a phone that isn't connected; refusing it"
+        );
+        if state == Some(PhoneState::Off) {
+            PAUSED
+        } else {
+            NOT_CONNECTED
         }
     }
 

@@ -449,11 +449,30 @@ def directories_dir():
         "desktop-directories"
 
 
+def lantern_state_dir():
+    """lanternd's state dir (`companion::state_dir()`)."""
+    state = os.environ.get("XDG_STATE_HOME", "")
+    return (Path(state) if state.startswith("/") else Path.home() / ".local/state") / "lantern"
+
+
 def devices_dir():
     """lanternd's device records (`companion::state_dir()/devices`)."""
-    state = os.environ.get("XDG_STATE_HOME", "")
-    return (Path(state) if state.startswith("/") else Path.home() / ".local/state") / \
-        "lantern" / "devices"
+    return lantern_state_dir() / "devices"
+
+
+def windows_json():
+    """The windows' remembered sizes (`window::sizes_path`)."""
+    return lantern_state_dir() / "windows.json"
+
+
+def size_key_of(pkg):
+    """`Naming::size_key(pkg, 0, SERIAL)`: the bare package when menu.json's primary is SERIAL,
+    else `<pkg>@<SERIAL>`."""
+    try:
+        primary = json.loads((lantern_state_dir() / "menu.json").read_text()).get("primary")
+    except (OSError, ValueError, AttributeError):
+        primary = None
+    return pkg if primary == SERIAL else f"{pkg}@{SERIAL}"
 
 
 def settings_file():
@@ -713,7 +732,9 @@ for (const w of wins) { w.closeWindow(); print(TAG + " closed " + w.resourceClas
 
 
 def kwin_on(pkg, js, name, **subst):
-    js = js.replace("CLASS", json.dumps(f"lantern.{pkg}"))
+    """Runs `js` on the windows of `pkg` on SERIAL: CLASS is its app_id (`app_id_of`), which a
+    window without --phone has only if it resolved SERIAL and named itself after its entry."""
+    js = js.replace("CLASS", json.dumps(app_id_of(pkg)))
     for k, v in subst.items():
         js = js.replace(k, str(v))
     return kwin(js, name)
@@ -759,7 +780,9 @@ class Suite:
         for line in desc:
             note(f"kwin: {line}")
         check("count=1" in desc[0], f"expected one KWin window: {desc}")
-        check(f"resourceClass=lantern.{SETTINGS}" in desc[1], "app_id mismatch")
+        # The window was opened without --phone: it resolved SERIAL and took its entry's name.
+        want = app_id_of(SETTINGS)
+        check(f"resourceClass={want} " in desc[1], f"app_id mismatch: want {want}: {desc[1]}")
 
     def second_open_focuses(self):
         second = Window(SETTINGS, "settings-second")
@@ -987,9 +1010,18 @@ class Suite:
                 note(f"kwin: {line}")
             m = re.search(r" caption=(.*) client=", desc[1])
             check(m and m.group(1) == "Settings", f"caption {m.group(1) if m else desc[1]!r}")
+            sizes = windows_json()
+            before = sizes.stat().st_mtime_ns if sizes.exists() else None
             kwin_on(SETTINGS, CLOSE, "lantern_close")
             code = w.wait_exit(5)
             check(code == 0, f"window exit {code}")
+            # The size is remembered under SERIAL's key (the window resolved SERIAL).
+            key = size_key_of(SETTINGS)
+            after = sizes.stat().st_mtime_ns if sizes.exists() else None
+            check(after is not None and after != before, f"{sizes} was not written on close")
+            keys = json.loads(sizes.read_text())
+            check(key in keys, f"{sizes} has no key {key!r}: {sorted(keys)}")
+            note(f"windows.json[{key!r}] = {keys[key]}")
         finally:
             w.kill()
         wait_until("lantern display gone", 5, lambda: not lantern_displays())
@@ -1162,7 +1194,9 @@ class Suite:
     def not_on_this_phone_notice(self):
         """After this phone's full sync, opening an app only another phone has is refused
         (exit 1) with "Connect your <that phone's name>", and this phone's device record has
-        its name."""
+        its name. The window resolves the other phone (it has the app; the live one lacks it) and
+        logs that line both when lanternd offers to connect it and on the window's own
+        fallback notice."""
         pkg = "dev.lantern.test.absent"
         name, planted = per_phone_entry(pkg, "lantern-test-other", "Lantern test absent")
         entry = applications_dir() / name

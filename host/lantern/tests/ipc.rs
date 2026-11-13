@@ -1592,12 +1592,17 @@ async fn catalogue_from_helper_becomes_menu_entries() {
 /// Plants the menu entry of `pkg` (user 0) as written by phone `serial`'s sync, under the
 /// legacy name (as if `serial` were the primary phone).
 fn plant_entry(dirs: &Dirs, pkg: &str, serial: &str) {
+    plant_named_entry(dirs, pkg, serial, pkg);
+}
+
+/// [`plant_entry`] with the menu name `label`.
+fn plant_named_entry(dirs: &Dirs, pkg: &str, serial: &str, label: &str) {
     use lantern::daemon::catalog::{desktop_file, AppEntry};
     use lantern::naming::Naming;
     let e = AppEntry {
         pkg: pkg.into(),
         user: 0,
-        label: pkg.into(),
+        label: label.into(),
         work: false,
         icon_png: Vec::new(),
     };
@@ -3425,4 +3430,175 @@ async fn without_unlock_prompt_open_errors_are_kept() {
     helper.send(error.clone());
     assert_eq!(recv(&mut client).await, Some(error));
     daemon.shutdown().await;
+}
+
+// --- open.phone routing (Task 5) ---------------------------------------------------------------
+
+/// A window's `open` naming `phone`.
+fn open_on(pkg: &str, user: u32, phone: &str) -> Frame {
+    control(
+        0,
+        Control::Open {
+            pkg: pkg.into(),
+            user,
+            w: 1280,
+            h: 800,
+            dpi: 160,
+            activation_token: None,
+            phone: Some(phone.into()),
+        },
+    )
+}
+
+/// Sends `frame` as a new client's `open` and returns lanternd's reply (it must be lanternd's
+/// own refusal on stream 0), after checking it then closes the client.
+async fn refused(sock: &Path, frame: Frame) -> Control {
+    let mut client = UnixStream::connect(sock).await.unwrap();
+    send(&mut client, &frame).await;
+    let reply = recv(&mut client).await.expect("a reply to the open");
+    assert_eq!(reply.stream, 0);
+    assert_eof(&mut client).await;
+    decode(&reply)
+}
+
+/// Sends `dev`'s full catalogue (com.y only) and waits until it is in: from then on an app in
+/// the menu for other phones only is "not on this phone".
+async fn full_sync(helper: &FakeHelper, dirs: &Dirs) {
+    helper.send(app("com.y", 0, "Yankee", ""));
+    helper.send(control(0, Control::AppsEnd { count: 1 }));
+    // Helper frames are handled in order: once com.z's entry exists, apps_end has been too.
+    helper.send(app("com.z", 0, "Zulu", ""));
+    wait_files(&dirs.applications, "synced", |n| {
+        n.iter().any(|f| f == "lantern.com.z.desktop")
+    })
+    .await;
+}
+
+/// `open{phone}` naming the live phone goes to its helper with `phone` stripped, even for an
+/// app the catalogue says is only on another phone (the window chose the phone).
+#[tokio::test]
+async fn open_naming_the_live_phone_is_forwarded() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (root, dirs, catalog) = temp_catalog();
+    plant_entry(&dirs, "com.x", "other");
+    let mut ctl = start_ctl_with(port, &["dev"], None, |p| p.catalog = Some(catalog));
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    full_sync(&helper, &dirs).await;
+    // Without a phone the Plan 3 rule still refuses it.
+    assert_eq!(
+        refused(&ctl.sock, open("com.x", 0, None)).await,
+        Control::error(ipc::NOT_ON_THIS_PHONE)
+    );
+    let mut client = UnixStream::connect(&ctl.sock).await.unwrap();
+    send(&mut client, &open_on("com.x", 0, "dev")).await;
+    let fwd = helper.next().await;
+    assert!(fwd.stream > 0);
+    assert_eq!(
+        fwd.payload,
+        br#"{"t":"open","pkg":"com.x","user":0,"w":1280,"h":800,"dpi":160}"#
+    );
+    ctl.assert_no_prompt().await;
+    ctl.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// With the connect prompt, `open{phone}` naming a phone that isn't live is refused with
+/// CONNECT_OFFERED and the prompt gets `OpenRefused` (the app named as in its entry); the
+/// helper sees nothing. An Off phone is offered too; a serial lanternd doesn't know is not.
+#[tokio::test]
+async fn open_naming_another_phone_is_offered() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (root, dirs, catalog) = temp_catalog();
+    plant_named_entry(&dirs, "com.x", "b", "Xray");
+    let mut ctl = start_ctl_with(port, &["dev", "b"], None, |p| p.catalog = Some(catalog));
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    // b plugged in while dev is live: the plug-in prompt.
+    assert_eq!(ctl.prompt().await, plugged_in("b", "b"));
+    let offered = ConnectEvent::OpenRefused {
+        serial: "b".into(),
+        name: "b".into(),
+        app: "Xray".into(),
+        pkg: "com.x".into(),
+        user: 0,
+    };
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::CONNECT_OFFERED)
+    );
+    assert_eq!(ctl.prompt().await, offered);
+    helper.assert_quiet().await;
+    // Switched off: still offered (Connect clears `off`).
+    ctl.command(disconnect("b")).await;
+    ctl.state_until("b", PhoneState::Off).await;
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::CONNECT_OFFERED)
+    );
+    assert_eq!(ctl.prompt().await, offered);
+    // A typo is no phone to connect: the old error, no prompt, no record.
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "typo")).await,
+        Control::error(ipc::NOT_CONNECTED)
+    );
+    ctl.assert_no_prompt().await;
+    assert!(ctl.phone("typo").is_none());
+    helper.assert_quiet().await;
+    ctl.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Without the connect prompt (no session bus) the old errors stay: PAUSED for a phone
+/// switched off in Lantern, NOT_CONNECTED otherwise.
+#[tokio::test]
+async fn open_naming_an_off_phone_without_prompt_is_paused_error() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let mut ctl = start_ctl_with(port, &["dev", "b"], None, |p| p.connect_events = None);
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    ctl.state_until("b", PhoneState::Waiting).await;
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::NOT_CONNECTED)
+    );
+    ctl.command(disconnect("b")).await;
+    ctl.state_until("b", PhoneState::Off).await;
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::PAUSED)
+    );
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "typo")).await,
+        Control::error(ipc::NOT_CONNECTED)
+    );
+    helper.assert_quiet().await;
+    ctl.shutdown().await;
+}
+
+/// `open` without a phone keeps Plan 3's rules even with the connect prompt present: not on
+/// this phone after a full sync, PAUSED after a Disconnect, and no prompt for either.
+#[tokio::test]
+async fn open_without_phone_keeps_plan3_rules() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (root, dirs, catalog) = temp_catalog();
+    plant_entry(&dirs, "com.x", "other");
+    let mut ctl = start_ctl_with(port, &["dev"], None, |p| p.catalog = Some(catalog));
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    full_sync(&helper, &dirs).await;
+    assert_eq!(
+        refused(&ctl.sock, open("com.x", 0, None)).await,
+        Control::error(ipc::NOT_ON_THIS_PHONE)
+    );
+    ctl.command(disconnect("dev")).await;
+    expect_bye(&mut helper).await;
+    ctl.state_until("dev", PhoneState::Off).await;
+    assert_eq!(
+        refused(&ctl.sock, open("com.y", 0, None)).await,
+        Control::error(ipc::PAUSED)
+    );
+    ctl.assert_no_prompt().await;
+    ctl.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
 }
