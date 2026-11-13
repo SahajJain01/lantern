@@ -29,10 +29,9 @@ Start here in a new session. Read this file, then `README.md`, then the spec
     `.superpowers/sdd/2026-11-10-lantern-phones-and-tray/`.
 - **Plan 4a** (`docs/superpowers/plans/2026-11-13-lantern-unlock-prompt.md`, design
   `docs/superpowers/specs/2026-11-13-lantern-unlock-prompt-design.md`): **implemented on branch
-  `plan4a-unlock-prompt`, host tests passing, device checks (items 21-22, Task 1 step 5) not yet
-  run.** Worktree `.worktrees/plan4a`, base `main` `5d83b8b`. Device steps were deferred by
-  Sahaj's instruction to one run at the end (he types the PIN); see "Plan 4a device checks
-  (pending)". Tasks 1–3 each passed their own review after one fix round; Task 4 (tray row,
+  `plan4a-unlock-prompt`, host tests passing, device acceptance passed 2026-11-13** (see "Plan
+  4a device acceptance"). Worktree `.worktrees/plan4a`, base `main` `5d83b8b`. Device steps were
+  deferred by Sahaj's instruction to one run at the end (he typed the PIN). Tasks 1–3 each passed their own review after one fix round; Task 4 (tray row,
   item 22, docs) passed review without one. The final branch review asked for two fixes (the
   keyguard focus check now rejects any `pkg/cls` title; these docs), both done. The SDD ledger and reports are in the worktree's gitignored
   `.superpowers/sdd/2026-11-13-lantern-unlock-prompt/` (copy it to the main checkout before
@@ -118,43 +117,42 @@ both phones plugged in, `systemctl --user set-environment LANTERN_SERIAL=20e9318
 6. Two windows on the real desktop: type into the test screen, click a second Lantern window's
    text field, type there, and check nothing typed lands in the other window's field.
 
-### Plan 4a device checks (pending)
+### Plan 4a device acceptance (2026-11-13, three phones attached, desktop unlocked)
 
-Not run yet. They need the Motorola (`ZD222LMDFV`, PIN keyguard) with Sahaj typing its PIN, and
-the Xiaomi (`20e9318`, swipe keyguard), both plugged in, the desktop unlocked. In the worktree:
+Installed from the branch (`build.py install`, helper `c0d475e7…`).
 
-```sh
-cd .worktrees/plan4a
-# 1. Xiaomi: the full automatic suite, including item 22 (a swipe phone never prompts).
-systemctl --user set-environment LANTERN_SERIAL=20e9318
-python3 tools/build.py install && python3 tools/device_test.py     # expect 19/19 PASS
-# 2. Motorola: serve it.
-systemctl --user set-environment LANTERN_SERIAL=ZD222LMDFV && systemctl --user restart lanternd
-#    Task 1 step 5 (by hand, Sahaj unlocks by hand at the end):
-adb -s ZD222LMDFV shell input keyevent KEYCODE_SLEEP; sleep 5
-adb -s ZD222LMDFV shell dumpsys trust | grep deviceLocked        # (current) line: deviceLocked=1
-#    copy any text on the PC, then (the last lines only):
-adb -s ZD222LMDFV logcat -d -t 500 -s lantern | grep -E 'lock:|clip:'
-#    want `lock: phone locked (clipboard)` once and no `clip: PC clipboard ... set`;
-#    Sahaj unlocks by hand; within ~5 s (2 s poll + up to 3 s dumpsys) `lock: phone unlocked` and `clip: held PC copy ... set on
-#    the phone`.
-# 3. Item 21 (manual; Sahaj clicks "Enter PIN…" and types the PIN, then a wrong PIN and
-#    "Try again"):
-LANTERN_SERIAL=ZD222LMDFV python3 tools/device_test.py --manual --only 21
-# 4. Back to normal.
-systemctl --user unset-environment LANTERN_SERIAL && systemctl --user restart lanternd
-```
-
-Also worth checking by hand then: the tray's "Unlock edge 50 pro…" row while locked, and
-FocusProbe against the real `dumpsys window displays` on the Motorola (item 21 covers it
-indirectly: "lock screen not reached" would fail it).
+- **Xiaomi `20e9318`** (`LANTERN_SERIAL=20e9318`, `device_test.py`): **19/19 automatic PASS**,
+  including item 22 `swipe_phone_never_prompts` (21.9 s).
+- **Motorola `ZD222LMDFV`** (`LANTERN_SERIAL=ZD222LMDFV`), Sahaj typing the PIN:
+  - Task 1 step 5: a PC copy while locked logged `lock: phone locked (clipboard)` once and wrote
+    nothing; after the unlock, `lock: phone unlocked` and `clip: held PC copy (27 chars) set on
+    the phone` within 0.2 s of each other.
+  - Item 21 right-PIN pass, twice: "Unlock your edge 50 pro" 0.2 s after the copy,
+    `deviceLocked=0` 3.5–3.9 s after lanternd sent the unlock, the panel `powerMode=Off` again,
+    and the tag pasted into the test screen (`LanternTest: text=lantern-unlock-…`).
+  - Item 21 as a whole FAILED twice, both times only because Sahaj typed the right PIN in the
+    wrong-PIN step (he confirmed). The wrong-PIN pass was then done by hand: the tray's
+    **Unlock edge 50 pro…** row (row 13) prompted, one wrong PIN gave exactly one
+    `unlock: still locked`, "That PIN didn't unlock edge 50 pro", the phone still locked and the
+    panel off. A careful retry from the tray row unlocked it (`ok in 3685 ms`) and wrote the
+    held PC copy.
+  - Two dialog answers that were not 4–16 digits were refused on the PC ("Couldn't unlock …",
+    nothing sent). One more attempt was a mistype: Android's keyguard registered about half the
+    key events of every successful unlock (diagnosed from the `NumPadKey` userActivity lines in
+    `logcat -b all`; every successful unlock showed the same count, so Lantern drops no digits).
+  - Real use in between: three more unlocks from the notification, each with the held copy
+    written once.
+- Not re-run: item 21 end to end in one pass. All of its assertions were seen on the device
+  above, across the two runs and the manual steps.
+- Afterwards: `LANTERN_SERIAL` unset, lanternd restarted (it served the Xiaomi, the first phone
+  online), the PC clipboard restored by the suite.
 
 ### Field findings on the Motorola (2026-11-13, Plan 2 build)
 
 Seen by Sahaj on the installed Plan 2 build with the Motorola edge 50 pro. Finding 1 is addressed
-by Plan 4a (device check pending); 2 and 3 are not fixed and stay on the Plan 4 list below.
+by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Plan 4 list below.
 
-1. **Addressed by Plan 4a (device check pending).** Clipboard is dead while the phone's PIN keyguard is locked (`dumpsys trust` deviceLocked=1):
+1. **Fixed by Plan 4a (device-checked 2026-11-13).** Clipboard is dead while the phone's PIN keyguard is locked (`dumpsys trust` deviceLocked=1):
    apps render behind the keyguard (ALWAYS_UNLOCKED) but Android returns null for every clipboard
    read, so pastes are empty and the helper's listener silently drops phone copies;
    setPrimaryClip still 'succeeds'. Unlocking once with the PIN fixed it (stay-awake keeps it
@@ -201,7 +199,6 @@ by Plan 4a (device check pending); 2 and 3 are not fixed and stay on the Plan 4 
 - Plan 3 on a device beyond items 15–20 and the two-phone check: the tray menu opened by hand on
   the Plasma panel, re-registration after a plasmashell restart (host-tested only), Quit and the
   Lantern launcher, start-at-login toggling, Undo phone setup from the tray.
-- Plan 4a on a device: items 21–22 and Task 1 step 5 (see "Plan 4a device checks (pending)").
 - From Plan 1: third-party notification clicks, app-started rotation on a real
   device, long runs with 5–6 encoders, interactive play in games.
 
@@ -381,7 +378,7 @@ findings):
 - A latency harness, and the target from spec §9a/§11: no more than 5 ms worse than scrcpy.
 - Choosing between two phones plugged in at the same time (today the first one online wins).
 - A settings window (the tray holds the few settings today).
-- ~~Field finding 1~~: addressed by Plan 4a (device check pending).
+- ~~Field finding 1~~: fixed by Plan 4a (device-checked 2026-11-13).
 - Field finding 2: `default_input_method` changed to Gboard mid-session — find the cause; consider
   the helper re-asserting the Lantern keyboard or reporting a keyboard changed by someone else
   (and a stale Lantern entry already in the journaled `enabled_input_methods` original).
