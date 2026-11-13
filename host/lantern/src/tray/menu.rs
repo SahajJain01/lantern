@@ -18,6 +18,8 @@ pub enum Action {
     ToggleLogin,
     OpenSettings,
     UndoSetup,
+    /// Asks the unlock prompt for its PIN dialog (the notification action's path).
+    Unlock,
     Quit,
 }
 
@@ -89,6 +91,7 @@ pub fn status_line(view: &View) -> String {
     match &view.phone {
         Phone::None => "No phone connected".to_owned(),
         Phone::Starting { .. } => format!("Connecting to {name}…"),
+        Phone::Ready { .. } if view.locked => format!("Connected to {name} (locked)"),
         Phone::Ready { .. } => format!("Connected to {name}"),
         Phone::Retrying { .. } => format!("Reconnecting to {name}…"),
         Phone::Paused { .. } => format!("Disconnected from {name}"),
@@ -127,6 +130,14 @@ pub fn items(
         id: 1,
         text: status_line(view),
     }];
+    if view.locked {
+        rows.push(Item::Button {
+            id: 13,
+            text: format!("Unlock {}…", name(view)),
+            enabled: true,
+            action: Action::Unlock,
+        });
+    }
     if let Some((_, msg)) = companion_msg(view) {
         let text = if msg == KEYBOARD_OFF_MSG {
             "Typing through the Lantern keyboard is off".to_owned()
@@ -400,6 +411,40 @@ mod tests {
         assert_eq!(rows(&v), want);
         assert_eq!(overlay(&v), "view-refresh");
         assert_eq!(sni_status(&v), "Active");
+    }
+
+    #[test]
+    fn locked_shows_unlock_row() {
+        let mut v = view(Phone::Ready {
+            serial: serial("s1"),
+            companion: Some((CompanionState::Ready, None)),
+        });
+        v.locked = true;
+        let mut want = vec![
+            label(1, "Connected to Test Phone (locked)"),
+            button(13, "Unlock Test Phone…", true, Action::Unlock),
+            button(3, "Disconnect", true, Action::Disconnect),
+        ];
+        want.extend(tail(true));
+        assert_eq!(rows(&v), want);
+        assert_eq!(status_line(&v), "Connected to Test Phone (locked)");
+        assert_eq!(action(&rows(&v), 13), Some(Action::Unlock));
+        // Row 13 right after row 1, before the companion and settings-error rows.
+        let mut warn = v.clone();
+        warn.phone = Phone::Ready {
+            serial: serial("s1"),
+            companion: Some((CompanionState::Unavailable, Some("x".to_owned()))),
+        };
+        let ids: Vec<i32> = items(&warn, &Settings::default(), None, true)
+            .iter()
+            .map(Item::id)
+            .collect();
+        assert_eq!(ids, [1, 13, 2, 12, 3, 4, 5, 6, 8, 9, 10, 11]);
+        // Not locked: no row 13, and a click on its id does nothing.
+        v.locked = false;
+        assert!(!rows(&v).iter().any(|i| i.id() == 13));
+        assert_eq!(action(&rows(&v), 13), None);
+        assert_eq!(status_line(&v), "Connected to Test Phone");
     }
 
     #[test]

@@ -54,7 +54,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `locked` | `reason`: one of `"clipboard"`, `"open"`. Helper → daemon, stream 0 |
 | `unlocked` | none. Helper → daemon, stream 0 |
 | `unlock` | `pin: string` (4–16 ASCII digits). Daemon → helper, stream 0. Never logged, no golden vector |
-| `unlock_result` | `ok: bool`, optional `reason: string`. Helper → daemon, stream 0 |
+| `unlock_result` | `ok: bool`, optional `reason: string` (values under "Lock rules"). Helper → daemon, stream 0 |
 
 ## Session rules (phone helper)
 
@@ -180,8 +180,9 @@ v1.
 While the phone's secure keyguard is locked (`dumpsys trust`: `deviceLocked=1` on the
 `(current)` user's line), Android returns null for every clipboard read and apps may fail to
 start. The helper reads that state with `dumpsys trust` (3 s timeout); an unknown state (no
-current-user line, a failing or slow `dumpsys`) counts as unlocked, so Lantern only reports a
-lock it is sure of. A work profile's own `deviceLocked` line is ignored.
+current-user line, a failing or slow `dumpsys`) counts as unlocked when deciding whether to
+report a lock, so Lantern only reports a lock it is sure of (it never ends a stretch, see below).
+A work profile's own `deviceLocked` line is ignored.
 
 - `locked{reason}` is sent once per locked stretch, when the lock first gets in the way:
   `"clipboard"` when a PC `clip` arrives or a phone clipboard change reads back null while
@@ -194,13 +195,38 @@ lock it is sure of. A work profile's own `deviceLocked` line is ignored.
 - A PC `clip` that arrives while locked is not written: the helper holds the latest one and
   writes it right after the unlock (its echo is suppressed as usual). A phone copy read after
   it drops the held copy, being newer.
-- `unlock{pin}` (stream 0 only) asks the helper for one unlock attempt; it answers
-  `unlock_result{ok}` (`reason` set on failure, omitted when absent). The helper accepts only a
-  string of 4–16 ASCII digits; anything else is the protocol error `bad unlock`, which never
-  quotes the value. Neither side ever logs the PIN (the helper logs only `router: unlock
-  requested`; the Rust `Control::Unlock` holds a `SecretPin`, whose `Debug` prints `SecretPin(<redacted>)`), and no golden
-  vector holds an `unlock`. `locked`, `unlocked` and `unlock_result` from lanternd, and
-  `unlock` on a window stream, are protocol errors.
+- `unlock{pin}` (stream 0 only) asks the helper for one unlock attempt; it answers with exactly
+  one `unlock_result{ok, reason?}` (`reason` omitted when absent). The attempt runs off the
+  control thread: re-read the lock, wake display 0, swipe up, check that display 0's focus is
+  the keyguard, re-read the lock, type the digits and ENTER on display 0 only, then poll the
+  lock for 3 s. Every key and the swipe target display 0 explicitly or the attempt fails; there
+  is no retry, and the panel goes back off afterwards if the session had turned it off.
+  `reason` is one of:
+
+  | `ok` | `reason` | Meaning |
+  |---|---|---|
+  | `true` | omitted | the PIN unlocked the phone (a read of `deviceLocked=0` after ENTER) |
+  | `true` | `"already unlocked"` | unlocked before anything was typed; no digit sent |
+  | `false` | `"wrong PIN"` | a successful read after ENTER still says locked |
+  | `false` | `"unlock not confirmed"` | no read after ENTER succeeded: not the user's error |
+  | `false` | `"lock screen not reached"` | display 0's focus was not the keyguard; nothing typed |
+  | `false` | `"lock state unknown"` | the lock could not be read before typing; nothing typed |
+  | `false` | `"busy"` | another attempt is still running; this PIN was dropped untyped |
+  | `false` | `"unlock failed"` | the attempt could not run or threw (e.g. key injection failed) |
+
+  lanternd shows "That PIN didn't unlock {name}" only for `"wrong PIN"`, and "Couldn't unlock
+  {name}" with the reason (a "check the phone" text for `"unlock not confirmed"`) otherwise.
+- PIN rules: a PIN is 4–16 ASCII digits. lanternd checks that before sending (the dialog's one
+  trailing newline is trimmed), and the helper accepts nothing else: any other `pin` value is
+  the protocol error `bad unlock`, which never quotes the value. lanternd sends a PIN only on a
+  user's click (the notification's action or the tray's Unlock row, one dialog at a time), only
+  to the phone that was shown at the click, and only once per answer; it never retries. Neither
+  side ever logs the PIN or a decode error of a frame that may carry it (the helper logs only
+  `router: unlock requested`; the Rust `Control::Unlock` holds a `SecretPin`, whose `Debug`
+  prints `SecretPin(<redacted>)`; lanternd logs only `unlock sent to the helper`). The PIN is
+  never a process argument (the dialog prints it on stdout), and the helper zeroes its `char[]`
+  when done. No golden vector holds an `unlock`. `locked`, `unlocked` and `unlock_result` from
+  lanternd, and `unlock` on a window stream, are protocol errors.
 
 ## Companion link (helper ↔ companion)
 

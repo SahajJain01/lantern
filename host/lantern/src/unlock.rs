@@ -122,6 +122,35 @@ pub enum LockEvent {
     Reopen(Vec<(String, u32)>),
 }
 
+/// A cheap, cloneable handle that asks the unlock prompt for its PIN dialog: the tray's Unlock
+/// row. It takes exactly the notification action's path (the phone is pinned at the click, one
+/// dialog at a time); the holder never runs the dialog and never sees the PIN.
+#[derive(Debug, Clone)]
+pub struct Request(mpsc::Sender<()>);
+
+/// The prompt's end of [`Request`]s, for [`run`].
+#[derive(Debug)]
+pub struct Requests(mpsc::Receiver<()>);
+
+impl Request {
+    /// A handle and the receiving end [`run`] takes.
+    pub fn channel() -> (Request, Requests) {
+        // One pending ask is enough: more clicks before the prompt looks are the same ask.
+        let (tx, rx) = mpsc::channel(1);
+        (Request(tx), Requests(rx))
+    }
+
+    /// Asks for the PIN dialog without waiting. A click while one is pending is dropped.
+    pub fn ask(&self) {
+        match self.0.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::warn!("unlock: the prompt is gone; no PIN dialog")
+            }
+        }
+    }
+}
+
 /// The PIN dialog: a command whose stdout (exit 0) is the PIN. `{name}` in an argument becomes
 /// the phone's name.
 #[derive(Debug, Clone)]
@@ -312,6 +341,34 @@ fn ask(prompt: &Prompt, name: &str) -> Result<Option<Pin>, String> {
     Pin::parse(raw).map(Some).map_err(str::to_owned)
 }
 
+/// Starts the PIN dialog for the phone shown now (its serial pinned to the answer), unless one is
+/// already open. `None` if a dialog is open or no phone is shown.
+fn begin_asking(
+    asking: &Option<Asking>,
+    view: &watch::Receiver<View>,
+    prompt: &Prompt,
+    stretch: u64,
+    from: &str,
+) -> Option<Asking> {
+    if asking.is_some() {
+        tracing::debug!(from, "PIN dialog already open");
+        return None;
+    }
+    // The PIN is pinned to the phone shown now.
+    let Some(serial) = view.borrow().phone.serial().map(str::to_owned) else {
+        tracing::info!(from, "unlock clicked with no phone; no PIN dialog");
+        return None;
+    };
+    let name = phone_name(view);
+    let prompt = prompt.clone();
+    tracing::info!(serial, from, "asking for the PIN");
+    Some(Asking {
+        task: tokio::task::spawn_blocking(move || ask(&prompt, &name)),
+        serial,
+        stretch,
+    })
+}
+
 /// A PIN dialog in flight.
 struct Asking {
     task: JoinHandle<Result<Option<Pin>, String>>,
@@ -323,11 +380,14 @@ struct Asking {
 
 /// Shows the unlock notification and the PIN dialog, hands valid PINs to `pins` with the serial
 /// of the phone they were asked for (the run loop sends each as one `unlock` frame, only to that
-/// phone) and reopens blocked apps after an unlock, until `events` closes. Without a
-/// notification server it logs one warning and carries on.
+/// phone) and reopens blocked apps after an unlock, until `events` closes. The dialog opens on
+/// the notification's action or on a [`Request`] (the tray's Unlock row) during a locked
+/// stretch, one at a time. Without a notification server it logs one warning and carries on.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     conn: Connection,
     mut events: mpsc::Receiver<LockEvent>,
+    requests: Requests,
     view: watch::Receiver<View>,
     pins: mpsc::Sender<(String, Pin)>,
     exe: PathBuf,
@@ -352,6 +412,9 @@ pub async fn run(
     // The notification on screen (0: none).
     let mut shown: u32 = 0;
     let mut asking: Option<Asking> = None;
+    let mut requests = requests.0;
+    // Whether `requests` can still deliver (every Request dropped: stop polling it).
+    let mut requestable = true;
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -396,23 +459,24 @@ pub async fn run(
                 if id == 0 || id != shown || action != ACTION {
                     continue;
                 }
-                if asking.is_some() {
-                    tracing::debug!("PIN dialog already open");
+                if let Some(started) = begin_asking(&asking, &view, &prompt, ended, "notification") {
+                    asking = Some(started);
+                }
+            }
+            request = requests.recv(), if requestable => {
+                if request.is_none() {
+                    requestable = false;
                     continue;
                 }
-                // The PIN is pinned to the phone shown now.
-                let Some(serial) = view.borrow().phone.serial().map(str::to_owned) else {
-                    tracing::info!("unlock clicked with no phone; no PIN dialog");
+                // The tray shows its row only while locked; a click that raced the unlock
+                // opens nothing.
+                if !stretch {
+                    tracing::info!("unlock requested while not locked; no PIN dialog");
                     continue;
-                };
-                let name = phone_name(&view);
-                let prompt = prompt.clone();
-                tracing::info!(serial, "asking for the PIN");
-                asking = Some(Asking {
-                    task: tokio::task::spawn_blocking(move || ask(&prompt, &name)),
-                    serial,
-                    stretch: ended,
-                });
+                }
+                if let Some(started) = begin_asking(&asking, &view, &prompt, ended, "tray") {
+                    asking = Some(started);
+                }
             }
             answer = async { (&mut asking.as_mut().expect("guarded").task).await }, if asking.is_some() => {
                 let Asking { serial, stretch: asked_in, .. } = asking.take().expect("guarded");
@@ -462,13 +526,13 @@ fn reopen(exe: &std::path::Path, apps: Vec<(String, u32)>) {
     }
 }
 
-/// Starts [`run`] on its own session-bus connection (5 s to connect). Without a bus there is no
-/// unlock prompt: one warning, and `None`.
+/// Starts [`run`] on its own session-bus connection (5 s to connect), with the [`Request`]
+/// handle the tray holds. Without a bus there is no unlock prompt: one warning, and `None`.
 pub async fn spawn(
     events: mpsc::Receiver<LockEvent>,
     view: watch::Receiver<View>,
     pins: mpsc::Sender<(String, Pin)>,
-) -> Option<JoinHandle<()>> {
+) -> Option<(JoinHandle<()>, Request)> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let conn = match tokio::time::timeout(TIMEOUT, Connection::session()).await {
         Ok(Ok(conn)) => conn,
@@ -488,11 +552,14 @@ pub async fn spawn(
             return None;
         }
     };
-    Some(tokio::spawn(async move {
-        if let Err(error) = run(conn, events, view, pins, exe, Prompt::kdialog()).await {
+    let (request, requests) = Request::channel();
+    let task = tokio::spawn(async move {
+        let prompt = Prompt::kdialog();
+        if let Err(error) = run(conn, events, requests, view, pins, exe, prompt).await {
             tracing::warn!(error = format!("{error:#}"), "unlock prompt stopped");
         }
-    }))
+    });
+    Some((task, request))
 }
 
 #[cfg(test)]

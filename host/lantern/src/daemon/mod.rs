@@ -834,11 +834,12 @@ pub async fn run() -> Result<()> {
     let (pin_tx, pin_rx) = mpsc::channel::<(String, unlock::Pin)>(1);
     let (lock_tx, lock_rx) = mpsc::channel(16);
     let prompt = crate::unlock::spawn(lock_rx, view_rx.clone(), pin_tx).await;
-    let (unlock, lock_events) = match prompt {
-        Some(_) => (Some(pin_rx), Some(lock_tx)),
-        None => (None, None),
+    let (unlock, lock_events, request) = match prompt {
+        Some((_, request)) => (Some(pin_rx), Some(lock_tx), Some(request)),
+        None => (None, None, None),
     };
-    crate::tray::spawn(view_rx, settings.clone(), cmd_tx).await;
+    // The tray's Unlock row asks the same prompt (it never runs the dialog or sees a PIN).
+    crate::tray::spawn(view_rx, settings.clone(), cmd_tx, request).await;
     serve_with(
         listener,
         Parts {

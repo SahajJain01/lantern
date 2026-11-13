@@ -159,6 +159,8 @@ before). Its menu shows what Lantern is doing ("Connected to Xiaomi 11T Pro", "R
 "Disconnected from …"), and a line when the companion isn't fully ready (for example "Typing
 through the Lantern keyboard is off"). It holds:
 
+- **Unlock {phone}…** (only while the phone is locked, see below; the first line then reads
+  "Connected to … (locked)"): opens the same PIN dialog as the "Unlock your …" notification.
 - **Disconnect / Connect**: the same as `lantern disconnect` / `lantern connect`.
 - **Sync clipboard**, **Type with the Lantern keyboard (from the next connection)**: check items
   over the settings file below.
@@ -184,6 +186,31 @@ Disconnect then Connect applies a change at once. A value of the wrong type fall
 key's default; a file that doesn't parse gives the defaults and the tray shows "Settings file has
 an error; using defaults" and won't overwrite it. When the tray writes the file it keeps unknown
 keys but rewrites the header comment and drops any other comments.
+
+## Locked phones
+
+A phone with a PIN lock screen (a "secure keyguard") blocks the clipboard while it is locked:
+Android hands the phone's clipboard to no one, so pastes on the phone come up empty, and some
+apps won't open. Lantern notices this only when the lock gets in the way (a copy, a paste or an
+open), and only when it is sure the phone is locked (`dumpsys trust`, `deviceLocked=1`). It then
+shows one notification per locked spell: **"Unlock your {phone}"**, with an **Enter PIN…**
+button. The tray's **Unlock {phone}…** row does the same.
+
+- Click it and type the phone's PIN (4–16 digits) into Lantern's password dialog. lanternd sends
+  it to the phone once, and only to the phone that was shown when you clicked: the helper wakes
+  the phone's own screen, swipes up, checks that the lock screen's PIN pad has focus, types the
+  digits there and ENTER, and turns the screen back off. One attempt, no retry; only one dialog
+  is open at a time.
+- The latest PC copy made while the phone was locked is held and lands on the phone right
+  after the unlock. Apps whose window failed to open because of the lock in the last 2 minutes open again.
+- A wrong PIN gives "That PIN didn't unlock {phone}" with **Try again**. If Lantern couldn't
+  confirm the result, or couldn't reach the lock screen, the notification says "Couldn't
+  unlock {phone}" with the reason instead, so a doubtful attempt is never counted as a wrong
+  PIN (check the phone before trying again: too many wrong PINs lock it for a while).
+- The PIN never goes into a log, a command line or an error message, and Lantern never stores
+  it: each unlock asks again.
+- Unlocking the phone by hand works too: the notification goes away once the phone reads
+  unlocked (checked every 2 s). A phone with a swipe lock or none never sees any of this.
 
 ## What it does to your phone
 
@@ -280,8 +307,8 @@ reinstall or remove the companion with `adb uninstall dev.lantern.companion`).
 ## Acceptance test (real phone + KDE desktop)
 
 ```sh
-python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, unattended
-python3 tools/device_test.py --manual                            # adds 8 and 14: USB unplug, prompts
+python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, 22, unattended
+python3 tools/device_test.py --manual                            # adds 8, 14 and 21: USB unplug, PIN
 python3 tools/device_test.py --only 12 13                        # some items, by number or name
 python3 tools/device_test.py --nested                            # windows in a headless nested KWin
 python3 tools/device_test.py --signal=KILL                       # item 7 with SIGKILL
@@ -294,7 +321,9 @@ entries follow the phone, 11 title is the app's name, 12 Unicode text and compos
 app, 13 clipboard both ways, 14 USB unplug restores the keyboard, 15 another phone's entries
 survive this phone's sync, 16 "Connect your …" for another phone's app, 17 clipboard sync off,
 18 keyboard setting off, 19 `lantern disconnect`/`connect`, 20 the tray menu (needs the real,
-unlocked desktop and its session bus).
+unlocked desktop and its session bus), 21 the unlock prompt (manual: a PIN-locked phone, you
+type its PIN into the real dialog; `LANTERN_SERIAL` must name that phone), 22 a phone without a
+PIN never gets the unlock prompt.
 
 The test restarts lanternd. Item 1 stops it first and reads the phone's own
 `stay_on_while_plugged_in`, `default_input_method` and `enabled_input_methods`, which later items
@@ -302,7 +331,7 @@ expect to see restored; set `LANTERN_STAY_ON_RESTORED=<value>` to give the first
 `--signal=KILL` checks that systemd restarts a SIGKILLed lanternd and that the new session
 removes the dead daemon's forward. The test opens only `com.android.settings`,
 `org.lineageos.jelly` and the companion's test screen (an EditText enabled only during items 10,
-12, 13 and 17), briefly, and drives windows through the KWin scripting D-Bus. Items 13 and 17
+12, 13, 17, 21 and 22), briefly, and drives windows through the KWin scripting D-Bus. Items 13, 17, 21 and 22
 replace the PC clipboard and put its text back afterwards; items 17 and 18 save
 `settings.toml` and restore it (or remove it if it was absent); items 15 and 16 plant and remove
 a fake other phone's menu entry and device record. Windows get no frames while the Plasma session is

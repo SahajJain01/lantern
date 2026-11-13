@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use lantern::daemon::control::{Command, Phone, View};
 use lantern::settings::SettingsHandle;
-use lantern_proto::CompanionState;
+use lantern::unlock::{self, LockEvent, Pin, Prompt};
+use lantern_proto::{CompanionState, LockReason};
 use tokio::sync::{mpsc, watch};
 use zbus::zvariant::{OwnedValue, Value};
 use zbus::{connection, Connection, MatchRule, MessageStream};
@@ -35,11 +36,25 @@ struct Bus {
 }
 
 impl Bus {
+    /// A session bus with no service directories: nothing is ever bus-activated on it (the
+    /// stock session config would start Plasma's notification service for the unlock prompt).
     fn start() -> Self {
         let dir = scratch();
+        let config = dir.join("bus.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN\"\n                  \"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n\
+                 <busconfig><type>session</type><listen>unix:dir={}</listen>\
+                 <policy context=\"default\"><allow send_destination=\"*\" eavesdrop=\"true\"/>\
+                 <allow eavesdrop=\"true\"/><allow own=\"*\"/></policy></busconfig>\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
         let mut child = Process::new("dbus-daemon")
-            .args(["--session", "--nofork", "--print-address=1"])
-            .arg(format!("--address=unix:dir={}", dir.display()))
+            .args(["--nofork", "--print-address=1"])
+            .arg(format!("--config-file={}", config.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -133,6 +148,11 @@ async fn wait_for<T>(what: &str, within: Duration, mut f: impl FnMut() -> Option
 
 impl Tray {
     async fn start() -> Self {
+        Self::start_with(ready(), None).await
+    }
+
+    /// A tray showing `view`, holding the unlock prompt's request handle `unlock`.
+    async fn start_with(view: View, unlock: Option<unlock::Request>) -> Self {
         let bus = Bus::start();
         let registered = Arc::new(Mutex::new(Vec::new()));
         let watcher = connection::Builder::address(bus.address.as_str())
@@ -151,10 +171,10 @@ impl Tray {
             .unwrap();
         let settings_path = bus.dir.join("config").join("settings.toml");
         let settings = SettingsHandle::new(Some(settings_path.clone()));
-        let (view, view_rx) = watch::channel(ready());
+        let (view, view_rx) = watch::channel(view);
         let (tx, commands) = mpsc::channel(8);
         let conn = bus.connect().await;
-        let task = tokio::spawn(lantern::tray::run(conn, view_rx, settings, tx));
+        let task = tokio::spawn(lantern::tray::run(conn, view_rx, settings, tx, unlock));
         let client = bus.connect().await;
         let tray = Self {
             _bus: bus,
@@ -370,6 +390,54 @@ async fn reregisters_when_watcher_returns() {
     assert_eq!(names, vec![tray_name(), tray_name()]);
 }
 
+/// The Unlock row takes the notification action's path: the unlock prompt opens its PIN dialog
+/// and hands the PIN on tagged with the phone shown at the click; the tray never sees the PIN.
+/// A second click while the dialog is open does nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_row_click_prompts() {
+    let (request, requests) = unlock::Request::channel();
+    let mut locked = ready();
+    locked.locked = true;
+    let tray = Tray::start_with(locked, Some(request)).await;
+    // The unlock prompt on the same private bus (no notification server there).
+    let (events, events_rx) = mpsc::channel(8);
+    let (pins_tx, mut pins) = mpsc::channel::<(String, Pin)>(1);
+    let prompt = Prompt {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "sleep 0.5; echo 1234".into()],
+    };
+    let conn = tray._bus.connect().await;
+    let task = tokio::spawn(unlock::run(
+        conn,
+        events_rx,
+        requests,
+        tray.view.subscribe(),
+        pins_tx,
+        PathBuf::from("/bin/false"),
+        prompt,
+    ));
+    events
+        .send(LockEvent::Locked(LockReason::Clipboard))
+        .await
+        .unwrap();
+    let (_, rows) = tray.layout().await;
+    assert_eq!(rows[0], (1, "Connected to Test Phone (locked)".to_owned()));
+    assert_eq!(rows[1], (13, "Unlock Test Phone…".to_owned()));
+    tray.click(13).await;
+    tray.click(13).await;
+    let (serial, pin) = tokio::time::timeout(Duration::from_secs(5), pins.recv())
+        .await
+        .expect("no PIN within 5 s")
+        .unwrap();
+    assert_eq!(serial, "s1");
+    assert_eq!(pin, Pin::parse("1234".into()).unwrap());
+    // The second click came while the dialog was open: no second dialog, no second PIN.
+    if let Ok(more) = tokio::time::timeout(Duration::from_millis(1500), pins.recv()).await {
+        panic!("a second PIN: {more:?}");
+    }
+    task.abort();
+}
+
 const CHILD: &str = "LANTERN_TRAY_TEST_CHILD";
 
 #[test]
@@ -381,7 +449,9 @@ fn no_bus_leaves_daemon_running() {
             let (_view, view_rx) = watch::channel(ready());
             let (tx, _rx) = mpsc::channel(8);
             let settings = SettingsHandle::new(None);
-            assert!(lantern::tray::spawn(view_rx, settings, tx).await.is_none());
+            assert!(lantern::tray::spawn(view_rx, settings, tx, None)
+                .await
+                .is_none());
         });
         return;
     }

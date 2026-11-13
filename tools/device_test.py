@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22
     python3 tools/device_test.py --manual                            # also 8, 14, 21 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
 
-Items (21; 18 automatic, 8, 14 and 21 only with --manual):
+Items (22; 19 automatic, 8, 14 and 21 only with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -19,20 +19,21 @@ Items (21; 18 automatic, 8, 14 and 21 only with --manual):
      9 companion_linked                    19 disconnect_and_connect
     10 catalogue_tracks_phone              20 tray_menu (real session bus, unlocked desktop)
                                            21 unlock_prompt (manual, PIN phone, Sahaj types)
-A full automatic run prints `18/18 PASS` when everything passes.
+                                           22 swipe_phone_never_prompts (Xiaomi, no PIN)
+A full automatic run prints `19/19 PASS` when everything passes.
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
-Klipper's D-Bus (items 13, 17, 21). Opens only com.android.settings, org.lineageos.jelly and the
-companion's test screen (enabled only during items 10, 12, 13, 17 and 21), each for a few seconds,
-and touches no other window. Items 13, 17 and 21 save the PC clipboard's text and put it back
+Klipper's D-Bus (items 13, 17, 21, 22). Opens only com.android.settings, org.lineageos.jelly and the
+companion's test screen (enabled only during items 10, 12, 13, 17, 21 and 22), each for a few
+seconds, and touches no other window. Items 13, 17, 21 and 22 save the PC clipboard's text and put it back
 afterwards; items 17 and 18 also save ~/.config/lantern/settings.toml and restore it (or remove it
 if it was absent); item 18 restarts lanternd with the keyboard off and back on; item 19
 disconnects the phone in Lantern for ~15 s and connects it again; item 20 does the same through
 the tray menu over the session bus (and saves a screenshot of the screen to the log dir).
 Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
-The window items (2-6, 11-13, 17) need frames from the compositor, which a locked Plasma session
+The window items (2-6, 11-13, 17, 22) need frames from the compositor, which a locked Plasma session
 does not give. --nested (or LANTERN_TEST_NESTED=1) runs every test window in a private headless
 `kwin_wayland --virtual` (no Xwayland, no DISPLAY) on its own D-Bus instead, with scratch XDG
 config/data/state/cache and runtime dirs (removed afterwards, with every service that bus
@@ -1436,6 +1437,58 @@ class Suite:
                     ("stop the notification monitor", stop_monitor),
                     ("disable the test screen", lambda: test_activity(False)))
 
+    def swipe_phone_never_prompts(self):
+        """A phone without a PIN (the Xiaomi: swipe or no lock screen) never gets the unlock
+        prompt. Copies on the PC and on the phone as item 13 does, then checks: no `lock: phone
+        locked` line in the helper log, no "phone locked" in lanternd's journal, the tray menu
+        (lanternd's view) not locked (row 1 without "(locked)", no Unlock row 13), and no Notify
+        titled "Unlock ..." on the session bus during the copies and 5 s after."""
+        check(SERIAL != "ZD222LMDFV",
+              "item 22 is for a phone without a PIN (the Xiaomi), not the PIN-locked Motorola")
+        wait_ready(15)
+        st = status()
+        check(st.get("serial") == SERIAL, f"lanternd serves {st.get('serial')}, not {SERIAL}")
+        since = phone_now()
+        journal_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Notify calls on the real session bus. Only matched summaries are ever printed.
+        mon_log = LOG_DIR / "notifications-22.log"
+        mon_f = open(mon_log, "w")
+        monitor = subprocess.Popen(["busctl", "--user", "monitor", "org.freedesktop.Notifications"],
+                                   stdout=mon_f, stderr=subprocess.STDOUT)
+        try:
+            time.sleep(1)  # the monitor is subscribed
+            # 1. Copy on the PC and on the phone (item 13's path; it restores the clipboard).
+            self.clipboard_both_ways()
+            time.sleep(5)
+        finally:
+            monitor.terminate()
+            try:
+                monitor.wait(5)
+            except subprocess.TimeoutExpired:
+                monitor.kill()
+            mon_f.close()
+        # 2. Nothing saw a lock.
+        locked_lines = [m for _, m in logcat_since(since, ["lantern"]) if m.startswith("lock:")]
+        check(not locked_lines, f"helper lock lines on a swipe phone: {locked_lines}")
+        journal = [l for l in sh("journalctl", "--user", "-u", UNIT, "--since", journal_since,
+                                 "--no-pager").splitlines() if "phone locked" in l]
+        check(not journal, f"lanternd logged a lock: {journal}")
+        unlock_notes = re.findall(r'STRING "((?:Unlock your|That PIN didn\'t unlock|'
+                                  r'Couldn\'t unlock) [^"]*)";',
+                                  mon_log.read_text(errors="replace"))
+        check(not unlock_notes, f"unlock notifications on a swipe phone: {unlock_notes}")
+        note("no lock line, no 'phone locked', no Unlock notification")
+        # 3. lanternd's view: the tray (its bus name is taken now, after any restart).
+        pid = systemctl("show", "-p", "MainPID", "--value", UNIT).strip()
+        check(pid not in ("", "0"), f"{UNIT} is not running")
+        out = sh("busctl", "--user", "--json=short", "call", f"org.kde.StatusNotifierItem-{pid}-1",
+                 "/MenuBar", "com.canonical.dbusmenu", "GetLayout", "iias", "--", "0", "-1", "0")
+        _, (_, _, children) = json.loads(out)["data"]
+        rows = {c["data"][0]: c["data"][1].get("label", {}).get("data", "") for c in children}
+        note(f"tray rows 1/13: {rows.get(1)!r} / {rows.get(13)!r}")
+        check(13 not in rows, f"the tray shows an Unlock row: {rows}")
+        check(not rows.get(1, "").endswith("(locked)"), f"the tray says locked: {rows.get(1)!r}")
+
 
 ITEMS = [
     "session_starts_on_plug",
@@ -1459,6 +1512,7 @@ ITEMS = [
     "disconnect_and_connect",
     "tray_menu",
     "unlock_prompt",
+    "swipe_phone_never_prompts",
 ]
 # Need a person: pull the cable (8, 14) or type the phone's PIN (21).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt"}
@@ -1513,7 +1567,7 @@ def main():
     print(f"lantern device test: serial={SERIAL} binary={LANTERN} logs={LOG_DIR}", flush=True)
     if not args.nested and desktop_locked():
         print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
-              "(4-6, 12, 13, 17) cannot pass. Unlock it or use --nested.", flush=True)
+              "(4-6, 12, 13, 17, 22) cannot pass. Unlock it or use --nested.", flush=True)
     results = []
     try:
         if args.nested:
@@ -1556,7 +1610,7 @@ def main():
                 print(f"WARNING: nested KWin stop failed: {e}", flush=True)
                 shutil.rmtree(NESTED.home, ignore_errors=True)
         if {"catalogue_tracks_phone", "ime_unicode_text", "clipboard_both_ways",
-            "clipboard_setting_off", "unlock_prompt"} & set(items):
+            "clipboard_setting_off", "unlock_prompt", "swipe_phone_never_prompts"} & set(items):
             try:  # the test screen is never left enabled
                 test_activity(False)
             except Exception as e:

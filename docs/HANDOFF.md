@@ -1,4 +1,4 @@
-# Lantern — handoff (end of Plan 3, 2026-11-13)
+# Lantern — handoff (Plan 4a implemented, 2026-11-13)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -27,6 +27,16 @@ Start here in a new session. Read this file, then `README.md`, then the spec
     170 host-JVM tests, companion build: 41, all passing.
   - The SDD ledger and per-task reports are in the main checkout's gitignored
     `.superpowers/sdd/2026-11-10-lantern-phones-and-tray/`.
+- **Plan 4a** (`docs/superpowers/plans/2026-11-13-lantern-unlock-prompt.md`, design
+  `docs/superpowers/specs/2026-11-13-lantern-unlock-prompt-design.md`): **implemented on branch
+  `plan4a-unlock-prompt`, host tests passing, device checks (items 21-22, Task 1 step 5) not yet
+  run.** Worktree `.worktrees/plan4a`, base `main` `5d83b8b`. Device steps were deferred by
+  Sahaj's instruction to one run at the end (he types the PIN); see "Plan 4a device checks
+  (pending)". Tasks 1–3 each passed their own review after one fix round; Task 4 (tray row,
+  item 22, docs) is in review. The SDD ledger and reports are in the worktree's gitignored
+  `.superpowers/sdd/2026-11-13-lantern-unlock-prompt/` (copy it to the main checkout before
+  removing the worktree).
+  - Host: `cargo test --workspace --offline` 341 passed, 1 ignored; clippy clean (2026-11-13).
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
 Lantern is **installed and running** on the PC from the **Plan 3** branch build (2026-11-13):
@@ -107,17 +117,50 @@ both phones plugged in, `systemctl --user set-environment LANTERN_SERIAL=20e9318
 6. Two windows on the real desktop: type into the test screen, click a second Lantern window's
    text field, type there, and check nothing typed lands in the other window's field.
 
+### Plan 4a device checks (pending)
+
+Not run yet. They need the Motorola (`ZD222LMDFV`, PIN keyguard) with Sahaj typing its PIN, and
+the Xiaomi (`20e9318`, swipe keyguard), both plugged in, the desktop unlocked. In the worktree:
+
+```sh
+cd .worktrees/plan4a
+# 1. Xiaomi: the full automatic suite, including item 22 (a swipe phone never prompts).
+systemctl --user set-environment LANTERN_SERIAL=20e9318
+python3 tools/build.py install && python3 tools/device_test.py     # expect 19/19 PASS
+# 2. Motorola: serve it.
+systemctl --user set-environment LANTERN_SERIAL=ZD222LMDFV && systemctl --user restart lanternd
+#    Task 1 step 5 (by hand, Sahaj unlocks by hand at the end):
+adb -s ZD222LMDFV shell input keyevent KEYCODE_SLEEP; sleep 5
+adb -s ZD222LMDFV shell dumpsys trust | grep deviceLocked        # (current) line: deviceLocked=1
+#    copy any text on the PC, then (the last lines only):
+adb -s ZD222LMDFV logcat -d -t 500 -s lantern | grep -E 'lock:|clip:'
+#    want `lock: phone locked (clipboard)` once and no `clip: PC clipboard ... set`;
+#    Sahaj unlocks by hand; within 3 s `lock: phone unlocked` and `clip: held PC copy ... set on
+#    the phone`.
+# 3. Item 21 (manual; Sahaj clicks "Enter PIN…" and types the PIN, then a wrong PIN and
+#    "Try again"):
+LANTERN_SERIAL=ZD222LMDFV python3 tools/device_test.py --manual --only 21
+# 4. Back to normal.
+systemctl --user unset-environment LANTERN_SERIAL && systemctl --user restart lanternd
+```
+
+Also worth checking by hand then: the tray's "Unlock edge 50 pro…" row while locked, and
+FocusProbe against the real `dumpsys window displays` on the Motorola (item 21 covers it
+indirectly: "lock screen not reached" would fail it).
+
 ### Field findings on the Motorola (2026-11-13, Plan 2 build)
 
-Seen by Sahaj on the installed Plan 2 build with the Motorola edge 50 pro. Not fixed; they are on
-the Plan 4 list below.
+Seen by Sahaj on the installed Plan 2 build with the Motorola edge 50 pro. Finding 1 is addressed
+by Plan 4a (device check pending); 2 and 3 are not fixed and stay on the Plan 4 list below.
 
-1. Clipboard is dead while the phone's PIN keyguard is locked (`dumpsys trust` deviceLocked=1):
+1. **Addressed by Plan 4a (device check pending).** Clipboard is dead while the phone's PIN keyguard is locked (`dumpsys trust` deviceLocked=1):
    apps render behind the keyguard (ALWAYS_UNLOCKED) but Android returns null for every clipboard
    read, so pastes are empty and the helper's listener silently drops phone copies;
    setPrimaryClip still 'succeeds'. Unlocking once with the PIN fixed it (stay-awake keeps it
-   unlocked). The Xiaomi has a swipe keyguard (deviceLocked=0). Fix idea: detect deviceLocked at
-   session start and notify 'Unlock your phone once for clipboard'; log the null read.
+   unlocked). The Xiaomi has a swipe keyguard (deviceLocked=0). Plan 4a: the helper reports
+   `locked{reason}` when the lock gets in the way and holds the PC copy until the unlock;
+   lanternd shows "Unlock your {name}" (and the tray an Unlock row), asks for the PIN in a KDE
+   dialog and the helper types it on display 0 (one checked attempt); blocked opens reopen.
 2. default_input_method became Gboard mid-session (journal still recorded set=Lantern IME; cause
    unknown, logcat had rolled). Under IME policy LOCAL, Gboard then popped up inside the PC
    window. Re-selecting the Lantern IME (`ime set dev.lantern.companion/.LanternIme`) fixed it.
@@ -157,8 +200,8 @@ the Plan 4 list below.
 - Plan 3 on a device beyond items 15–20 and the two-phone check: the tray menu opened by hand on
   the Plasma panel, re-registration after a plasmashell restart (host-tested only), Quit and the
   Lantern launcher, start-at-login toggling, Undo phone setup from the tray.
-- From Plan 1: PIN keyguard (see field finding 1: the clipboard needs one unlock),
-  third-party notification clicks, app-started rotation on a real
+- Plan 4a on a device: items 21–22 and Task 1 step 5 (see "Plan 4a device checks (pending)").
+- From Plan 1: third-party notification clicks, app-started rotation on a real
   device, long runs with 5–6 encoders, interactive play in games.
 
 ## Layout
@@ -168,11 +211,11 @@ the Plan 4 list below.
 | `android/helper/` | Java helper. It runs as the shell user via `app_process` and owns the virtual displays, encoders, input, power, settings, the companion link and the phone clipboard. Built with `source ~/.local/opt/pd-toolchain/env.sh && python3 tools/build.py helper`; host-JVM tests run as part of the build. |
 | `android/companion/` | Companion APK `dev.lantern.companion`: `LinkProvider` (the link), `LanternIme` (the invisible keyboard), the launcher catalogue, `LinkReceiver` (test-only `TEST_ACTIVITY`) and the disabled `TestActivity`. Built without Gradle by `python3 tools/build.py companion`. |
 | `host/proto/` | Rust crate `lantern-proto`: the wire protocol v1 and golden vectors that both sides test against. |
-| `host/lantern/` | Rust crate `lantern`. `lantern daemon` is lanternd: device tracking, helper and companion deploy, session, window IPC, KDE menu catalogue for every phone (`daemon/catalog.rs`), commands and the published view (`daemon/control.rs`), PC clipboard (`clipboard/`), settings file (`settings.rs`), the tray (`tray/`: `menu.rs` pure menu model, `sni.rs`, `dbusmenu.rs`, `mod.rs`), desktop command env (`desktop.rs`). `lantern open <pkg>` is one process per window (winit/wgpu, VA-API decode, text input). `lantern status` prints the daemon state; `lantern connect`/`disconnect` pause and resume the phone. `lantern undo-setup` reverses the phone setup. |
+| `host/lantern/` | Rust crate `lantern`. `lantern daemon` is lanternd: device tracking, helper and companion deploy, session, window IPC, KDE menu catalogue for every phone (`daemon/catalog.rs`), commands and the published view (`daemon/control.rs`), PC clipboard (`clipboard/`), settings file (`settings.rs`), the tray (`tray/`: `menu.rs` pure menu model, row ids 1–13, `sni.rs`, `dbusmenu.rs`, `mod.rs`), desktop command env (`desktop.rs`), the unlock prompt (`unlock.rs`: notification, PIN dialog, `Pin`, the tray's `Request` handle). `lantern open <pkg>` is one process per window (winit/wgpu, VA-API decode, text input). `lantern status` prints the daemon state; `lantern connect`/`disconnect` pause and resume the phone. `lantern undo-setup` reverses the phone setup. |
 | `docs/protocol.md` | The wire spec, including the companion link. Keep it in step with both sides. |
 | `docs/spikes/RESULTS.md` | Risk-spike measurements, plus the Plan 2 IME display policy finding. |
 | `tools/build.py` | Targets: `helper`, `companion`, `all`, `install` (also the Lantern launcher `dev.lantern.Lantern.desktop`), `uninstall` (runs `lantern undo-setup` best effort, removes the launcher). |
-| `tools/device_test.py` | On-device acceptance suite, items 1–20 (18 automatic): `--manual` adds 8 and 14, `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; item 20 still needs the real session bus), `--state`. |
+| `tools/device_test.py` | On-device acceptance suite, items 1–22 (19 automatic): `--manual` adds 8, 14 and 21, `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; item 20 still needs the real session bus), `--state`. |
 
 ## Environment facts
 - Phone: Xiaomi 11T Pro, serial `20e9318`, Android 17 / SDK 37, LineageOS 24, swipe keyguard, USB
@@ -321,8 +364,9 @@ the Plan 4 list below.
 
 ## Next: Plan 4 (not yet written)
 
-Plan 3 is merged. Next is Plan 4a, unlocking a PIN-locked phone from the PC (design:
-`docs/superpowers/specs/2026-11-13-lantern-unlock-prompt-design.md`, spike done). Then write Plan 4 with superpowers:writing-plans and run it with
+Plan 3 is merged. Plan 4a (unlocking a PIN-locked phone from the PC) is implemented on its branch;
+finish it first: run its device checks, final review, merge. Then write Plan 4 with
+superpowers:writing-plans and run it with
 superpowers:subagent-driven-development. Candidates (Plan 3's "Out of scope" plus the field
 findings):
 
@@ -336,8 +380,7 @@ findings):
 - A latency harness, and the target from spec §9a/§11: no more than 5 ms worse than scrcpy.
 - Choosing between two phones plugged in at the same time (today the first one online wins).
 - A settings window (the tray holds the few settings today).
-- Field finding 1: clipboard while the PIN keyguard is locked — detect `deviceLocked` at session
-  start, notify "Unlock your phone once for clipboard", log the null clipboard read.
+- ~~Field finding 1~~: addressed by Plan 4a (device check pending).
 - Field finding 2: `default_input_method` changed to Gboard mid-session — find the cause; consider
   the helper re-asserting the Lantern keyboard or reporting a keyboard changed by someone else
   (and a stale Lantern entry already in the journaled `enabled_input_methods` original).
@@ -531,6 +574,31 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
     - Registration is awaited inline in the tray's select loop (delays a menu refresh up to 5 s).
     - A millisecond race remains between the tray's re-read of the phone and the daemon's
       UndoSetup target pick (Ruling R9 accepted).
+- **Plan 4a** (`minor (deferred)` in the Plan 4a SDD ledger, for the final review's triage)
+  - Helper lock watch:
+    - A re-lock right as a stretch ends can be dropped (narrow window); clear the stretch before
+      `onUnlocked` or re-check.
+    - `LockWatch` sends (`sendSession`) while holding its monitor; a stalled write delays
+      `close()`.
+    - A `fromHost` already running when `dropHeld` fires can re-set the held copy (it is never
+      written to a locked phone).
+  - Helper unlock:
+    - `FocusProbe` `contains("Keyguard")` could match an app title with that word; require no
+      `/` in the title.
+    - The Router builds the PIN as a `String` from JSON before `toCharArray` (a heap copy until
+      GC).
+    - Ordinary `Input.send` still ignores `setDisplayId`'s result (window input could reach
+      another display if the hidden API fails).
+    - `displayIdOf`/`requireBound` wiring is untested on the host (the rule fails closed).
+  - Daemon unlock:
+    - Unwiped PIN copies (`SecretPin` String, the encoded frame `Vec`, `Command::output`
+      buffers): memory only, never logged; consider a wiping `Drop` on `SecretPin`.
+    - Any open error while locked is rewritten to "phone locked" and queued for reopen.
+    - The stretch-ended check is best-effort (`select!` not biased): a PIN can still be sent to
+      the same phone after it unlocked (the helper answers "already unlocked" and types
+      nothing). Fix: `drive` also requires `hub.locked()` before `send_unlock`.
+  - Docs (fixed in Task 4): protocol.md's "unknown counts as unlocked" wording and the
+    `unlock_result` reasons.
 - **Tests**
   - Several tests rely on fixed sleeps or timing windows (fake_adb, fake_helper, ipc, the catalogue
     debounce, CompanionLink); some assert little (`setExtrasAcceptsHandler`, the ipc mismatch step,

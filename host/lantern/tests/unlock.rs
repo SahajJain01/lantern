@@ -169,6 +169,8 @@ struct Rig {
     events: Option<mpsc::Sender<LockEvent>>,
     view: watch::Sender<View>,
     pins: mpsc::Receiver<(String, Pin)>,
+    /// The tray's handle on the prompt.
+    request: unlock::Request,
     /// Where the fake `exe` appends one line per run.
     reopened: PathBuf,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -230,7 +232,10 @@ impl Rig {
         let (view, view_rx) = watch::channel(locked_view());
         let (pins_tx, pins) = mpsc::channel(1);
         let conn = bus.connect().await;
-        let task = tokio::spawn(unlock::run(conn, events_rx, view_rx, pins_tx, exe, prompt));
+        let (request, requests) = unlock::Request::channel();
+        let task = tokio::spawn(unlock::run(
+            conn, events_rx, requests, view_rx, pins_tx, exe, prompt,
+        ));
         Self {
             bus,
             server,
@@ -238,6 +243,7 @@ impl Rig {
             events: Some(events),
             view,
             pins,
+            request,
             reopened,
             task,
         }
@@ -553,4 +559,42 @@ async fn answer_after_the_stretch_ended_is_dropped() {
     // A new stretch before the answer does not revive it.
     rig.send(LockEvent::Locked(LockReason::Open)).await;
     rig.assert_no_pin_within(Duration::from_millis(1500)).await;
+}
+
+/// The tray's request takes the notification's path: one dialog, the PIN tagged with the
+/// phone shown at the click. It only works during a locked stretch.
+#[tokio::test]
+async fn request_prompts_only_while_locked() {
+    let mut rig = Rig::start(true, echo_prompt("1234")).await;
+    // Not locked yet (or the click raced the unlock): no dialog.
+    rig.request.ask();
+    rig.assert_no_pin().await;
+    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.notify_id(1).await;
+    rig.request.ask();
+    assert_eq!(rig.next_pin().await, pin("1234"));
+    rig.assert_no_pin().await;
+    // After the stretch ends, a request does nothing again.
+    rig.send(LockEvent::Unlocked).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.request.ask();
+    rig.assert_no_pin().await;
+}
+
+/// One dialog at a time, whichever source clicked: a tray request or a notification click
+/// while a dialog is open does nothing.
+#[tokio::test]
+async fn second_click_while_dialog_open_does_nothing() {
+    let mut rig = Rig::start(true, slow_prompt("0.5", "1234")).await;
+    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    let id = rig.notify_id(1).await;
+    rig.request.ask();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.click(id, "unlock").await;
+    rig.request.ask();
+    assert_eq!(rig.next_pin().await, pin("1234"));
+    rig.assert_no_pin_within(Duration::from_millis(1500)).await;
+    // Once it answered, the next click opens a new one.
+    rig.click(id, "unlock").await;
+    assert_eq!(rig.next_pin().await, pin("1234"));
 }

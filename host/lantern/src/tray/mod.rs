@@ -22,6 +22,7 @@ use zbus::Connection;
 
 use crate::daemon::control::{Command, View};
 use crate::settings::{self, Key, Settings, SettingsHandle};
+use crate::unlock;
 use menu::{Action, Item};
 
 pub(crate) const MENU_PATH: &str = "/MenuBar";
@@ -60,6 +61,8 @@ impl State {
 pub(crate) struct Shared {
     state: Mutex<State>,
     commands: mpsc::Sender<Command>,
+    /// The unlock prompt's handle for the Unlock row (`None`: no prompt runs).
+    unlock: Option<unlock::Request>,
     settings: SettingsHandle,
     /// Woken after a login toggle changed `State::login`.
     login_changed: Notify,
@@ -78,11 +81,13 @@ fn bus_name() -> String {
 }
 
 /// Connects to the session bus and runs the tray on it. Without a session bus it logs one
-/// warning (`no tray: <error>`) and returns `None`; lanternd runs on without a tray.
+/// warning (`no tray: <error>`) and returns `None`; lanternd runs on without a tray. `unlock`
+/// is the unlock prompt's handle, which the Unlock row uses.
 pub async fn spawn(
     view: watch::Receiver<View>,
     settings: SettingsHandle,
     commands: mpsc::Sender<Command>,
+    unlock: Option<unlock::Request>,
 ) -> Option<JoinHandle<()>> {
     let conn = match tokio::time::timeout(TIMEOUT, Connection::session()).await {
         Ok(Ok(conn)) => conn,
@@ -96,7 +101,7 @@ pub async fn spawn(
         }
     };
     Some(tokio::spawn(async move {
-        if let Err(error) = run(conn, view, settings, commands).await {
+        if let Err(error) = run(conn, view, settings, commands, unlock).await {
             tracing::warn!(error = format!("{error:#}"), "tray stopped");
         }
     }))
@@ -107,12 +112,14 @@ pub async fn spawn(
 /// 2. registers that name with the StatusNotifierWatcher;
 /// 3. registers again whenever the watcher gets a new owner (e.g. plasmashell restarted).
 ///
-/// Every view, settings or login change that alters the menu emits `LayoutUpdated`.
+/// Every view, settings or login change that alters the menu emits `LayoutUpdated`. The
+/// Unlock row asks the unlock prompt through `unlock`; the tray never runs the PIN dialog.
 pub async fn run(
     conn: Connection,
     mut view: watch::Receiver<View>,
     settings: SettingsHandle,
     commands: mpsc::Sender<Command>,
+    unlock: Option<unlock::Request>,
 ) -> Result<()> {
     let mut values = settings.subscribe();
     let mut errors = settings.subscribe_error();
@@ -129,6 +136,7 @@ pub async fn run(
     let shared = Arc::new(Shared {
         state: Mutex::new(state),
         commands,
+        unlock,
         settings,
         login_changed: Notify::new(),
     });
@@ -332,6 +340,12 @@ pub(crate) fn perform(shared: &Arc<Shared>, action: Action) {
             let shared = shared.clone();
             tokio::spawn(async move { confirm_undo(&shared).await });
         }
+        // The same request as the notification's action: the prompt pins the phone shown at
+        // the click and opens one dialog at a time.
+        Action::Unlock => match &shared.unlock {
+            Some(request) => request.ask(),
+            None => tracing::warn!("tray: no unlock prompt (no notification bus); click dropped"),
+        },
     }
 }
 
@@ -531,6 +545,7 @@ mod tests {
                 items: Vec::new(),
             }),
             commands: tx,
+            unlock: None,
             settings: SettingsHandle::new(None),
             login_changed: Notify::new(),
         };
