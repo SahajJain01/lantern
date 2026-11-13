@@ -99,8 +99,10 @@ JSON objects tagged by `"t"` (snake_case). Example:
 `code` and `version` on `error` are omitted when absent, so a plain error is still
 `{"t":"error","msg":"..."}`. The only `code` defined in v1 is `"version"`.
 
-Pause/resume (Plan 3) will be added within protocol v1, without a version bump: the helper jar is
-embedded in and deployed by `lanternd`, so both sides always ship together.
+Later additions (e.g. pausing a window's encoder, Plan 4) stay within protocol v1, without a
+version bump: the helper jar is embedded in and deployed by `lanternd`, so both sides always ship
+together. Plan 3 added only `hello.keyboard` (optional) on the helper side; everything else it
+added is host-only (`daemon`, `status_report` state `paused`, the window-IPC errors below).
 
 `label` and `work` on `opened`, `work` on `app`, and `msg` on `companion` are omitted when absent
 (`work` when false), so an `opened` without them is still the v1 bytes.
@@ -127,11 +129,21 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
   (added or changed) and `app_removed` messages. A full catalogue whose `apps_end.count` matches
   the `app` messages received replaces the previous one (apps missing from it are removed); a
   partial one (the link dropped mid-list, or the count differs) removes nothing.
+- Several phones (host-only, lanternd's KDE menu): there is one `.desktop` entry per app_id
+  (`lantern.<pkg>[-u<N>]`, never a serial), listing every phone that has the app as
+  `X-Lantern-Serials=a;b;` (each serial `;`-terminated, `;` inside one escaped; a Plan 2 entry
+  with only `X-Lantern-Serial=` counts as listing that one phone). A session only adds or removes
+  its own phone's serial: a matching full catalogue from phone S takes S off the entries it did
+  not list (only for the Android users that sent at least one `app`), and an entry (and its icon)
+  is deleted when no phone lists it. `app_removed` takes S off that one entry. Name and icon come
+  from the phone that synced last. Unplugging changes no entry; `lantern undo-setup` takes that
+  phone off every entry the same way.
 - `companion{state}` is sent after the hello reply: `"ready"` when the companion linked and the
   Lantern keyboard is selected, `"ready"` with `msg:"keyboard off in Lantern settings"` when it
   linked and the hello said `keyboard:false`, `"unavailable"` (with a `msg`) otherwise:
-  `"companion did not connect"`, or `"keyboard switch failed: <reason>"` when the companion linked but selecting its
-  keyboard failed (the catalogue still syncs; only PC text input is missing). Without the
+  `"companion did not connect"`, or `"keyboard switch failed: <reason>"` when the companion
+  linked but selecting its keyboard failed (the catalogue still syncs; only PC text input is
+  missing). Without the
   companion the session still works, with no catalogue and no PC text input.
 - `clip` carries plain text only, on stream 0, and only changes sync: nothing is pushed when a
   session starts. Each side suppresses only the echo of the text it last received from the
@@ -146,6 +158,10 @@ embedded in and deployed by `lanternd`, so both sides always ship together.
 - Secrets stay put: the helper never sends a phone clip whose description has the extra
   `android.content.extra.IS_SENSITIVE = true`; lanternd never sends a PC selection that offers
   `x-kde-passwordManagerHint` with content `secret` (or whose hint can't be read).
+- Clipboard sync off (`clipboard_sync = false` in settings.toml, applied within 2 s, no
+  restart): nothing crosses either way. lanternd sends no `clip` and discards the helper's `clip`
+  without touching the PC clipboard; the helper is not told (it still sends phone copies, which go
+  no further than lanternd). Turning it back on forgets the remembered echo text.
 - lanternd reads the PC clipboard (the regular selection only, never the primary selection)
   through `ext_data_control_v1` on its own thread and connection, preferring the mime types
   `text/plain;charset=utf-8`, `UTF8_STRING`, `text/plain` in that order, and offers all three
@@ -308,7 +324,19 @@ on start, a live one means another daemon is running. The daemon listens even wi
 - One client per window. Its first frame must be `open` on stream 0, carrying the client's
   `XDG_ACTIVATION_TOKEN` as `activation_token` if it has one. Anything else first gets
   `error{msg}` on stream 0 and the connection is closed.
-- No phone session: `error{msg:"phone not connected"}` on stream 0, then close.
+- No phone session: `error{msg:"phone not connected"}` on stream 0, then close. If the phone was
+  disconnected in Lantern (`status_report` state `paused`) the `msg` is
+  `"phone disconnected in Lantern"` instead.
+- App on other phones only: once this session's first full catalogue has arrived (its count
+  matched), an `open` whose app has a menu entry that does not list the session's phone gets
+  `error{msg:"app not on this phone"}` on stream 0, then close. Before that first sync, or for an
+  app with no entry, the `open` is forwarded as usual (so a newly installed app is never refused
+  by a stale list).
+- `lantern open` turns these three refusals (on stream 0, before any `opened`) into a desktop
+  notification and exits 1: "Connect your <phone name>" (the phones the entry lists, named from
+  their device records, else their serials; "Connect your phone" when none), with the body
+  naming the connected phone that lacks the app; or "Lantern is disconnected" for the paused
+  case.
 - New `pkg`/`user`: the daemon assigns window id `N` (from 1, never reused within a helper
   session) and forwards the `open` to the helper on stream `N` without `activation_token`. The
   helper's `opened`, `video`, `resized`, `error` and `closed` on `N` reach the client unchanged.

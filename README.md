@@ -45,8 +45,9 @@ protocol is in [`docs/protocol.md`](docs/protocol.md).
   `PD_TC`.
 - `adb` on `PATH`, with the phone authorized for USB debugging. The phone must run Android 15 or
   newer (API 35).
-- lanternd serves the only connected device. With several devices connected, set
-  `LANTERN_SERIAL` to the one it should serve: run `systemctl --user edit lanternd` and add
+- lanternd serves one phone at a time. With several devices connected it keeps the one it is
+  serving, else takes the first that came online; when that one goes away it starts the next one
+  still online. To pin one, set `LANTERN_SERIAL`: run `systemctl --user edit lanternd` and add
   `[Service]` / `Environment=LANTERN_SERIAL=<serial>`. `adb devices` lists the serials.
 
 lanternd runs `adb` from the systemd user manager's `PATH`, not your shell's. If `adb` lives
@@ -81,7 +82,9 @@ python3 tools/build.py install
 
 `install` builds the phone helper jar and the companion APK (running their host-JVM tests),
 embeds both in a release `lantern`, copies that to `~/.local/bin/lantern`, and installs
-`~/.config/systemd/user/lanternd.service`. It then runs `systemctl --user daemon-reload` and
+`~/.config/systemd/user/lanternd.service` and a **Lantern** app-menu entry
+(`~/.local/share/applications/dev.lantern.Lantern.desktop`, which runs `systemctl --user start
+lanternd.service`, e.g. after Quit in the tray). It then runs `systemctl --user daemon-reload` and
 `systemctl --user enable --now lanternd`. Running it again is safe: it restarts a running
 daemon only when the binary or the unit changed.
 
@@ -97,14 +100,21 @@ Tests: `cd host && cargo test`.
 lantern open com.android.settings     # one window per app; opening it again focuses that window
 lantern open --user 10 com.android.settings   # the same app from Android user/profile 10 (e.g. work)
 lantern status                        # daemon state as JSON
+lantern disconnect                    # end the session (phone restored) and stay disconnected
+lantern connect                       # connect again (also: unplug and replug the phone)
 ```
 
 You rarely need the command: once the phone has connected, every app on its launcher (each
 profile's, work apps too) has an entry with its icon in the **Phone** submenu of the KDE
 application menu (and in KRunner). The entries follow the phone while it is connected: an app
-installed or removed there is added or removed here. They stay when the phone is unplugged;
-opening one then shows "Connect your phone". They are `~/.local/share/applications/lantern.*.desktop`, with icons in
-`~/.local/share/lantern/icons/`.
+installed or removed there is added or removed here. They stay when the phone is unplugged, and
+the menu keeps the apps of every phone you have connected: switching phones adds the new phone's
+apps and leaves the other phone's entries (and your pins) alone. An app both phones have is one
+entry. Opening an app while no phone that has it is connected shows a notification "Connect your
+Xiaomi 11T Pro" (the phone's name from its settings), or, once the connected phone's app list has
+arrived and it lacks the app, which phone has it. They are
+`~/.local/share/applications/lantern.*.desktop` (the line `X-Lantern-Serials=` lists the phones),
+with icons in `~/.local/share/lantern/icons/`.
 
 `--user N` (default `0`) picks the Android user or profile the app runs as; `adb shell pm list
 users` lists them. Each user's copy of an app is its own window: Wayland app_id
@@ -116,7 +126,8 @@ digits, `_`, `.`), and `N` a plain decimal number; anything else is a usage erro
 Typing: keys go to the app as keys (shortcuts such as Ctrl+C work), and text the US layout can't
 produce (another layout, dead keys, an input method such as ibus or fcitx5, emoji) is committed
 as text through the Lantern keyboard, including composition (preedit). Clipboard: plain text
-copied on the PC can be pasted on the phone and the other way round, up to 1 MiB. Passwords stay
+copied on the PC can be pasted on the phone and the other way round, up to 1 MiB (unless
+`clipboard_sync` is off, see below). Passwords stay
 put: text a password manager marks secret (KDE's `x-kde-passwordManagerHint`) and Android
 clips marked sensitive are never synced. Neither side logs clipboard or typed text.
 
@@ -131,12 +142,48 @@ phone (on its screen or in recents) may be moved onto its Lantern window (Launch
 for a new task); the window then prints `lantern: <pkg> (user N) was already open on the phone; it
 moved into this window and closing the window will quit it`.
 
-`lantern status` prints `{"state":"idle|starting|ready","serial":…,"helper":<jar sha256>,"windows":[{"id","pkg","user"}],"companion":"ready|unavailable"}`
-(`companion` is omitted until known).
+`lantern status` prints `{"state":"idle|starting|ready|paused","serial":…,"helper":<jar sha256>,"windows":[{"id","pkg","user"}],"companion":"ready|unavailable"}`
+(`companion` is omitted until known; `paused` means you disconnected the phone in Lantern).
+`lantern connect` and `lantern disconnect` print the same report (the state before the command)
+and exit 1 if lanternd isn't running. A disconnected phone stays disconnected until you connect
+it again or unplug and replug it; opening an app meanwhile shows "Lantern is disconnected".
 Logs: `journalctl --user -u lanternd`. Set `LANTERN_LOG=debug` for more detail.
 
 Exit statuses: 0 ok, 1 runtime failure, 2 usage error, 3 helper protocol mismatch (`daemon`
 only; systemd does not restart it).
+
+## Tray and settings
+
+lanternd puts a phone icon in the KDE system tray (when there is a tray; without one it runs as
+before). Its menu shows what Lantern is doing ("Connected to Xiaomi 11T Pro", "Reconnecting to …",
+"Disconnected from …"), and a line when the companion isn't fully ready (for example "Typing
+through the Lantern keyboard is off"). It holds:
+
+- **Disconnect / Connect**: the same as `lantern disconnect` / `lantern connect`.
+- **Sync clipboard**, **Type with the Lantern keyboard (from the next connection)**: check items
+  over the settings file below.
+- **Start Lantern at login**: whether `lanternd.service` is enabled (`systemctl --user
+  enable|disable`); not stored in the settings file.
+- **Open settings folder**: `~/.config/lantern/` (the file is created with its defaults).
+- **Undo phone setup…**: asks first, then ends the session and does what `lantern undo-setup`
+  does, for the phone shown; the phone then stays disconnected until replugged or connected.
+- **Quit Lantern**: stops lanternd (systemd doesn't restart it). Start it again from the
+  **Lantern** entry in the app menu, or `systemctl --user start lanternd`.
+
+Settings live in `~/.config/lantern/settings.toml` (`$XDG_CONFIG_HOME` is honoured). A missing
+file or key means the default; edits by hand apply within 2 s, no restart needed:
+
+```toml
+clipboard_sync = true     # copy text between the PC and the phone; applies at once
+lantern_keyboard = true   # type through the Lantern keyboard; applies at the next connection
+```
+
+With `lantern_keyboard = false` the session changes only stay-awake: the phone's keyboard settings
+are left alone and PC text can't be typed into phone apps (keys and shortcuts still work).
+Disconnect then Connect applies a change at once. A value of the wrong type falls back to that
+key's default; a file that doesn't parse gives the defaults and the tray shows "Settings file has
+an error; using defaults" and won't overwrite it. When the tray writes the file it keeps unknown
+keys but rewrites the header comment and drops any other comments.
 
 ## What it does to your phone
 
@@ -151,7 +198,8 @@ session), lanternd starts a session on the phone at once, even if no window is o
     `secure enabled_input_methods` and selected as `default_input_method`. It draws nothing, so
     the phone shows no on-screen keyboard in Lantern windows; PC text reaches apps through it.
     If selecting it fails, the session runs without it (no PC text input, `companion` reads
-    `unavailable`), and the phone's own keyboard stays hidden on Lantern displays.
+    `unavailable`), and the phone's own keyboard stays hidden on Lantern displays. With
+    `lantern_keyboard = false` the keyboard is not touched at all.
 
   The original values are restored when the session ends, including when the helper is killed
   or the cable is pulled. A separate guard process on the phone does that restore. As a last line
@@ -181,8 +229,9 @@ session), lanternd starts a session on the phone at once, even if no window is o
   no launcher icon and requests no permissions (no network); it can see the launcher apps, and
   only the shell (the helper) can reach its link. It writes no settings; the keyboard fallback
   above is an input method switching itself back.
-- **The clipboard is shared while a session runs**: a text copied on the PC becomes the phone's
-  clipboard, and the other way round (never sensitive or password-manager clips).
+- **The clipboard is shared while a session runs** (unless `clipboard_sync = false`): a text
+  copied on the PC becomes the phone's clipboard, and the other way round (never sensitive or
+  password-manager clips).
 
 The phone is restored whenever the session ends: when you stop lanternd
 (`systemctl --user stop lanternd`), unplug the phone, the daemon dies, or you log out. Restored
@@ -203,6 +252,7 @@ systemctl --user stop lanternd        # pause: ends the session and restores the
 systemctl --user disable --now lanternd   # stop starting it at login
 
 lantern undo-setup [--serial <serial>]   # with lanternd stopped: undo what Lantern did to the phone
+                                         # (or "Undo phone setup…" in the tray, lanternd running)
 python3 tools/build.py uninstall      # disable --now, undo-setup (best effort), remove the unit
                                       # and ~/.local/bin/lantern
 ```
@@ -214,11 +264,12 @@ notification "Lantern set up your phone" and records the phone in
 companion and one notification per daemon run says so (details in `journalctl --user -u lanternd`).
 
 `lantern undo-setup` refuses whenever lanternd answers on its socket, even when idle (it may be
-about to retry a session). It cannot see a lanternd on another runtime dir or another program using
+about to retry a session); use the tray's "Undo phone setup…" then. It cannot see a lanternd on another runtime dir or another program using
 adb on the phone; stop those first. It restores any
 setting a dead session left changed, the keyboard included (only where the setting still holds
 Lantern's value), deletes Lantern's files from `/data/local/tmp`, uninstalls the companion,
-removes that phone's KDE menu entries and icons, and forgets the phone. It prints one
+takes that phone off its KDE menu entries (an entry and its icon go when no other phone lists
+the app), and forgets the phone. It prints one
 line per step and exits 0 only if every step succeeded. Without `--serial` it uses `$LANTERN_SERIAL`
 or the only connected phone.
 
@@ -229,7 +280,7 @@ reinstall or remove the companion with `adb uninstall dev.lantern.companion`).
 ## Acceptance test (real phone + KDE desktop)
 
 ```sh
-python3 tools/build.py install && python3 tools/device_test.py   # items 1–7 and 9–13, unattended
+python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, unattended
 python3 tools/device_test.py --manual                            # adds 8 and 14: USB unplug, prompts
 python3 tools/device_test.py --only 12 13                        # some items, by number or name
 python3 tools/device_test.py --nested                            # windows in a headless nested KWin
@@ -240,7 +291,10 @@ python3 tools/device_test.py --state                             # status + phon
 Items: 1 session on plug, 2 open, 3 second open focuses, 4 resize, 5 close quits, 6 app exit
 closes the window, 7 daemon kill restores the phone, 8 USB unplug, 9 companion linked, 10 menu
 entries follow the phone, 11 title is the app's name, 12 Unicode text and composition reach the
-app, 13 clipboard both ways, 14 USB unplug restores the keyboard.
+app, 13 clipboard both ways, 14 USB unplug restores the keyboard, 15 another phone's entries
+survive this phone's sync, 16 "Connect your …" for another phone's app, 17 clipboard sync off,
+18 keyboard setting off, 19 `lantern disconnect`/`connect`, 20 the tray menu (needs the real,
+unlocked desktop and its session bus).
 
 The test restarts lanternd. Item 1 stops it first and reads the phone's own
 `stay_on_while_plugged_in`, `default_input_method` and `enabled_input_methods`, which later items
@@ -248,8 +302,10 @@ expect to see restored; set `LANTERN_STAY_ON_RESTORED=<value>` to give the first
 `--signal=KILL` checks that systemd restarts a SIGKILLed lanternd and that the new session
 removes the dead daemon's forward. The test opens only `com.android.settings`,
 `org.lineageos.jelly` and the companion's test screen (an EditText enabled only during items 10,
-12 and 13), briefly, and drives windows through the KWin scripting D-Bus. Item 13 replaces the PC
-clipboard and puts its text back afterwards. Windows get no frames while the Plasma session is
+12, 13 and 17), briefly, and drives windows through the KWin scripting D-Bus. Items 13 and 17
+replace the PC clipboard and put its text back afterwards; items 17 and 18 save
+`settings.toml` and restore it (or remove it if it was absent); items 15 and 16 plant and remove
+a fake other phone's menu entry and device record. Windows get no frames while the Plasma session is
 locked, so the window items fail there; `--nested` runs them in a private headless KWin instead
 (the clipboard still goes through the real session).
 
@@ -269,15 +325,23 @@ the phone restoring itself, work profiles, install, and an on-device acceptance 
 Plan 2 (feels like a desktop app) is done: KDE menu entries and icons that follow the phone's
 apps, window titles with the app's name (and "(work)"), typing any text through the hidden
 Lantern keyboard, text clipboard both ways, `lantern undo-setup`, and phone-safety hardening of
-the settings journal. Next:
+the settings journal.
 
-**Plan 3: integration**
+Plan 3 (phones and tray) is implemented, with its on-device acceptance run still to do: menu
+entries for every phone you use, phone names in "Connect your …" notices, the tray with
+Connect/Disconnect, Undo phone setup and Quit, `settings.toml` (clipboard sync, the Lantern
+keyboard), start at login, and `lantern connect|disconnect`. Next:
+
+**Plan 4: integration**
 - Phone notifications in KDE. Clicking one opens that app's window.
 - Drag and drop files from the PC to the phone, through Android share with a Downloads fallback.
 - Phone audio on the PC (one stream).
 - Gamepads, following whichever Lantern window is active.
-- A tray icon, and pausing a window's encoder while it is minimised.
+- Pausing a window's encoder while it is minimised.
 - A latency harness, with a target of no more than 5 ms glass-to-glass behind scrcpy.
+- Choosing between two phones plugged in at once, and a settings window.
+- Clipboard with a PIN-locked phone (Android returns no clipboard until it is unlocked once), and
+  Ctrl shortcuts in Microsoft Windows App's remote sessions.
 
 **Later / ideas**
 - Wi-Fi or Tailscale transport (the transport is already replaceable).

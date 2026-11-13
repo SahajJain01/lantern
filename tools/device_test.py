@@ -7,6 +7,19 @@
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
 
+Items (20; 18 automatic, 8 and 14 only with --manual):
+     1 session_starts_on_plug              11 title_is_label
+     2 open_settings_creates_one_display   12 ime_unicode_text
+     3 second_open_focuses                 13 clipboard_both_ways
+     4 resize_reflows                      14 usb_yank_restores_keyboard (manual)
+     5 close_quits                         15 phones_keep_their_entries
+     6 app_exit_closes_window              16 not_on_this_phone_notice
+     7 daemon_kill_restores_phone          17 clipboard_setting_off
+     8 usb_yank (manual)                   18 keyboard_setting_off
+     9 companion_linked                    19 disconnect_and_connect
+    10 catalogue_tracks_phone              20 tray_menu (real session bus, unlocked desktop)
+A full automatic run prints `18/18 PASS` when everything passes.
+
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
 Klipper's D-Bus (items 13, 17). Opens only com.android.settings, org.lineageos.jelly and the

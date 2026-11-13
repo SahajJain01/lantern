@@ -288,12 +288,31 @@ heat.
   helper reports it and the window process asks KWin to swap the window's aspect (keep the long edge's
   size). If the compositor refuses (e.g. maximised or tiled), letterbox inside the window. Letterboxing is
   accepted only in that case.
-- **One phone at a time.** Naming and session state assume a single active device. Connecting a different
-  phone replaces the menu entries (the previous phone's entries are removed). Settings records are kept per
-  device serial so undo-setup still works for each.
-- **Status tray:** a small KDE status-tray item (StatusNotifierItem) from `lanternd` shows connected/
-  disconnected/reconnecting and offers Disconnect, Open settings folder, Undo phone setup and Quit. This
-  makes per-session phone changes visible and reachable without the CLI.
+- **One session at a time; menu entries for every phone** (Sahaj's decision, 2026-11-10, replacing "one
+  phone at a time … the previous phone's entries are removed"). lanternd serves one phone at a time (the
+  first one that came online wins; `LANTERN_SERIAL` overrides), but the KDE menu keeps the union of every
+  phone's apps. There is one entry per app_id (no serial in it, so window identity, titles and remembered
+  sizes are unchanged), listing the phones that have the app (`X-Lantern-Serials=a;b;`). A full sync from
+  phone S only takes S off entries it no longer lists; an entry goes when no phone lists it; unplugging
+  changes nothing; undo-setup takes one phone off the same way. Name and icon come from the phone that
+  synced last. Opening an app the connected phone lacks (known once its first full catalogue arrived), or
+  any app with no phone connected, shows "Connect your <phone name>" (the device record keeps each phone's
+  friendly name, `settings get global device_name`). Settings records are kept per device serial so
+  undo-setup still works for each.
+- **Status tray:** a KDE status-tray item (StatusNotifierItem + `com.canonical.dbusmenu` over zbus) from
+  `lanternd`, icon `smartphone` with a state overlay. It is the home for Lantern's actions and settings:
+  - status: no phone / connecting / connected to <name> / reconnecting / disconnected / removing Lantern,
+    plus the companion's state when it is not plainly ready (e.g. "Typing through the Lantern keyboard is
+    off") and a row when `settings.toml` doesn't parse;
+  - actions: Disconnect / Connect (a disconnected phone stays paused until replugged or Connect), Open
+    settings folder, Undo phone setup… (asks first, then runs undo-setup inside lanternd), Quit Lantern
+    (exit 0; the "Lantern" app-menu entry starts it again);
+  - settings, as check items over `~/.config/lantern/settings.toml` (hand edits apply within 2 s): Sync
+    clipboard (at once), Type with the Lantern keyboard (from the next connection), Start Lantern at login
+    (systemd's enable state, not a TOML key).
+
+  The tray is optional: without a session bus or tray host lanternd runs as before. `lantern connect` /
+  `lantern disconnect` do the same as the tray's Connect/Disconnect.
 - **Latency target:** glass-to-glass no more than 5 ms worse than scrcpy 5.0.1 on the same phone, cable and
   settings, measured by the §11 harness. Start with a plain socket relay daemon → window. If it misses the
   target, switch to handing the window process its channel directly (fd passing) — keep the relay behind an
