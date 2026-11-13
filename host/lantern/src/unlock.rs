@@ -6,7 +6,6 @@
 //! The PIN never reaches a log line, an error string, `Debug` output or a process argument: it
 //! lives in a [`Pin`] (overwritten when dropped) from the dialog's stdout to the frame.
 
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
@@ -17,11 +16,10 @@ use futures_util::StreamExt;
 use lantern_proto::{LockReason, SecretPin};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use zbus::names::UniqueName;
-use zbus::zvariant::Value;
-use zbus::{Connection, MatchRule, MessageStream};
+use zbus::Connection;
 
 use crate::daemon::control::View;
+use crate::notices::{escape_markup, Notices};
 
 /// What [`Pin::parse`] says about anything but 4 to 16 ASCII digits.
 pub const PIN_FORMAT: &str = "the PIN must be 4 to 16 digits";
@@ -181,12 +179,8 @@ impl Prompt {
     }
 }
 
-const BUS: &str = "org.freedesktop.Notifications";
-const PATH: &str = "/org/freedesktop/Notifications";
 /// The notification action that opens the PIN dialog.
 const ACTION: &str = "unlock";
-/// How long a notification server call may take (it blocks the prompt's loop meanwhile).
-const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// "Unlock your {name}" and its body.
 pub fn locked_notice(name: &str) -> (String, String) {
@@ -239,82 +233,22 @@ fn phone_name(view: &watch::Receiver<View>) -> String {
         .unwrap_or_else(|| "phone".to_owned())
 }
 
-/// The notification server as [`run`] uses it.
-struct Notifier {
-    conn: Connection,
-    /// The server's unique name, from its last reply: only its `ActionInvoked` counts.
-    server: Option<UniqueName<'static>>,
-    /// Whether the missing-server warning was logged.
-    warned: bool,
+/// Shows (or replaces `replaces`) the notice with the `unlock` action labelled `label`; the
+/// phone name in it is escaped by the caller ([`notice_name`]).
+async fn show(
+    notices: &mut Notices,
+    replaces: u32,
+    (summary, body): (String, String),
+    label: &str,
+) -> u32 {
+    notices
+        .notify(replaces, &summary, &body, &[(ACTION, label)])
+        .await
 }
 
-impl Notifier {
-    /// Shows (or replaces `replaces`) a notification with the `unlock` action labelled `label`.
-    async fn notify(
-        &mut self,
-        replaces: u32,
-        (summary, body): (String, String),
-        label: &str,
-    ) -> u32 {
-        let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
-        hints.insert("urgency", Value::U8(1));
-        let body = (
-            "Lantern",
-            replaces,
-            "smartphone",
-            summary.as_str(),
-            body.as_str(),
-            vec![ACTION, label],
-            hints,
-            -1i32,
-        );
-        let reply = tokio::time::timeout(
-            CALL_TIMEOUT,
-            self.conn
-                .call_method(Some(BUS), PATH, Some(BUS), "Notify", &body),
-        )
-        .await
-        .unwrap_or_else(|_| Err(zbus::Error::Failure("no reply in time".into())));
-        match reply.and_then(|reply| {
-            let sender = reply.header().sender().map(|s| s.to_owned());
-            reply.body().deserialize::<u32>().map(|id| (id, sender))
-        }) {
-            Ok((id, sender)) => {
-                tracing::info!(id, summary, "unlock notification shown");
-                if let Some(sender) = sender {
-                    self.server = Some(sender);
-                }
-                self.warned = false;
-                id
-            }
-            Err(error) => {
-                if !self.warned {
-                    tracing::warn!(%error, "no unlock notification (no notification server?)");
-                    self.warned = true;
-                }
-                0
-            }
-        }
-    }
-
-    async fn close(&mut self, id: u32) {
-        if id == 0 {
-            return;
-        }
-        let reply = tokio::time::timeout(
-            CALL_TIMEOUT,
-            self.conn
-                .call_method(Some(BUS), PATH, Some(BUS), "CloseNotification", &id),
-        )
-        .await;
-        match reply {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::debug!(%error, id, "could not close the unlock notification")
-            }
-            Err(_) => tracing::debug!(id, "closing the unlock notification timed out"),
-        }
-    }
+/// The phone's name for a notice: [`phone_name`] escaped for the server's markup.
+fn notice_name(view: &watch::Receiver<View>) -> String {
+    escape_markup(&phone_name(view))
 }
 
 /// Runs the PIN dialog (blocking): its stdout parsed as a [`Pin`], `Ok(None)` if the user
@@ -410,18 +344,7 @@ pub async fn run(
     exe: PathBuf,
     prompt: Prompt,
 ) -> Result<()> {
-    let rule = MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .interface(BUS)?
-        .path(PATH)?
-        .member("ActionInvoked")?
-        .build();
-    let mut actions = MessageStream::for_match_rule(rule, &conn, None).await?;
-    let mut notifier = Notifier {
-        conn,
-        server: None,
-        warned: false,
-    };
+    let (mut notices, mut actions) = Notices::new(conn).await?;
     // The locked stretch: open from the first `Locked` until it ends.
     let mut stretch = false;
     // Stretches ended so far: a dialog answer is only good for the stretch it was asked in.
@@ -443,14 +366,15 @@ pub async fn run(
                         }
                         stretch = true;
                         tracing::info!(?reason, "phone locked: asking for its PIN");
-                        let name = phone_name(&view);
-                        shown = notifier.notify(0, locked_notice(&name), "Enter PIN…").await;
+                        let name = notice_name(&view);
+                        shown = show(&mut notices, 0, locked_notice(&name), "Enter PIN…").await;
                     }
                     LockEvent::Result { ok: false, reason } => {
                         tracing::info!(reason = reason.as_deref().unwrap_or(""), "unlock failed");
-                        let name = phone_name(&view);
+                        let name = notice_name(&view);
+                        let reason = reason.as_deref().map(escape_markup);
                         let notice = failed_notice(&name, reason.as_deref());
-                        shown = notifier.notify(shown, notice, "Try again").await;
+                        shown = show(&mut notices, shown, notice, "Try again").await;
                     }
                     LockEvent::Result { ok: true, .. } | LockEvent::Unlocked => {
                         if stretch || shown != 0 {
@@ -458,21 +382,15 @@ pub async fn run(
                         }
                         stretch = false;
                         ended += 1;
-                        notifier.close(std::mem::take(&mut shown)).await;
+                        notices.close(std::mem::take(&mut shown)).await;
                     }
                     LockEvent::Reopen { serial, apps } => reopen(&exe, &serial, apps),
                 }
             }
             message = actions.next() => {
                 let Some(Ok(message)) = message else { continue };
-                let header = message.header();
                 // Only the notification server's own signal counts, for a notification of ours.
-                if header.sender().is_none() || header.sender() != notifier.server.as_ref() {
-                    continue;
-                }
-                let Ok((id, action)) = message.body().deserialize::<(u32, String)>() else {
-                    continue;
-                };
+                let Some((id, action)) = notices.action(&message) else { continue };
                 if id == 0 || id != shown || action != ACTION {
                     continue;
                 }
@@ -510,9 +428,9 @@ pub async fn run(
                     Ok(Ok(None)) => {}
                     Ok(Err(message)) => {
                         tracing::warn!(message, "PIN not sent");
-                        let name = phone_name(&view);
-                        let notice = (format!("Couldn't unlock {name}"), message);
-                        shown = notifier.notify(shown, notice, "Try again").await;
+                        let name = notice_name(&view);
+                        let notice = (format!("Couldn't unlock {name}"), escape_markup(&message));
+                        shown = show(&mut notices, shown, notice, "Try again").await;
                     }
                     Err(error) => tracing::warn!(%error, "PIN dialog task failed"),
                 }

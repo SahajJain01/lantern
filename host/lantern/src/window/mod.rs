@@ -947,13 +947,19 @@ fn notify_connect_phone(id: &identity::Identity, notice: Notice) {
     let (summary, body, icon) = match crate::daemon::catalog::Dirs::from_env() {
         Ok(dirs) => {
             let names = crate::daemon::companion::names();
-            crate::daemon::catalog::connect_notice(
-                &dirs,
-                &*names,
-                &id.pkg,
-                id.user,
-                here.as_deref(),
-            )
+            match &id.phone {
+                // The open named its phone: that is the one to connect.
+                Some(phone) => crate::daemon::catalog::connect_notice_for_phone(
+                    &dirs, &*names, &id.pkg, id.user, phone,
+                ),
+                None => crate::daemon::catalog::connect_notice(
+                    &dirs,
+                    &*names,
+                    &id.pkg,
+                    id.user,
+                    here.as_deref(),
+                ),
+            }
         }
         Err(_) => (
             "Connect your phone".to_owned(),

@@ -373,6 +373,9 @@ pub struct Hub {
     reopens: Vec<(String, String, u32, Instant)>,
     /// The connect prompt runs: an open for a phone that isn't connected is offered to it.
     connect_prompt: bool,
+    /// The prompt's notifications get through (`None`: assume they do). Offers are made only
+    /// while they do.
+    connect_health: Option<crate::connect::Health>,
     /// Opens refused with [`CONNECT_OFFERED`] not yet taken by the run loop: (serial, pkg, user).
     refused: Vec<(String, String, u32)>,
 }
@@ -405,15 +408,18 @@ impl Hub {
             opened: HashSet::new(),
             reopens: Vec::new(),
             connect_prompt: false,
+            connect_health: None,
             refused: Vec::new(),
         }
     }
 
     /// The connect prompt runs: an open naming a phone that isn't connected (but is plugged in
     /// or known) is answered with [`CONNECT_OFFERED`] and queued for [`Self::take_refused`],
-    /// instead of the old [`NOT_CONNECTED`]/[`PAUSED`].
-    pub fn set_connect_events(&mut self) {
+    /// instead of the old [`NOT_CONNECTED`]/[`PAUSED`]; with `health`, only while it is healthy
+    /// (otherwise nobody would see the offer, and the window, told it was offered, stays silent).
+    pub fn set_connect_events(&mut self, health: Option<crate::connect::Health>) {
         self.connect_prompt = true;
+        self.connect_health = health;
     }
 
     /// The opens refused with [`CONNECT_OFFERED`] since the last call, oldest first:
@@ -1064,7 +1070,18 @@ impl Hub {
         user: u32,
     ) -> &'static str {
         let state = self.view.phone(&serial).map(|p| p.state);
-        if self.connect_prompt && state.is_some_and(|s| s != PhoneState::Undoing) {
+        let prompt_shows = self.connect_prompt
+            && self
+                .connect_health
+                .as_ref()
+                .is_none_or(crate::connect::Health::healthy);
+        if self.connect_prompt && !prompt_shows {
+            tracing::info!(
+                serial,
+                "connect prompt has no notification server; not offering"
+            );
+        }
+        if prompt_shows && state.is_some_and(|s| s != PhoneState::Undoing) {
             tracing::info!(
                 cid,
                 serial,

@@ -1278,6 +1278,19 @@ pub fn connect_notice(
     notice_for_phones(names, app, &phones, here, icon)
 }
 
+/// [`connect_notice`] for an open that named its phone (`lantern open --phone S`): it names
+/// that phone only, whichever other phones have the app.
+pub fn connect_notice_for_phone(
+    dirs: &Dirs,
+    names: &dyn Fn(&str) -> Option<String>,
+    pkg: &str,
+    user: u32,
+    phone: &str,
+) -> (String, String, Option<PathBuf>) {
+    let (app, _, icon) = app_of_entries(dirs, pkg, user);
+    notice_for_phones(names, app, &[phone.to_owned()], None, icon)
+}
+
 /// "Lantern is disconnected": the open was refused because the user disconnected the phone in
 /// Lantern. The app is named (with its icon) as in its menu entries.
 pub fn paused_notice(dirs: &Dirs, pkg: &str, user: u32) -> (String, String, Option<PathBuf>) {
@@ -2471,6 +2484,26 @@ mod tests {
         let (_, body, ic) = connect_notice(&dirs, &|_| None, "com.a", 0, None);
         assert_eq!(body, "Sett\\ings opens when your s is connected by USB.");
         assert_eq!(ic, Some(icon(&dirs, "lantern.com.a-ps")));
+    }
+
+    /// An open that named its phone (`--phone A`) gets a notice for A only, even when other
+    /// phones have the app too (never "Connect A or B" while B is live).
+    #[test]
+    fn connect_notice_for_a_named_phone() {
+        let (_t, dirs) = tmp();
+        plant(&dirs, &["A", "B"]);
+        let (s, body, _) = connect_notice_for_phone(&dirs, &names, "com.a", 0, "A");
+        assert_eq!(
+            (s, body),
+            (
+                "Connect your Phone A".to_owned(),
+                "Alpha opens when your Phone A is connected by USB.".to_owned()
+            )
+        );
+        // A phone without the app (or entry) is still the one named.
+        let (s, body, _) = connect_notice_for_phone(&dirs, &names, "com.zz", 0, "s9");
+        assert_eq!(s, "Connect your s9");
+        assert_eq!(body, "com.zz opens when your s9 is connected by USB.");
     }
 
     #[test]

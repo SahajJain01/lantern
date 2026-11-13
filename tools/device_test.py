@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-24
-    python3 tools/device_test.py --manual                            # also 8, 14, 21 (prompts)
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-25
+    python3 tools/device_test.py --manual                            # also 8, 14, 21, 26 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
 
-Items (24; 21 automatic, 8, 14 and 21 only with --manual):
+Items (26; 22 automatic, 8, 14, 21 and 26 only with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -22,12 +22,14 @@ Items (24; 21 automatic, 8, 14 and 21 only with --manual):
                                            22 swipe_phone_never_prompts (Xiaomi, no PIN)
                                            23 per_phone_folders (restarts lanternd)
                                            24 autoconnect_on_remembers_off (adb reconnect)
-A full automatic run prints `21/21 PASS` when everything passes.
+                                           25 autoconnect_off_asks_on_plug (adb reconnect, tray)
+                                           26 connect_from_entry_opens_app (manual, Sahaj clicks)
+A full automatic run prints `22/22 PASS` when everything passes.
 
 lanternd serves only LANTERN_SERIAL's phone during the run: the suite sets
 `LANTERN_SERIAL=<SERIAL>` in the systemd user environment (restarting lanternd) if it isn't set
 there, and puts the previous value back (restarting again) at the end. Item 24 lifts it for its
-own steps.
+own steps, and so do items 25 and 26.
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
@@ -39,7 +41,11 @@ if it was absent); item 18 restarts lanternd with the keyboard off and back on; 
 disconnects the phone in Lantern for ~15 s and connects it again; item 20 does the same through
 the tray menu over the session bus (and saves a screenshot of the screen to the log dir); item 24
 sets `autoconnect = true` in settings.toml (restored afterwards), drops the phone off adb with
-`adb reconnect` twice and restarts lanternd.
+`adb reconnect` twice and restarts lanternd; item 25 sets `autoconnect = false` (restored),
+drops the phone off adb once and connects it through its tray row; item 26 disconnects the
+phone, refuses an open of Settings and has Sahaj click Connect on the "Connect your <phone>"
+notification (real desktop only), then closes the Settings window it opened. Items 21, 22, 25
+and 26 log the session bus's Notify calls to the log dir and print only matched summaries.
 Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
 The window items (2-6, 11-13, 17, 22) need frames from the compositor, which a locked Plasma session
@@ -256,6 +262,102 @@ def replug(manual=None):
             raise Fail("adb reconnect did not drop the phone; run --manual and pull the cable")
     _, secs = wait_until("phone back on adb", 15, lambda: adb_state() == "device", interval=0.2)
     note(f"phone back on adb after {secs:.1f} s")
+
+
+def markup(text):
+    """`text` as lanternd's notices send it (Plasma markup: & < > escaped)."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def device_name():
+    """The phone's friendly name (Settings > About), else its serial."""
+    return adb("shell", "settings", "get", "global", "device_name").strip() or SERIAL
+
+
+class NotifyMonitor:
+    """`busctl --user monitor org.freedesktop.Notifications` into LOG_DIR/notifications-<tag>.log
+    while open. `notifies()` lists every Notify call seen so far as (summary, actions); callers
+    print only the summaries they match."""
+
+    def __init__(self, tag):
+        self.log = LOG_DIR / f"notifications-{tag}.log"
+        self.f = None
+        self.p = None
+
+    def __enter__(self):
+        self.f = open(self.log, "w")
+        self.p = subprocess.Popen(["busctl", "--user", "monitor", "org.freedesktop.Notifications"],
+                                  stdout=self.f, stderr=subprocess.STDOUT)
+        time.sleep(1)  # the monitor is subscribed
+        return self
+
+    def __exit__(self, *exc):
+        self.p.terminate()
+        try:
+            self.p.wait(5)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+        self.f.close()
+        return False
+
+    def notifies(self):
+        out = []
+        for block in self.log.read_text(errors="replace").split("\u2023"):
+            if "Member=Notify" not in block:
+                continue
+            strings = re.findall(r'STRING "((?:[^"\\]|\\.)*)";', block)
+            arr = re.search(r'ARRAY "s" \{(.*?)\};', block, re.S)
+            actions = re.findall(r'STRING "((?:[^"\\]|\\.)*)";', arr.group(1)) if arr else []
+            if len(strings) >= 4:
+                out.append((strings[2], actions))  # app, icon, summary, body, ...
+        return out
+
+    def matching(self, summary, since=0):
+        return [n for n in self.notifies()[since:] if n[0] == summary]
+
+
+def tray_name():
+    """lanternd's StatusNotifierItem bus name (take it after any lanternd restart)."""
+    pid = systemctl("show", "-p", "MainPID", "--value", UNIT).strip()
+    check(pid not in ("", "0"), f"{UNIT} is not running")
+    return f"org.kde.StatusNotifierItem-{pid}-1"
+
+
+def tray_rows(name):
+    """The tray menu's top-level rows: {id: (label, toggle-state or None)}."""
+    out = sh("busctl", "--user", "--json=short", "call", name, "/MenuBar",
+             "com.canonical.dbusmenu", "GetLayout", "iias", "--", "0", "-1", "0")
+    _, (_, _, children) = json.loads(out)["data"]
+    found = {}
+    for child in children:
+        cid, props, _ = child["data"]
+        found[cid] = (props.get("label", {}).get("data", ""),
+                      props.get("toggle-state", {}).get("data"))
+    return found
+
+
+def tray_click(name, cid):
+    sh("busctl", "--user", "call", name, "/MenuBar", "com.canonical.dbusmenu", "Event",
+       "isvu", "--", str(cid), "clicked", "i", "0", "0")
+
+
+def tray_phone_row(name, device):
+    """(row id, rows) of the checkmark row named `device` (ids 100n), else None."""
+    want = device.replace("_", "__")  # dbusmenu escapes mnemonics
+    r = tray_rows(name)
+    ids = [cid for cid, (label, toggle) in r.items()
+           if label == want and toggle is not None and cid >= 100 and cid % 100 == 0]
+    return (ids[0], r) if ids else None
+
+
+def edit_settings(saved_file, key, value):
+    """Writes settings.toml as `saved_file` (bytes or None) with `key = value` instead of any
+    line setting `key`."""
+    path = settings_file()
+    text = (saved_file or b"").decode(errors="replace")
+    lines = [l for l in text.splitlines() if not re.match(rf"\s*{key}\s*=", l)]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines + [f"{key} = {value}"]) + "\n")
 
 
 class Window:
@@ -1446,9 +1548,7 @@ class Suite:
         base = baseline()
         note(f"originals: stay_on={base['stay_on']} ime={base['ime']} imes={base['imes']}")
         wait_ready(15)
-        pid = systemctl("show", "-p", "MainPID", "--value", UNIT).strip()
-        check(pid not in ("", "0"), f"{UNIT} is not running")
-        name = f"org.kde.StatusNotifierItem-{pid}-1"
+        name = tray_name()
 
         def registered():
             out = sh("busctl", "--user", "--json=short", "get-property",
@@ -1459,30 +1559,14 @@ class Suite:
         note(f"registered {items} ({secs:.1f} s)")
 
         def rows():
-            """Top-level rows: {id: (label, toggle-state or None)}."""
-            out = sh("busctl", "--user", "--json=short", "call", name, "/MenuBar",
-                     "com.canonical.dbusmenu", "GetLayout", "iias", "--", "0", "-1", "0")
-            _, (_, _, children) = json.loads(out)["data"]
-            found = {}
-            for child in children:
-                cid, props, _ = child["data"]
-                found[cid] = (props.get("label", {}).get("data", ""),
-                              props.get("toggle-state", {}).get("data"))
-            return found
+            return tray_rows(name)
 
         def click(cid):
-            sh("busctl", "--user", "call", name, "/MenuBar", "com.canonical.dbusmenu", "Event",
-               "isvu", "--", str(cid), "clicked", "i", "0", "0")
+            tray_click(name, cid)
 
         device = adb("shell", "settings get global device_name").strip()
-        want = device.replace("_", "__")  # dbusmenu escapes mnemonics
-
-        def phone_row():
-            r = rows()
-            ids = [cid for cid, (label, toggle) in r.items()
-                   if label == want and toggle is not None and cid >= 100 and cid % 100 == 0]
-            return ids and (ids[0], r)
-        (row, menu), _ = wait_until(f"a checkmark row {want!r}", 15, phone_row)
+        (row, menu), _ = wait_until(f"a checkmark row {device!r}", 15,
+                                    lambda: tray_phone_row(name, device))
         note(f"menu: {menu}; the phone's row is {row}")
         check(menu[row][1] == 1, f"row {row} is not checked: {menu[row]}")
         check(menu.get(11, ("",))[0] == "Quit Lantern", f"no Quit Lantern row: {menu}")
@@ -1827,6 +1911,161 @@ class Suite:
             cleanup(ok, *steps)
 
 
+    def autoconnect_off_asks_on_plug(self):
+        """With `autoconnect = false` (and LANTERN_SERIAL lifted, a 0 ms unplug grace): the
+        restart reconnects the phone through its `live` flag without a "plugged in" notice; a
+        replug then asks: a Notify "<phone> is plugged in" within 5 s, the phone waiting and
+        restored; clicking its tray row connects it."""
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+
+        def restore_file():
+            if saved_file is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(saved_file)
+
+        device = device_name()
+        summary = f"{markup(device)} is plugged in"
+        env = manager_env(set={"LANTERN_UNPLUG_GRACE_MS": "0"}, unset=["LANTERN_SERIAL"])
+        ok = False
+        entered = False
+        with NotifyMonitor("25") as mon:
+            try:
+                # 1. Autoconnect off; the restart reconnects the phone through its live flag.
+                edit_settings(saved_file, "autoconnect", "false")
+                env.__enter__()  # puts the environment back itself if it fails part-way
+                entered = True
+                _, secs = wait_ready(15)
+                note(f"autoconnect off: ready {secs:.1f} s after the restart (live flag)")
+                time.sleep(5)
+                check(not mon.matching(summary), f"{summary!r} after a restart")
+                note(f"no {summary!r} for 5 s after the restart")
+                # 2. A replug asks instead of connecting.
+                before = len(mon.notifies())
+                replug()
+                got, secs = wait_until(f"Notify {summary!r}", 5,
+                                       lambda: mon.matching(summary, before), interval=0.2)
+                note(f"Notify {got[0][0]!r} {secs:.1f} s after the phone came back")
+                wait_until("phone restored", 5, lambda: restored(phone_state()), interval=0.2)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    p = phone_status(SERIAL)
+                    check(p.get("state") == "waiting", f"phone not waiting: {json.dumps(p)}")
+                    check(restored(phone_state()), "the phone is not restored while waiting")
+                    time.sleep(1)
+                note("waiting and restored for 10 s after the replug")
+                # 3. Its tray row connects it (the bus name is taken after the restart).
+                name = tray_name()
+                (row, menu), _ = wait_until(f"a checkmark row {device!r}", 15,
+                                            lambda: tray_phone_row(name, device))
+                note(f"the phone's row is {row}: {menu[row]}")
+                tray_click(name, row)
+                _, secs = wait_ready(15)
+                note(f"ready {secs:.1f} s after the tray click")
+                ok = True
+            finally:
+                # 4. The file, then the environment (restarts lanternd); lanternd left ready.
+                steps = [("restore settings.toml", restore_file)]
+                if entered:
+                    steps.append(("restore lanternd's environment",
+                                  lambda: env.__exit__(None if ok else Fail, None, None)))
+                if not ok:
+                    steps.append(("lantern connect", lambda: lantern_cmd("connect", SERIAL)))
+                steps.append(("lanternd ready", lambda: wait_ready(20)))
+                cleanup(ok, *steps)
+
+    def connect_from_entry_opens_app(self):
+        """Manual (Sahaj clicks Connect; real desktop, not --nested: lanternd opens the window
+        on the session it runs in). LANTERN_SERIAL lifted, a 0 ms unplug grace. The phone is
+        disconnected in Lantern; `lantern open --phone SERIAL com.android.settings` exits 1
+        within 5 s and a Notify "Connect your <phone>" with the `connect` action follows within
+        5 s; after the click the phone is ready within 20 s, Settings opens in a window of its
+        own app_id within 20 s, and 10 s later lanternd lists exactly one Settings window. The
+        window is closed through KWin."""
+        check(not NESTED, "item 26 needs the real desktop: lanternd opens the window there")
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+
+        def restore_file():
+            if saved_file is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(saved_file)
+
+        def settings_windows():
+            return [w for w in status()["windows"] if w["pkg"] == SETTINGS]
+
+        def close_settings():
+            if settings_windows():
+                kwin_on(SETTINGS, CLOSE, "lantern_close")
+                wait_until("Settings window gone", 10, lambda: not settings_windows())
+
+        summary = f"Connect your {markup(device_name())}"
+        env = manager_env(set={"LANTERN_UNPLUG_GRACE_MS": "0"}, unset=["LANTERN_SERIAL"])
+        ok = False
+        entered = False
+        with NotifyMonitor("26") as mon:
+            try:
+                env.__enter__()  # puts the environment back itself if it fails part-way
+                entered = True
+                _, secs = wait_ready(15)
+                note(f"ready {secs:.1f} s after the restart (live flag)")
+                # 1. Disconnected in Lantern: the phone is restored.
+                note(f"lantern disconnect {SERIAL}: {lantern_cmd('disconnect', SERIAL)}")
+                wait_until("phone restored", 5, lambda: restored(phone_state()), interval=0.2)
+                # 2. The open is refused and offered.
+                before = len(mon.notifies())
+                t0 = time.monotonic()
+                r = subprocess.run([LANTERN, "open", "--phone", SERIAL, SETTINGS],
+                                   capture_output=True, text=True, timeout=5)
+                took = time.monotonic() - t0
+                note(f"lantern open --phone {SERIAL} {SETTINGS}: exit {r.returncode} "
+                     f"after {took:.1f} s")
+                check(r.returncode == 1, f"lantern open exited {r.returncode}, want 1")
+                got, secs = wait_until(f"Notify {summary!r}", 5,
+                                       lambda: mon.matching(summary, before), interval=0.2)
+                note(f"Notify {got[0][0]!r} {secs:.1f} s after the open exited; "
+                     f"actions {got[0][1]}")
+                check("connect" in got[0][1][::2], f"no `connect` action: {got[0][1]}")
+                # 3. Sahaj clicks Connect.
+                print(f"    >>> Click Connect on the notification {summary!r}.", flush=True)
+                # 4. Connected, and Settings opens once. The click clears `off` at once.
+                _, secs = wait_until("the Connect click", 180,
+                                     lambda: phone_status(SERIAL).get("state") != "off",
+                                     interval=0.2)
+                note(f"clicked {secs:.1f} s after the prompt")
+                _, secs = wait_ready(20)
+                note(f"ready {secs:.1f} s after the click")
+                want = f"resourceClass={app_id_of(SETTINGS)} "
+                lines, secs = wait_until(
+                    "the Settings window", 20,
+                    lambda: [l for l in kwin_on(SETTINGS, DESCRIBE, "lantern_describe")
+                             if l.startswith(want)])
+                note(f"{lines[0]} ({secs:.1f} s after ready)")
+                time.sleep(10)
+                wins = settings_windows()
+                check(len(wins) == 1, f"{len(wins)} Settings windows after 10 s: {wins}")
+                # 5. Closed through KWin.
+                close_settings()
+                note("Settings closed through KWin")
+                ok = True
+            finally:
+                steps = [("close Settings", close_settings),
+                         ("restore settings.toml", restore_file)]
+                if entered:
+                    steps.append(("restore lanternd's environment",
+                                  lambda: env.__exit__(None if ok else Fail, None, None)))
+                if not ok:
+                    steps.append(("lantern connect", lambda: lantern_cmd("connect", SERIAL)))
+                steps.append(("lanternd ready", lambda: wait_ready(20)))
+                cleanup(ok, *steps)
+
+
 ITEMS = [
     "session_starts_on_plug",
     "open_settings_creates_one_display",
@@ -1852,9 +2091,12 @@ ITEMS = [
     "swipe_phone_never_prompts",
     "per_phone_folders",
     "autoconnect_on_remembers_off",
+    "autoconnect_off_asks_on_plug",
+    "connect_from_entry_opens_app",
 ]
-# Need a person: pull the cable (8, 14) or type the phone's PIN (21).
-MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt"}
+# Need a person: pull the cable (8, 14), type the phone's PIN (21) or click Connect (26).
+MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt",
+          "connect_from_entry_opens_app"}
 
 
 def desktop_locked():
@@ -1875,7 +2117,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manual", action="store_true",
-                    help="also run items 8, 14 and 21 (USB unplug, typing the PIN; prompts)")
+                    help="also run items 8, 14, 21 and 26 (USB unplug, typing the PIN, "
+                         "clicking Connect; prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
     ap.add_argument("--only", nargs="*", help="run only these items (numbers or names)")
     ap.add_argument("--nested", action="store_true",

@@ -121,6 +121,10 @@ pub struct Parts {
     /// drops one). Set only when the connect prompt runs: it also makes an open for a phone that
     /// isn't connected an offer to connect it ([`Hub::set_connect_events`]).
     pub connect_events: Option<mpsc::Sender<ConnectEvent>>,
+    /// Whether the connect prompt's notifications get through: refused opens are offered to it
+    /// only while they do (else the window gets the old error and shows its own notice). `None`
+    /// with `connect_events` set: always offered.
+    pub connect_health: Option<crate::connect::Health>,
     /// Opens the app of a connect-and-open request once its phone is ready.
     pub opener: Option<Opener>,
 }
@@ -172,12 +176,13 @@ where
         state_dir,
         timing,
         connect_events,
+        connect_health,
         opener,
     } = parts;
     let mut hub = Hub::new(Some(listener));
     hub.set_state_dir(state_dir.clone());
     if connect_events.is_some() {
-        hub.set_connect_events();
+        hub.set_connect_events(connect_health);
     }
     if let Some(events) = lock_events {
         hub.set_lock_events(events);
@@ -1207,6 +1212,16 @@ pub async fn run() -> Result<()> {
         Some((_, request)) => (Some(pin_rx), Some(lock_tx), Some(request)),
         None => (None, None, None),
     };
+    // The connect prompt on its own bus connection: "plugged in" / "Connect your …" / "Plug in
+    // your …"; its Connect click comes back as a command. Without a session bus there is none:
+    // plug-ins then wait silently and refused opens get the old errors.
+    let (connect_tx, connect_rx) = mpsc::channel(16);
+    let connect_health = crate::connect::Health::new();
+    let (connect_events, connect_health) =
+        match crate::connect::spawn(connect_rx, cmd_tx.clone(), connect_health.clone()).await {
+            Some(_) => (Some(connect_tx), Some(connect_health)),
+            None => (None, None),
+        };
     // The tray's Unlock row asks the same prompt (it never runs the dialog or sees a PIN).
     crate::tray::spawn(view_rx, settings.clone(), cmd_tx, request).await;
     let mut timing = Timing::default();
@@ -1234,9 +1249,10 @@ pub async fn run() -> Result<()> {
             lock_events,
             state_dir: companion::state_dir(),
             timing,
-            // The connect prompt comes with the plugged-in notifications. Setting this also
-            // turns opens for a phone that isn't connected into offers (`CONNECT_OFFERED`).
-            connect_events: None,
+            // Setting this also turns opens for a phone that isn't connected into offers
+            // (`CONNECT_OFFERED`), while the prompt's notifications get through.
+            connect_events,
+            connect_health,
             opener: opener(),
         },
         configured,

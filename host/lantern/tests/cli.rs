@@ -359,11 +359,17 @@ fn open_without_daemon(tag: &str, args: &[&str]) -> (std::process::Output, Strin
 #[test]
 fn open_with_phone_reaches_the_daemon_step() {
     // A valid `--phone` parses; with no daemon it fails at runtime (1), not as usage (2), and
-    // shows the \"Connect your phone\" notice (through the stub).
-    for args in [
-        &["open", "--phone", "20e9318", "com.example"][..],
-        &["open", "--phone=ZD222LMDFV", "--user", "10", "com.example"],
-        &["open", "com.example", "--phone", "a:b"],
+    // shows the \"Connect your <phone>\" notice (through the stub) for the phone it named.
+    for (args, phone) in [
+        (
+            &["open", "--phone", "20e9318", "com.example"][..],
+            "20e9318",
+        ),
+        (
+            &["open", "--phone=ZD222LMDFV", "--user", "10", "com.example"],
+            "ZD222LMDFV",
+        ),
+        (&["open", "com.example", "--phone", "a:b"], "a:b"),
     ] {
         let (output, sent) = open_without_daemon("open-phone-ok", args);
         let stderr = String::from_utf8(output.stderr).unwrap();
@@ -373,7 +379,7 @@ fn open_with_phone_reaches_the_daemon_step() {
             "{args:?} stderr: {stderr}"
         );
         assert!(
-            sent.contains("Connect your phone"),
+            sent.contains(&format!("Connect your {phone} ")),
             "{args:?} notify-send: {sent:?}"
         );
     }

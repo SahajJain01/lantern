@@ -3549,6 +3549,50 @@ async fn open_naming_another_phone_is_offered() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The ledger's Task 5 note: while the connect prompt's notifications don't get through (its
+/// `Notify` failed, no server answers), lanternd doesn't offer Connect; the window gets the old
+/// error and shows its own notice. Once the prompt is healthy again, opens are offered.
+#[tokio::test]
+async fn open_is_offered_only_while_the_prompt_is_healthy() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let health = lantern::connect::Health::new();
+    let shared = health.clone();
+    let mut ctl = start_ctl_with(port, &["dev", "b"], None, |p| {
+        p.connect_health = Some(shared)
+    });
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    assert_eq!(ctl.prompt().await, plugged_in("b", "b"));
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::NOT_CONNECTED)
+    );
+    ctl.command(disconnect("b")).await;
+    ctl.state_until("b", PhoneState::Off).await;
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::PAUSED)
+    );
+    ctl.assert_no_prompt().await;
+    health.set(true);
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::CONNECT_OFFERED)
+    );
+    assert!(matches!(
+        ctl.prompt().await,
+        ConnectEvent::OpenRefused { serial, .. } if serial == "b"
+    ));
+    health.set(false);
+    assert_eq!(
+        refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+        Control::error(ipc::PAUSED)
+    );
+    ctl.assert_no_prompt().await;
+    helper.assert_quiet().await;
+    ctl.shutdown().await;
+}
+
 /// Without the connect prompt (no session bus) the old errors stay: PAUSED for a phone
 /// switched off in Lantern, NOT_CONNECTED otherwise.
 #[tokio::test]

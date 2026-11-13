@@ -1,8 +1,10 @@
 pub mod adb;
 pub mod clipboard;
+pub mod connect;
 pub mod daemon;
 pub mod desktop;
 pub mod naming;
+pub mod notices;
 pub mod notify;
 pub mod settings;
 pub mod tray;
