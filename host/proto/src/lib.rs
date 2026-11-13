@@ -181,7 +181,7 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Control {
     Hello {
@@ -304,9 +304,9 @@ pub enum Control {
     /// Helper -> daemon, stream 0: the locked stretch is over.
     Unlocked,
     /// Daemon -> helper, stream 0: one unlock attempt with this PIN (4-16 ASCII digits). Never
-    /// logged by either side; its `Debug` prints `pin: "<redacted>"`.
+    /// logged by either side; [`SecretPin`]'s `Debug` redacts it.
     Unlock {
-        pin: String,
+        pin: SecretPin,
     },
     /// Helper -> daemon, stream 0: the outcome of one [`Control::Unlock`]. `reason` is absent when
     /// `None`.
@@ -317,127 +317,27 @@ pub enum Control {
     },
 }
 
-/// Hand-written so [`Control::Unlock`]'s PIN never reaches a log. Every other variant prints
-/// exactly as `#[derive(Debug)]` would.
-impl fmt::Debug for Control {
+/// A PIN on the wire (`unlock.pin`): serialized as the bare string, but its `Debug` prints
+/// `SecretPin(<redacted>)`, so a `{:?}` of any message that holds it (tracing's `?field`, assert
+/// messages) never shows the digits. Read it only through [`SecretPin::expose`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretPin(String);
+
+impl SecretPin {
+    pub fn new(pin: String) -> Self {
+        SecretPin(pin)
+    }
+
+    /// The digits. Never log the result.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretPin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Control::Hello {
-                version,
-                token,
-                keyboard,
-            } => f
-                .debug_struct("Hello")
-                .field("version", version)
-                .field("token", token)
-                .field("keyboard", keyboard)
-                .finish(),
-            Control::Open {
-                pkg,
-                user,
-                w,
-                h,
-                dpi,
-                activation_token,
-            } => f
-                .debug_struct("Open")
-                .field("pkg", pkg)
-                .field("user", user)
-                .field("w", w)
-                .field("h", h)
-                .field("dpi", dpi)
-                .field("activation_token", activation_token)
-                .finish(),
-            Control::Opened {
-                display,
-                task,
-                codec,
-                w,
-                h,
-                moved,
-                label,
-                work,
-            } => f
-                .debug_struct("Opened")
-                .field("display", display)
-                .field("task", task)
-                .field("codec", codec)
-                .field("w", w)
-                .field("h", h)
-                .field("moved", moved)
-                .field("label", label)
-                .field("work", work)
-                .finish(),
-            Control::Resize { w, h, dpi } => f
-                .debug_struct("Resize")
-                .field("w", w)
-                .field("h", h)
-                .field("dpi", dpi)
-                .finish(),
-            Control::Resized { w, h } => f
-                .debug_struct("Resized")
-                .field("w", w)
-                .field("h", h)
-                .finish(),
-            Control::Focus { activation_token } => f
-                .debug_struct("Focus")
-                .field("activation_token", activation_token)
-                .finish(),
-            Control::Close => f.write_str("Close"),
-            Control::Closed { reason } => f.debug_struct("Closed").field("reason", reason).finish(),
-            Control::Error { msg, code, version } => f
-                .debug_struct("Error")
-                .field("msg", msg)
-                .field("code", code)
-                .field("version", version)
-                .finish(),
-            Control::Bye => f.write_str("Bye"),
-            Control::Status => f.write_str("Status"),
-            Control::StatusReport(r) => f.debug_tuple("StatusReport").field(r).finish(),
-            Control::Daemon { cmd } => f.debug_struct("Daemon").field("cmd", cmd).finish(),
-            Control::App {
-                pkg,
-                user,
-                label,
-                work,
-                icon,
-            } => f
-                .debug_struct("App")
-                .field("pkg", pkg)
-                .field("user", user)
-                .field("label", label)
-                .field("work", work)
-                .field("icon", icon)
-                .finish(),
-            Control::AppsEnd { count } => f.debug_struct("AppsEnd").field("count", count).finish(),
-            Control::AppRemoved { pkg, user } => f
-                .debug_struct("AppRemoved")
-                .field("pkg", pkg)
-                .field("user", user)
-                .finish(),
-            Control::Companion { state, msg } => f
-                .debug_struct("Companion")
-                .field("state", state)
-                .field("msg", msg)
-                .finish(),
-            Control::Clip { text } => f.debug_struct("Clip").field("text", text).finish(),
-            Control::Ime { op, text } => f
-                .debug_struct("Ime")
-                .field("op", op)
-                .field("text", text)
-                .finish(),
-            Control::Locked { reason } => f.debug_struct("Locked").field("reason", reason).finish(),
-            Control::Unlocked => f.write_str("Unlocked"),
-            Control::Unlock { pin: _ } => f
-                .debug_struct("Unlock")
-                .field("pin", &"<redacted>")
-                .finish(),
-            Control::UnlockResult { ok, reason } => f
-                .debug_struct("UnlockResult")
-                .field("ok", ok)
-                .field("reason", reason)
-                .finish(),
-        }
+        f.write_str("SecretPin(<redacted>)")
     }
 }
 
@@ -1329,7 +1229,9 @@ mod tests {
             Control::decode(br#"{"t":"unlocked"}"#).unwrap(),
             Control::Unlocked
         );
-        let unlock = Control::Unlock { pin: "1234".into() };
+        let unlock = Control::Unlock {
+            pin: SecretPin::new("1234".into()),
+        };
         let s = String::from_utf8(unlock.encode()).unwrap();
         assert_eq!(s, r#"{"t":"unlock","pin":"1234"}"#);
         assert_eq!(Control::decode(s.as_bytes()).unwrap(), unlock);
@@ -1357,12 +1259,18 @@ mod tests {
     #[test]
     fn unlock_debug_is_redacted() {
         let c = Control::Unlock {
-            pin: "975310".into(),
+            pin: SecretPin::new("975310".into()),
         };
         let d = format!("{c:?}");
-        assert_eq!(d, r#"Unlock { pin: "<redacted>" }"#);
-        assert!(!format!("{c:#?}").contains("975310"));
-        assert!(!format!("{:?}", Some(&c)).contains("975310"));
+        assert_eq!(d, "Unlock { pin: SecretPin(<redacted>) }");
+        let no_digits = |s: String| !s.chars().any(|c| c.is_ascii_digit());
+        assert!(no_digits(d));
+        assert!(no_digits(format!("{c:#?}")));
+        assert!(no_digits(format!("{:?}", Some(&c))));
+        assert!(no_digits(format!("{:#?}", Some(&c))));
+        if let Control::Unlock { pin } = &c {
+            assert_eq!(pin.expose(), "975310");
+        }
         // Every other variant keeps the derived format.
         assert_eq!(
             format!("{:?}", Control::Clip { text: "x".into() }),

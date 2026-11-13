@@ -128,4 +128,11 @@ final class ClipSync {
         }
         writeHeld.accept(text);
     }
+
+    /** The session is over: forgets the held PC copy, so a late {@link #unlocked} writes nothing. */
+    void dropHeld() {
+        synchronized (this) {
+            held = null;
+        }
+    }
 }

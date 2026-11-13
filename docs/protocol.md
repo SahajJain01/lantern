@@ -187,8 +187,10 @@ lock it is sure of. A work profile's own `deviceLocked` line is ignored.
   `"clipboard"` when a PC `clip` arrives or a phone clipboard change reads back null while
   locked, `"open"` when a window's open fails while locked (sent before that window's
   `error`/`closed`, which keep the helper's message; `locked` itself is stream 0 only).
-- During a stretch the helper re-reads the lock every 2 s; when it reads unlocked it sends
-  `unlocked`, which ends the stretch (the next obstacle starts a new one).
+- During a stretch the helper re-reads the lock every 2 s. Only a successful read of unlocked
+  (`deviceLocked=0`) ends it: the helper sends `unlocked` (the next obstacle starts a new
+  stretch). An unknown read mid-stretch keeps polling. A session that ends mid-stretch sends no
+  `unlocked` and drops the held PC copy.
 - A PC `clip` that arrives while locked is not written: the helper holds the latest one and
   writes it right after the unlock (its echo is suppressed as usual). A phone copy read after
   it drops the held copy, being newer.
@@ -196,7 +198,7 @@ lock it is sure of. A work profile's own `deviceLocked` line is ignored.
   `unlock_result{ok}` (`reason` set on failure, omitted when absent). The helper accepts only a
   string of 4–16 ASCII digits; anything else is the protocol error `bad unlock`, which never
   quotes the value. Neither side ever logs the PIN (the helper logs only `router: unlock
-  requested`; the Rust `Control::Unlock` prints `pin: "<redacted>"` in `Debug`), and no golden
+  requested`; the Rust `Control::Unlock` holds a `SecretPin`, whose `Debug` prints `SecretPin(<redacted>)`), and no golden
   vector holds an `unlock`. `locked`, `unlocked` and `unlock_result` from lanternd, and
   `unlock` on a window stream, are protocol errors.
 

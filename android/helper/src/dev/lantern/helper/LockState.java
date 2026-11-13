@@ -73,20 +73,28 @@ final class LockState {
         return null;
     }
 
-    /** True only when the dump says the current user's device is locked; false when unknown. */
-    boolean locked() {
+    /**
+     * The current user's lock state: true locked, false unlocked, null unknown (no current user
+     * line, or the source failed or timed out; logged once per failing stretch).
+     */
+    Boolean read() {
         Boolean b;
         try {
             b = parseTrust(source.dump());
         } catch (IOException | RuntimeException e) {
             if (!failing) {
                 failing = true;
-                log.accept("lock: reading dumpsys trust failed (" + e + "); treating the phone as unlocked");
+                log.accept("lock: reading dumpsys trust failed (" + e + "); lock state unknown");
             }
-            return false;
+            return null;
         }
         failing = false;
-        return b != null && b;
+        return b;
+    }
+
+    /** True only when the dump says the current user's device is locked; false when unknown. */
+    boolean locked() {
+        return Boolean.TRUE.equals(read());
     }
 
     /** Device only: runs {@code dumpsys trust}, killed after {@link #DUMP_TIMEOUT_MS}. */
