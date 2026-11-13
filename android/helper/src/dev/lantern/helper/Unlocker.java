@@ -93,16 +93,37 @@ final class Unlocker {
                 log.accept("unlock: lock screen not reached (focus=" + title + ")");
                 return new Result(false, "lock screen not reached");
             }
+            // Re-read right before typing: unlocked meanwhile (by hand) means no digit at all.
+            Boolean now = lock.read();
+            if (Boolean.FALSE.equals(now)) {
+                log.accept("unlock: unlocked before typing");
+                return new Result(true, "already unlocked");
+            }
+            if (now == null) {
+                log.accept("unlock: lock state unknown before typing");
+                return new Result(false, "lock state unknown");
+            }
             for (char c : pin) {
                 keys.key(DISPLAY, KEYCODE_0 + (c - '0'));
             }
             keys.key(DISPLAY, KEYCODE_ENTER);
+            // Only a successful read of locked makes it a wrong PIN; if no read after ENTER
+            // succeeded, saying "wrong PIN" would invite guesses towards a lockout.
+            Boolean last = null;
             for (long waited = 0; waited < POLL_FOR_MS; waited += POLL_MS) {
                 sleep.sleep(POLL_MS);
-                if (Boolean.FALSE.equals(lock.read())) {
+                Boolean s = lock.read();
+                if (Boolean.FALSE.equals(s)) {
                     log.accept("unlock: ok in " + (System.nanoTime() - t0) / 1_000_000 + " ms");
                     return new Result(true, null);
                 }
+                if (s != null) {
+                    last = s;
+                }
+            }
+            if (last == null) {
+                log.accept("unlock: not confirmed");
+                return new Result(false, "unlock not confirmed");
             }
             log.accept("unlock: still locked");
             return new Result(false, "wrong PIN");

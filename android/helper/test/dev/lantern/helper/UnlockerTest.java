@@ -203,9 +203,52 @@ public final class UnlockerTest {
         eq(Arrays.asList(false), panel, "panel back off on failure");
     }
 
+    /** The lock is re-read right before typing: unlocked meanwhile, no digit goes anywhere. */
+    static void unlockedBeforeTypingTypesNothing() {
+        Rig r = new Rig().trust(trust(1), trust(0));
+        char[] pin = PIN.toCharArray();
+        Unlocker.Result res = r.unlocker().unlock(pin);
+        eq(true, res.ok, "ok");
+        eq("already unlocked", res.reason, "reason");
+        eq(Arrays.asList("key d=0 " + Unlocker.KEYCODE_WAKEUP, "swipe d=0"), r.keys, "no digit, no enter");
+        eq(true, zeroed(pin), "pin zeroed");
+        eq(Arrays.asList(false), r.panel, "panel back off");
+    }
+
+    static void unknownBeforeTypingTypesNothing() {
+        Rig r = new Rig().trust(trust(1), FAILS);
+        char[] pin = PIN.toCharArray();
+        Unlocker.Result res = r.unlocker().unlock(pin);
+        eq(false, res.ok, "not ok");
+        eq("lock state unknown", res.reason, "reason");
+        eq(Arrays.asList("key d=0 " + Unlocker.KEYCODE_WAKEUP, "swipe d=0"), r.keys, "no digit, no enter");
+        eq(true, zeroed(pin), "pin zeroed");
+        eq(Arrays.asList(false), r.panel, "panel back off");
+    }
+
+    /** No successful read after ENTER is never called a wrong PIN (that invites guessing). */
+    static void allUnknownAfterEnterIsNotConfirmed() {
+        Rig r = new Rig().trust(trust(1), trust(1), FAILS);
+        char[] pin = PIN.toCharArray();
+        Unlocker.Result res = r.unlocker().unlock(pin);
+        eq(false, res.ok, "not ok");
+        eq("unlock not confirmed", res.reason, "reason");
+        long enters = r.keys.stream().filter(k -> k.equals("key d=0 " + Unlocker.KEYCODE_ENTER)).count();
+        eq(1L, enters, "one attempt");
+        eq(true, r.logs.contains("unlock: not confirmed"), "logged: " + r.logs);
+        eq(true, zeroed(pin), "pin zeroed");
+        eq(Arrays.asList(false), r.panel, "panel back off");
+    }
+
+    /** A later failing read does not erase a successful read of locked: still a wrong PIN. */
+    static void lockedThenUnknownIsWrongPin() {
+        Rig r = new Rig().trust(trust(1), trust(1), trust(1), FAILS);
+        eq("wrong PIN", r.unlocker().unlock(PIN.toCharArray()).reason, "reason");
+    }
+
     static void unlockNeverLogsPin() {
         List<String> all = new ArrayList<>();
-        Rig ok = new Rig().trust(trust(1), trust(0));
+        Rig ok = new Rig().trust(trust(1), trust(1), trust(0));
         ok.unlocker().unlock(PIN.toCharArray());
         all.addAll(ok.logs);
         Rig wrong = new Rig().trust(trust(1));
@@ -242,6 +285,10 @@ public final class UnlockerTest {
             {"wrongPinOneAttemptPanelBackOff", (Case) UnlockerTest::wrongPinOneAttemptPanelBackOff},
             {"panelLeftAloneWhenItWasOn", (Case) UnlockerTest::panelLeftAloneWhenItWasOn},
             {"failingKeysStillZeroAndPanelOff", (Case) UnlockerTest::failingKeysStillZeroAndPanelOff},
+            {"unlockedBeforeTypingTypesNothing", (Case) UnlockerTest::unlockedBeforeTypingTypesNothing},
+            {"unknownBeforeTypingTypesNothing", (Case) UnlockerTest::unknownBeforeTypingTypesNothing},
+            {"allUnknownAfterEnterIsNotConfirmed", (Case) UnlockerTest::allUnknownAfterEnterIsNotConfirmed},
+            {"lockedThenUnknownIsWrongPin", (Case) UnlockerTest::lockedThenUnknownIsWrongPin},
             {"unlockNeverLogsPin", (Case) UnlockerTest::unlockNeverLogsPin},
         };
         int failed = 0;

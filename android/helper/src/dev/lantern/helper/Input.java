@@ -92,6 +92,18 @@ final class Input implements Injector {
             return new float[] {w / 2f, 0.81f * h, w / 2f, 0.22f * h};
         }
 
+        /**
+         * An unlock event may be injected only if {@code setDisplayId} succeeded ({@code set}) and
+         * the event reads back {@code display} ({@code readBack}, null if the read failed). An
+         * unbound event goes to the top-focused display, usually a Lantern window, so the PIN
+         * would be typed into an app. Throws {@link IllegalStateException} (no keycode in it).
+         */
+        static void requireBound(boolean set, Integer readBack, int display, String what) {
+            if (!set || readBack == null || readBack != display) {
+                throw new IllegalStateException("unlock: " + what + " not bound to display " + display);
+            }
+        }
+
         /** Proto.KEY_* to KeyEvent.ACTION_* (DOWN 0, UP 1). */
         static int keyAction(int a) {
             switch (a) {
@@ -266,9 +278,20 @@ final class Input implements Injector {
         }
 
         private void inject(int display, InputEvent ev, String what) {
-            InputManager.setDisplayId(ev, display);
+            boolean set = InputManager.setDisplayId(ev, display);
+            Policy.requireBound(set, displayIdOf(ev), display, what);
             if (!im.injectInputEvent(ev, InputManager.INJECT_INPUT_EVENT_MODE_WAIT_FOR_FINISH)) {
                 throw new IllegalStateException("unlock: inject " + what + " failed on display " + display);
+            }
+        }
+
+        /** The event's display id ({@code InputEvent.getDisplayId()}, hidden), null if unreadable. */
+        private static Integer displayIdOf(InputEvent ev) {
+            try {
+                return (Integer) InputEvent.class.getMethod("getDisplayId").invoke(ev);
+            } catch (ReflectiveOperationException | ClassCastException e) {
+                Droid.log("unlock: display id read back failed: " + e.getClass().getName());
+                return null;
             }
         }
     }

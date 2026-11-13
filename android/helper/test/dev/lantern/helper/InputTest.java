@@ -67,6 +67,29 @@ public final class InputTest {
         eq(Math.round(0.22f * 2712), Math.round(s[3]), "y1");
     }
 
+    /**
+     * An unlock event is injected only if setDisplayId succeeded and the event reads back that
+     * display; otherwise it would go to the top-focused display (a Lantern window).
+     */
+    static void unlockEventMustBeBound() {
+        Input.Policy.requireBound(true, 0, 0, "key"); // bound: no throw
+        expectUnbound(() -> Input.Policy.requireBound(false, 0, 0, "key"), "setDisplayId failed");
+        expectUnbound(() -> Input.Policy.requireBound(true, 12, 0, "key"), "read back another display");
+        expectUnbound(() -> Input.Policy.requireBound(true, null, 0, "swipe"), "read back failed");
+    }
+
+    private static void expectUnbound(Runnable r, String what) {
+        try {
+            r.run();
+        } catch (IllegalStateException e) {
+            if (!e.getMessage().startsWith("unlock: ") || !e.getMessage().endsWith(" not bound to display 0")) {
+                throw new AssertionError(what + ": message " + e.getMessage());
+            }
+            return;
+        }
+        throw new AssertionError(what + ": expected IllegalStateException");
+    }
+
     private static void eq(Object want, Object got, String what) {
         if (want == null ? got != null : !want.equals(got)) {
             throw new AssertionError(what + ": want " + want + ", got " + got);
@@ -85,6 +108,7 @@ public final class InputTest {
             {"actionButtonIsTheChangedButton", (Case) InputTest::actionButtonIsTheChangedButton},
             {"keyActionMapping", (Case) InputTest::keyActionMapping},
             {"swipeUpGeometry", (Case) InputTest::swipeUpGeometry},
+            {"unlockEventMustBeBound", (Case) InputTest::unlockEventMustBeBound},
         };
         int failed = 0;
         for (Object[] c : cases) {

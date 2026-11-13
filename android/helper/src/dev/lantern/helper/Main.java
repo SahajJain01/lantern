@@ -225,11 +225,25 @@ public final class Main {
                     try {
                         Thread t = new Thread(() -> {
                             try {
-                                Unlocker.Result r = unlockOnce(lockState, liveSession.get(), pin);
+                                Unlocker.Result r;
+                                try {
+                                    r = unlockOnce(lockState, liveSession.get(), pin);
+                                } catch (Throwable e) {
+                                    // Any Error too: lanternd always gets an answer. The
+                                    // Unlocker's finally has already restored the panel.
+                                    Droid.log("unlock: failed (" + e.getClass().getName() + ")");
+                                    r = new Unlocker.Result(false, "unlock failed");
+                                } finally {
+                                    java.util.Arrays.fill(pin, '\0');
+                                }
                                 if (r.ok) {
                                     // A read of unlocked: end the stretch now (unlocked once, the
                                     // held PC copy written once) rather than at the next poll.
-                                    lockWatch.unlockConfirmed();
+                                    try {
+                                        lockWatch.unlockConfirmed();
+                                    } catch (Throwable e) {
+                                        Droid.log("unlock: confirm failed (" + e.getClass().getName() + ")");
+                                    }
                                 }
                                 sendUnlockResult(router, r);
                             } finally {
