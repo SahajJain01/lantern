@@ -25,9 +25,8 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   ledger copied to the main checkout's gitignored `.superpowers/sdd/`.
   - Host: `cargo test --workspace --offline` 308 passed, 1 ignored (2026-11-13). Helper build:
     170 host-JVM tests, companion build: 41, all passing.
-  - The SDD ledger and per-task reports are in the worktree's gitignored
-    `.superpowers/sdd/2026-11-10-lantern-phones-and-tray/`; copy that directory to the main
-    checkout before removing the worktree.
+  - The SDD ledger and per-task reports are in the main checkout's gitignored
+    `.superpowers/sdd/2026-11-10-lantern-phones-and-tray/`.
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
 Lantern is **installed and running** on the PC from the **Plan 3** branch build (2026-11-13):
