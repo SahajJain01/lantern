@@ -51,18 +51,39 @@ fn missing_subcommand_prints_usage() {
     assert!(stderr.contains("usage: lantern daemon"), "stderr: {stderr}");
 }
 
-/// A session bus address nobody listens on, inside the test's scratch `dir`.
-/// Scratch `XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME` under `dir`: a `lantern` run from a
-/// test must never read or write the desktop's menu entries, menu files, settings or state
-/// (lanternd migrates the menu at startup).
-fn scratch_xdg(dir: &std::path::Path) -> [(&'static str, std::path::PathBuf); 3] {
+/// Scratch `XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME` under `dir`: a
+/// `lantern` run from a test must never read or write the desktop's menu entries, menu files,
+/// settings, state or caches (lanternd migrates the menu at startup).
+fn scratch_xdg(dir: &std::path::Path) -> [(&'static str, std::path::PathBuf); 4] {
     [
         ("XDG_DATA_HOME", dir.join("data")),
         ("XDG_CONFIG_HOME", dir.join("config")),
         ("XDG_STATE_HOME", dir.join("state")),
+        ("XDG_CACHE_HOME", dir.join("cache")),
     ]
 }
 
+/// Stubs in `bin` (put first on `PATH`) for the desktop tools lanternd may run: a
+/// `kbuildsycoca6` that only appends a line to the returned file (the real one rebuilds the
+/// desktop's menu cache), and a `notify-send` that does nothing.
+fn stub_desktop_tools(bin: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let ran = bin.join("kbuildsycoca6.ran");
+    for (name, body) in [
+        (
+            "kbuildsycoca6",
+            format!("#!/bin/sh\necho ran >> '{}'\nexit 0\n", ran.display()),
+        ),
+        ("notify-send", "#!/bin/sh\nexit 0\n".to_owned()),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    ran
+}
+
+/// A session bus address nobody listens on, inside the test's scratch `dir`.
 fn no_bus(dir: &std::path::Path) -> String {
     format!("unix:path={}", dir.join("no-bus").display())
 }
@@ -162,6 +183,7 @@ fn status_prints_the_running_daemons_state_as_json() {
     )
     .unwrap();
     std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    stub_desktop_tools(&bin);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
@@ -419,10 +441,8 @@ fn undo_setup_refuses_live_session() {
     )
     .unwrap();
     std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // Never reach the desktop's notification daemon from a test.
-    let notify = bin.join("notify-send");
-    std::fs::write(&notify, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&notify, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Never reach the desktop's notification daemon or menu cache from a test.
+    stub_desktop_tools(&bin);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
@@ -497,9 +517,7 @@ fn undo_setup_refuses_idle_daemon() {
     )
     .unwrap();
     std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let notify = bin.join("notify-send");
-    std::fs::write(&notify, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&notify, std::fs::Permissions::from_mode(0o755)).unwrap();
+    stub_desktop_tools(&bin);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
@@ -581,6 +599,7 @@ fn daemon_migrates_the_menu_before_it_answers() {
         )
         .unwrap();
     }
+    let rebuilt = stub_desktop_tools(&bin);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
@@ -609,11 +628,19 @@ fn daemon_migrates_the_menu_before_it_answers() {
     // The first answer comes after the migration.
     let menu = std::fs::read_to_string(dir.join("state/lantern/menu.json"));
     let shared_b = std::fs::read_to_string(apps.join("lantern.com.s-pB.desktop"));
+    // The menu changed, so lanternd rebuilt the menu cache: the stub ran, not the real
+    // kbuildsycoca6 (spawned without waiting, so give it a moment).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rebuilt.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let rebuilt = rebuilt.exists();
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
     let _ = std::fs::remove_dir_all(&dir);
     let menu: serde_json::Value = serde_json::from_str(&menu.expect("menu.json")).unwrap();
     assert_eq!(menu, serde_json::json!({"version": 2, "primary": "A"}));
+    assert!(rebuilt, "the kbuildsycoca6 stub never ran");
     let shared_b = shared_b.expect("B's own entry");
     assert!(
         shared_b.contains("StartupWMClass=lantern.com.s-pB\n"),

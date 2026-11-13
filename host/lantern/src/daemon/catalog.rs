@@ -1108,9 +1108,10 @@ pub fn choose_primary(legacy: &[(String, Vec<String>)], pins: Option<&str>) -> O
 ///    left as it is.
 /// 2. The primary is [`choose_primary`] over them.
 /// 3. For each file and each of its phones the per-phone entry is written (`Name` verbatim, the
-///    icon copied to the new name); then the old file and icon go unless one is a target. A
-///    target that is someone else's file keeps the old file. A phone whose tag another phone
-///    (the primary, else the smaller serial) has is dropped.
+///    icon copied to the new name), the old file itself last when it is a target; then the old
+///    file and icon go unless one is a target. A target that is someone else's file keeps the
+///    old file. A phone whose tag another phone (the primary, else the smallest serial) has is
+///    dropped, and the old file stays as it is.
 /// 4. The menu files are rewritten, and `menu.json` last: a run cut short starts over and ends
 ///    with the same files.
 pub fn migrate(dirs: &Dirs, pins: Option<&str>) -> Result<Migration> {
@@ -1150,14 +1151,16 @@ pub fn migrate(dirs: &Dirs, pins: Option<&str>) -> Result<Migration> {
     let naming = Naming {
         primary: primary.clone(),
     };
+    // The primary keeps its tag, else the smallest serial does.
+    let all: BTreeSet<&String> = apps.values().flatten().collect();
     let mut by_tag: BTreeMap<String, String> = BTreeMap::new();
-    for serial in primary.iter().chain(apps.values().flatten()) {
+    for serial in primary.iter().chain(all.iter().copied()) {
         by_tag
             .entry(naming::tag(serial))
             .or_insert_with(|| serial.clone());
     }
     let allowed = |serial: &String| by_tag.get(&naming::tag(serial)) == Some(serial);
-    for serial in apps.values().flatten().collect::<BTreeSet<_>>() {
+    for serial in all {
         if !allowed(serial) {
             tracing::warn!(
                 serial,
@@ -1176,10 +1179,22 @@ pub fn migrate(dirs: &Dirs, pins: Option<&str>) -> Result<Migration> {
             .clone()
             .unwrap_or_else(|| escape_value(pkg, MAX_LABEL));
         let mut targets = Vec::new();
-        let mut keep_old = false;
-        for serial in owned.serials.iter().filter(|s| allowed(s)) {
-            let stem = naming.app_id(pkg, *user, serial);
-            let target = dirs.entry_path(&stem);
+        // A phone refused for its tag keeps its old file (and icon) as they are.
+        let mut keep_old = owned.serials.iter().any(|s| !allowed(s));
+        // The old file itself, when it is a target, is rewritten last: a run cut short before
+        // then still lists every phone there, so the rerun finds them all.
+        let mut plan: Vec<(&String, String, PathBuf)> = owned
+            .serials
+            .iter()
+            .filter(|s| allowed(s))
+            .map(|serial| {
+                let stem = naming.app_id(pkg, *user, serial);
+                let target = dirs.entry_path(&stem);
+                (serial, stem, target)
+            })
+            .collect();
+        plan.sort_by_key(|(_, _, target)| target == path);
+        for (serial, stem, target) in plan {
             if target != *path {
                 match read_owned(&target)? {
                     Some(o) if !o.is_only(serial) => {
@@ -2746,6 +2761,69 @@ mod tests {
             line(&read(&folder(&dirs, "a:b")), "X-Lantern-Serial"),
             ["a:b"]
         );
+    }
+
+    /// A phone refused for its tag keeps its legacy file and icon as they are, even when no
+    /// other phone is listed in that file.
+    #[test]
+    fn migrate_keeps_a_refused_phones_files() {
+        let (_t, dirs) = tmp();
+        legacy(&dirs, "com.p", 0, "P", None, "Primary");
+        legacy(&dirs, "com.p2", 0, "P", None, "Primary 2");
+        legacy(&dirs, "com.y", 0, "a:b", None, "Wins the tag");
+        legacy(&dirs, "com.x", 0, "a_b", None, "Loses the tag");
+        let before = std::fs::read(file(&dirs, "lantern.com.x")).unwrap();
+        let m = migrate(&dirs, None).unwrap();
+        assert_eq!(m.primary.as_deref(), Some("P"));
+        assert_eq!(std::fs::read(file(&dirs, "lantern.com.x")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(icon(&dirs, "lantern.com.x")).unwrap(),
+            legacy_icon("com.x", 0)
+        );
+        assert!(!file(&dirs, "lantern.com.x-pa_b").exists());
+        assert_eq!(
+            line(
+                &read(&file(&dirs, "lantern.com.y-pa_b")),
+                "X-Lantern-Serial"
+            ),
+            ["a:b"]
+        );
+    }
+
+    /// A shared entry is split with the old file (the primary's target) rewritten last: a run
+    /// that fails on that write has already written every other phone's file, and the rerun
+    /// finishes with both phones' entries.
+    #[test]
+    fn migrate_split_cut_short_keeps_every_phone() {
+        let (_t, dirs) = tmp();
+        legacy(&dirs, "com.s", 0, "B", Some("A;B;"), "Shared");
+        // The in-place rewrite of `lantern.com.s.desktop` fails: its temporary file's name is
+        // taken by a directory.
+        let blocker = dirs
+            .applications
+            .join(format!(".lantern.com.s.desktop.{}.tmp", std::process::id()));
+        std::fs::create_dir_all(&blocker).unwrap();
+        assert!(migrate(&dirs, None).is_err());
+        assert!(!Naming::migrated(&dirs.state));
+        assert_eq!(
+            line(&read(&file(&dirs, "lantern.com.s")), "X-Lantern-Serials"),
+            ["A;B;"],
+            "the shared file is still whole"
+        );
+        assert_eq!(
+            line(&read(&file(&dirs, "lantern.com.s-pB")), "X-Lantern-Serial"),
+            ["B"],
+            "B's file came first"
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        let m = migrate(&dirs, None).unwrap();
+        assert_eq!(m.primary.as_deref(), Some("A"));
+        assert_eq!(phones_with(&dirs, "com.s", 0), ["A", "B"]);
+        for (serial, stem) in [("A", "lantern.com.s"), ("B", "lantern.com.s-pB")] {
+            let f = read(&file(&dirs, stem));
+            assert_eq!(line(&f, "X-Lantern-Serial"), [serial]);
+            assert!(!f.contains("X-Lantern-Serials"), "{f}");
+        }
     }
 
     #[test]
