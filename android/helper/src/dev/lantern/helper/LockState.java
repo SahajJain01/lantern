@@ -37,7 +37,7 @@ final class LockState {
 
     /** Reads the phone through {@code dumpsys trust} (bounded by {@link #DUMP_TIMEOUT_MS}). */
     static LockState device(Consumer<String> log) {
-        return new LockState(LockState::dumpsysTrust, log);
+        return new LockState(() -> dumpsys(DUMP_TIMEOUT_MS, "trust"), log);
     }
 
     /**
@@ -97,9 +97,16 @@ final class LockState {
         return Boolean.TRUE.equals(read());
     }
 
-    /** Device only: runs {@code dumpsys trust}, killed after {@link #DUMP_TIMEOUT_MS}. */
-    private static String dumpsysTrust() throws IOException {
-        Process p = new ProcessBuilder("dumpsys", "trust").redirectErrorStream(true).start();
+    /**
+     * Device only: runs {@code dumpsys <args>}, killed after {@code timeoutMs}; at most 1 MiB of
+     * output is kept. Also used by {@link FocusProbe#device}.
+     */
+    static String dumpsys(long timeoutMs, String... args) throws IOException {
+        String[] cmd = new String[args.length + 1];
+        cmd[0] = "dumpsys";
+        System.arraycopy(args, 0, cmd, 1, args.length);
+        String what = String.join(" ", cmd);
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         Thread reader = new Thread(() -> {
             try (InputStream in = p.getInputStream()) {
@@ -119,15 +126,15 @@ final class LockState {
         reader.setDaemon(true);
         reader.start();
         try {
-            if (!p.waitFor(DUMP_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            if (!p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
                 p.destroyForcibly();
-                throw new IOException("dumpsys trust took over " + DUMP_TIMEOUT_MS + " ms");
+                throw new IOException(what + " took over " + timeoutMs + " ms");
             }
             reader.join(500);
         } catch (InterruptedException e) {
             p.destroyForcibly();
             Thread.currentThread().interrupt();
-            throw new IOException("interrupted waiting for dumpsys trust");
+            throw new IOException("interrupted waiting for " + what);
         }
         synchronized (buf) {
             return new String(buf.toByteArray(), StandardCharsets.UTF_8);

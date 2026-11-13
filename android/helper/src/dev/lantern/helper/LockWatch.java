@@ -69,14 +69,15 @@ final class LockWatch implements AutoCloseable {
                 return;
             }
             synchronized (this) {
-                if (closed) {
+                if (closed || ended()) {
                     return;
                 }
             }
             Boolean locked = lock.read();
             synchronized (this) {
-                // A read interrupted by close() (or finishing after it) is not an unlock.
-                if (closed || Thread.currentThread().isInterrupted()) {
+                // A read interrupted by close() (or finishing after it) is not an unlock; a stretch
+                // already ended by unlockConfirmed() sends nothing more.
+                if (closed || Thread.currentThread().isInterrupted() || ended()) {
                     return;
                 }
                 if (!Boolean.FALSE.equals(locked)) {
@@ -95,6 +96,34 @@ final class LockWatch implements AutoCloseable {
                 stretch = false; // after unlocked went out, so a new stretch's locked follows it
                 return;
             }
+        }
+    }
+
+    /** The calling poller's stretch is over (ended by {@link #unlockConfirmed}). Under the monitor. */
+    private boolean ended() {
+        return !stretch || poller != Thread.currentThread();
+    }
+
+    /**
+     * The Unlocker saw {@code deviceLocked=0} after typing the PIN: end the stretch now instead of
+     * at the next poll. Sends {@code unlocked} and runs {@link #onUnlocked} (writes the held PC
+     * copy) once; the stretch's poller then stops without sending. Does nothing with no stretch
+     * running (its poller already sent {@code unlocked}, or no {@code locked} was sent) or after
+     * {@link #close}.
+     */
+    void unlockConfirmed() {
+        synchronized (this) {
+            if (closed || !stretch) {
+                return;
+            }
+            log.accept("lock: phone unlocked (PIN)");
+            send.accept(Msg.of("unlocked"));
+            try {
+                onUnlocked.run();
+            } catch (RuntimeException e) {
+                log.accept("lock: unlock follow-up failed: " + e);
+            }
+            stretch = false; // the poller sees ended() and returns; a new lock opens a new stretch
         }
     }
 

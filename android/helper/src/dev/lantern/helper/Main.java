@@ -122,6 +122,12 @@ public final class Main {
             // Set once the session is up: each display's IME policy follows it (AppDisplay.Policy.imePolicy).
             final java.util.concurrent.atomic.AtomicBoolean lanternIme =
                 new java.util.concurrent.atomic.AtomicBoolean(false);
+            // The live session (set once it started): the unlock puts its panel back off.
+            final java.util.concurrent.atomic.AtomicReference<Session> liveSession =
+                new java.util.concurrent.atomic.AtomicReference<>();
+            // An unlock attempt is running (lantern-unlock): a second one is answered busy.
+            final java.util.concurrent.atomic.AtomicBoolean unlocking =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
             Router router = new Router(in, out,
                 (win, pkg, user, w, h, dpi, sink) -> AppDisplay.open(win, pkg, user, w, h, dpi, lanternIme.get(), sink),
                 new Input(), Control.CODEC, token,
@@ -148,6 +154,7 @@ public final class Main {
                         throw e;
                     }
                     Session session = started.session;
+                    liveSession.set(session);
                     imeFailure[0] = started.imeFailure;
                     lanternIme.set(started.imeSelected);
                     if (started.imeSelected) {
@@ -209,10 +216,35 @@ public final class Main {
 
                 @Override
                 public void unlock(char[] pin) {
-                    // Task 2 types it into the lock screen; until then, refuse without a try.
-                    java.util.Arrays.fill(pin, '\0');
-                    router.sendSession(Msg.of("unlock_result").put("ok", Boolean.FALSE)
-                        .put("reason", "not implemented"));
+                    // Off the control thread: the attempt takes seconds. One at a time.
+                    if (!unlocking.compareAndSet(false, true)) {
+                        java.util.Arrays.fill(pin, '\0');
+                        sendUnlockResult(router, new Unlocker.Result(false, "busy"));
+                        return;
+                    }
+                    try {
+                        Thread t = new Thread(() -> {
+                            try {
+                                Unlocker.Result r = unlockOnce(lockState, liveSession.get(), pin);
+                                if (r.ok) {
+                                    // A read of unlocked: end the stretch now (unlocked once, the
+                                    // held PC copy written once) rather than at the next poll.
+                                    lockWatch.unlockConfirmed();
+                                }
+                                sendUnlockResult(router, r);
+                            } finally {
+                                java.util.Arrays.fill(pin, '\0');
+                                unlocking.set(false);
+                            }
+                        }, "lantern-unlock");
+                        t.setDaemon(true);
+                        t.start();
+                    } catch (RuntimeException | OutOfMemoryError e) {
+                        java.util.Arrays.fill(pin, '\0');
+                        unlocking.set(false);
+                        Droid.log("unlock: could not start (" + e.getClass().getName() + ")");
+                        sendUnlockResult(router, new Unlocker.Result(false, "unlock failed"));
+                    }
                 }
 
                 @Override
@@ -257,6 +289,45 @@ public final class Main {
         }
         Droid.log("serve: exit");
         return 0;
+    }
+
+    /**
+     * One unlock attempt (on {@code lantern-unlock}) against display 0. The panel goes back off
+     * afterwards only through the live session, so a session closing meanwhile keeps its panel on.
+     * Without a live session (none started yet) nothing is touched: {@code panelWasOff} is false.
+     * A failing injection is {@code unlock failed}; only its class is logged (never the PIN).
+     */
+    private static Unlocker.Result unlockOnce(LockState lockState, Session session, char[] pin) {
+        Power panel = new Power() {
+            @Override
+            public void wake() {
+                throw new UnsupportedOperationException("the unlock wakes with KEYCODE_WAKEUP on display 0");
+            }
+
+            @Override
+            public void setPanel(boolean on) {
+                if (!on && session != null) {
+                    session.panelOffAgain();
+                }
+            }
+        };
+        boolean panelWasOff = session != null && session.panelOff();
+        try {
+            return new Unlocker(lockState, panel, new Input.DisplayKeys(), FocusProbe.device(), android.os.SystemClock::sleep,
+                panelWasOff, Droid::log).unlock(pin);
+        } catch (RuntimeException e) {
+            Droid.log("unlock: failed (" + e.getClass().getName() + ")");
+            return new Unlocker.Result(false, "unlock failed");
+        }
+    }
+
+    /** {@code unlock_result{ok, reason?}}: reason omitted when absent (a plain success). */
+    private static void sendUnlockResult(Router router, Unlocker.Result r) {
+        Msg m = Msg.of("unlock_result").put("ok", r.ok);
+        if (r.reason != null) {
+            m.put("reason", r.reason);
+        }
+        router.sendSession(m);
     }
 
     /** How long a session start waits for the companion to link. */

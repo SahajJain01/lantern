@@ -58,6 +58,15 @@ public final class InputTest {
         eq(1, Input.Policy.keyAction(Proto.KEY_UP), "up");
     }
 
+    /** The unlock swipe: (w/2, 0.81h) up to (w/2, 0.22h) on display 0's real size. */
+    static void swipeUpGeometry() {
+        float[] s = Input.Policy.swipeUp(1220, 2712);
+        eq(610f, s[0], "x0");
+        eq(Math.round(0.81f * 2712), Math.round(s[1]), "y0");
+        eq(610f, s[2], "x1");
+        eq(Math.round(0.22f * 2712), Math.round(s[3]), "y1");
+    }
+
     private static void eq(Object want, Object got, String what) {
         if (want == null ? got != null : !want.equals(got)) {
             throw new AssertionError(what + ": want " + want + ", got " + got);
@@ -75,6 +84,7 @@ public final class InputTest {
             {"pointerActionMapping", (Case) InputTest::pointerActionMapping},
             {"actionButtonIsTheChangedButton", (Case) InputTest::actionButtonIsTheChangedButton},
             {"keyActionMapping", (Case) InputTest::keyActionMapping},
+            {"swipeUpGeometry", (Case) InputTest::swipeUpGeometry},
         };
         int failed = 0;
         for (Object[] c : cases) {

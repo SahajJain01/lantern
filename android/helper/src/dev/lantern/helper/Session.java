@@ -139,6 +139,22 @@ public final class Session implements AutoCloseable {
         return journal;
     }
 
+    /** The session turned the panel off and has not closed (so it is to stay off). */
+    public synchronized boolean panelOff() {
+        return panelOff && !closed;
+    }
+
+    /**
+     * Turns the panel back off after something (the unlock's wake-up) may have lit it, only while
+     * this session still holds it off: under the same monitor as {@link #close}, so it can never
+     * undo close's panel-on.
+     */
+    public synchronized void panelOffAgain() {
+        if (panelOff && !closed) {
+            power.setPanel(false);
+        }
+    }
+
     /**
      * Idempotent. Panel back on, then every journaled setting that still holds the value Lantern
      * wrote (even if the panel call throws an Error), then the persisted journal is removed; the

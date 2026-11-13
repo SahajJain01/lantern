@@ -189,6 +189,57 @@ public final class LockWatchTest {
         w.close();
     }
 
+    /**
+     * A confirmed unlock (the Unlocker's) ends the running stretch at once: {@code unlocked} and
+     * the held copy go out once, and the stretch's poller sends nothing more.
+     */
+    static void unlockConfirmedEndsTheStretchOnce() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        LockState lock = new LockState(() -> {
+            reads.incrementAndGet();
+            return dump(reads.get() >= 3 ? 0 : 1); // the poller would see the unlock on its third read
+        }, s -> { });
+        Rec rec = new Rec();
+        LockWatch w = new LockWatch(lock, m -> rec.sent.add(m.toString()), rec.logs::add, 50);
+        List<String> held = Collections.synchronizedList(new ArrayList<>());
+        ClipSync clip = heldClip(held);
+        w.onUnlocked = clip::unlocked;
+        w.onLocked("open");
+        Thread p = w.poller();
+        w.unlockConfirmed();
+        w.unlockConfirmed(); // a second confirmation inside no stretch: nothing more
+        p.join(2000);
+        eq(false, p.isAlive(), "the stretch's poller ended");
+        Thread.sleep(200);
+        eq(List.of("locked{reason=open}", "unlocked{}"), rec.sent, "unlocked once");
+        eq(List.of("pc copy"), held, "held copy written once");
+        // A later lock opens a new stretch as usual.
+        w.onLocked("clipboard");
+        eq(List.of("locked{reason=open}", "unlocked{}", "locked{reason=clipboard}"), rec.sent, "new stretch");
+        w.close();
+        w.unlockConfirmed(); // after close: never an unlock
+        eq(3, rec.sent.size(), "nothing after close");
+    }
+
+    /**
+     * Without a running stretch (its poller already ended it, or no locked was sent) a confirmed
+     * unlock sends nothing: unlocked goes out once per stretch.
+     */
+    static void unlockConfirmedWithoutStretch() throws Exception {
+        Rec rec = new Rec();
+        LockWatch w = rec.watch(new LockState(() -> dump(0), s -> { }));
+        AtomicInteger runs = new AtomicInteger();
+        w.onUnlocked = runs::incrementAndGet;
+        w.unlockConfirmed();
+        eq(List.of(), rec.sent, "nothing without a stretch");
+        w.onLocked("open");
+        w.poller().join(2000); // the poller reads unlocked and ends the stretch first
+        w.unlockConfirmed();
+        eq(List.of("locked{reason=open}", "unlocked{}"), rec.sent, "unlocked once");
+        eq(1, runs.get(), "onUnlocked once");
+        w.close();
+    }
+
     static void readIsTriState() {
         eq(Boolean.TRUE, new LockState(() -> dump(1), s -> { }).read(), "locked");
         eq(Boolean.FALSE, new LockState(() -> dump(0), s -> { }).read(), "unlocked");
@@ -215,6 +266,8 @@ public final class LockWatchTest {
             {"unknownReadKeepsPolling", (Case) LockWatchTest::unknownReadKeepsPolling},
             {"falseReadEndsTheStretchOnce", (Case) LockWatchTest::falseReadEndsTheStretchOnce},
             {"readIsTriState", (Case) LockWatchTest::readIsTriState},
+            {"unlockConfirmedEndsTheStretchOnce", (Case) LockWatchTest::unlockConfirmedEndsTheStretchOnce},
+            {"unlockConfirmedWithoutStretch", (Case) LockWatchTest::unlockConfirmedWithoutStretch},
         };
         int failed = 0;
         for (Object[] c : cases) {

@@ -103,6 +103,20 @@ public final class SessionTest {
         eq("[wake, panel(false), panel(true)]", p.calls.toString(), "power calls after close");
     }
 
+    /** The unlock's panel-off goes through the live session only: never after close's panel-on. */
+    static void panelOffAgainOnlyWhileLive() throws Exception {
+        FakeSettings s = new FakeSettings();
+        FakePower p = new FakePower();
+        Session session = Session.start(s, p);
+        eq(true, session.panelOff(), "panel held off while live");
+        session.panelOffAgain();
+        eq("[wake, panel(false), panel(false)]", p.calls.toString(), "back off while live");
+        session.close();
+        eq(false, session.panelOff(), "not after close");
+        session.panelOffAgain();
+        eq("[wake, panel(false), panel(false), panel(true)]", p.calls.toString(), "close's panel-on stands");
+    }
+
     static void journalJsonRoundTrip() throws Exception {
         for (String orig : new String[] {"15", null, "a \"quoted\" \\ value"}) {
             FakeSettings s = new FakeSettings();
@@ -372,6 +386,7 @@ public final class SessionTest {
             {"deletesOriginallyAbsentKey", (Case) SessionTest::deletesOriginallyAbsentKey},
             {"closeIsIdempotent", (Case) SessionTest::closeIsIdempotent},
             {"panelTurnedOnAtClose", (Case) SessionTest::panelTurnedOnAtClose},
+            {"panelOffAgainOnlyWhileLive", (Case) SessionTest::panelOffAgainOnlyWhileLive},
             {"journalJsonRoundTrip", (Case) SessionTest::journalJsonRoundTrip},
             {"guardArmedBeforeAnyChange", (Case) SessionTest::guardArmedBeforeAnyChange},
             {"cleanupSkipsAfterDone", (Case) SessionTest::cleanupSkipsAfterDone},

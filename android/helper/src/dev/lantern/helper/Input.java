@@ -84,6 +84,14 @@ final class Input implements Injector {
             return Integer.lowestOneBit(prev ^ cur);
         }
 
+        /**
+         * The unlock swipe on a {@code w}x{@code h} display: {x0, y0, x1, y1} from (w/2, 0.81h)
+         * up to (w/2, 0.22h).
+         */
+        static float[] swipeUp(int w, int h) {
+            return new float[] {w / 2f, 0.81f * h, w / 2f, 0.22f * h};
+        }
+
         /** Proto.KEY_* to KeyEvent.ACTION_* (DOWN 0, UP 1). */
         static int keyAction(int a) {
             switch (a) {
@@ -212,6 +220,56 @@ final class Input implements Injector {
         InputManager.setDisplayId(ev, displayId);
         if (!im.injectInputEvent(ev, InputManager.INJECT_INPUT_EVENT_MODE_ASYNC)) {
             Droid.log("input: inject failed display=" + displayId + " " + ev);
+        }
+    }
+
+    /**
+     * The Unlocker's input: keys and a touch swipe injected on an explicit display (always display
+     * 0 there), each event waited for until dispatched so the digits land in order. Throws
+     * {@link IllegalStateException} if an injection fails. Never logs a keycode (digits are a PIN).
+     */
+    static final class DisplayKeys implements Unlocker.Keys {
+        static final long SWIPE_MS = 200;
+        static final int SWIPE_STEPS = 10;
+
+        private final InputManager im = ServiceManager.getInputManager();
+
+        @Override
+        public void key(int display, int keycode) {
+            long now = SystemClock.uptimeMillis();
+            for (int action : new int[] {Policy.keyAction(Proto.KEY_DOWN), Policy.keyAction(Proto.KEY_UP)}) {
+                inject(display, new KeyEvent(now, SystemClock.uptimeMillis(), action, keycode, 0, 0,
+                    KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, Policy.SOURCE_KEYBOARD), "key");
+            }
+        }
+
+        @Override
+        public void swipeUp(int display) {
+            com.genymobile.scrcpy.display.DisplayInfo info = ServiceManager.getDisplayManager().getDisplayInfo(display);
+            if (info == null) {
+                throw new IllegalStateException("no display info for display " + display);
+            }
+            float[] s = Policy.swipeUp(info.getSize().getWidth(), info.getSize().getHeight());
+            long down = SystemClock.uptimeMillis();
+            inject(display, touch(Policy.ACTION_DOWN, down, s[0], s[1], 1f), "swipe");
+            for (int i = 1; i <= SWIPE_STEPS; i++) {
+                SystemClock.sleep(SWIPE_MS / SWIPE_STEPS);
+                float f = (float) i / SWIPE_STEPS;
+                inject(display, touch(Policy.ACTION_MOVE, down, s[0] + (s[2] - s[0]) * f, s[1] + (s[3] - s[1]) * f, 1f),
+                    "swipe");
+            }
+            inject(display, touch(Policy.ACTION_UP, down, s[2], s[3], 0f), "swipe");
+        }
+
+        private static MotionEvent touch(int action, long down, float x, float y, float pressure) {
+            return motion(action, down, x, y, pressure, 0, Policy.SOURCE_TOUCHSCREEN, Policy.TOOL_TYPE_FINGER, 0, 0);
+        }
+
+        private void inject(int display, InputEvent ev, String what) {
+            InputManager.setDisplayId(ev, display);
+            if (!im.injectInputEvent(ev, InputManager.INJECT_INPUT_EVENT_MODE_WAIT_FOR_FINISH)) {
+                throw new IllegalStateException("unlock: inject " + what + " failed on display " + display);
+            }
         }
     }
 
