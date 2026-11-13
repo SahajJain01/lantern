@@ -1926,6 +1926,16 @@ impl Ctl {
             .unwrap()
     }
 
+    /// The next connect event that isn't a `Gone`.
+    async fn prompt(&mut self) -> ConnectEvent {
+        loop {
+            match self.event().await {
+                ConnectEvent::Gone { .. } => continue,
+                event => return event,
+            }
+        }
+    }
+
     /// Every connect event within 300 ms.
     async fn events_for_a_while(&mut self) -> Vec<ConnectEvent> {
         let mut got = Vec::new();
@@ -2611,12 +2621,128 @@ async fn pending_is_per_phone() {
     ctl.ready("a").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(ctl.opened(), [], "nothing opens on a");
-    // b plugged in: its request connects it (switching a off) and opens on b.
+    // Choosing a dropped b's request: b plugged in only asks, and a stays live.
     ctl.online("b");
-    expect_bye(&mut helper).await;
-    assert_eq!(helper.next_session().await, 1);
+    assert_eq!(ctl.prompt().await, plugged_in("b", "b"));
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.phone("a").unwrap().state, PhoneState::Ready);
+    assert_eq!(ctl.opened(), []);
+    ctl.shutdown().await;
+}
+
+/// The latest choice wins: a request for a, then Connect{b}; a blipping (or plugged) within
+/// the request's window leaves b live and opens nothing.
+#[tokio::test]
+async fn later_connect_drops_other_pending() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["b"], rules(&state, false), |_| {});
+    assert_eq!(ctl.event().await, plugged_in("b", "b"));
+    ctl.command(connect_and_open("a", "com.x", 0)).await;
+    assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
+    ctl.command(connect("b")).await;
+    assert_eq!(helper.next_session().await, 0);
     ctl.ready("b").await;
-    assert_eq!(ctl.opened(), [("b".into(), "com.x".into(), 0)]);
+    // a plugged in, then a blip.
+    ctl.online("a");
+    assert_eq!(ctl.prompt().await, plugged_in("a", "a"));
+    ctl.offline("a");
+    ctl.online("a");
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.phone("b").unwrap().state, PhoneState::Ready);
+    assert_eq!(ctl.phone("a").unwrap().state, PhoneState::Waiting);
+    assert_eq!(ctl.opened(), [], "the stale request opened nothing");
+    ctl.shutdown().await;
+}
+
+/// A request for a, then a plugged-in phone c connects through its own rule (autoconnect):
+/// a's request goes, so a plugged in later doesn't take over.
+#[tokio::test]
+async fn plug_connect_drops_other_pending() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &[], rules(&state, true), |_| {});
+    ctl.command(connect_and_open("a", "com.x", 0)).await;
+    assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
+    ctl.online("c");
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("c").await;
+    ctl.online("a");
+    assert_eq!(ctl.prompt().await, plugged_in("a", "a"));
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.phone("c").unwrap().state, PhoneState::Ready);
+    assert_eq!(ctl.opened(), []);
+    ctl.shutdown().await;
+}
+
+/// A phone that was live when lanternd stopped but is left waiting (another is wanted) loses
+/// its `live` flag, so a later blip only asks.
+#[tokio::test]
+async fn waiting_phone_loses_live() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    companion::set_live(&state, "a", true).unwrap();
+    companion::set_live(&state, "x", true).unwrap();
+    // The default 10 s grace: the start-up rule must not be what clears x's flag.
+    let mut opts = rules(&state, false);
+    opts.timing = None;
+    let mut ctl = start_ctl_opts(port, &["a", "x"], opts, |_| {});
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("a").await;
+    ctl.state_until("x", PhoneState::Waiting).await;
+    record_until(&state, "x", |(_, live)| !live).await;
+    // a switched off: nothing is wanted. x blips: it is asked about, not connected.
+    ctl.command(disconnect("a")).await;
+    expect_bye(&mut helper).await;
+    ctl.state_until("a", PhoneState::Off).await;
+    ctl.offline("x");
+    ctl.online("x");
+    assert_eq!(ctl.prompt().await, plugged_in("x", "x"));
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.phone("x").unwrap().state, PhoneState::Waiting);
+    ctl.shutdown().await;
+}
+
+/// `lantern connect|disconnect <serial>` for a phone neither plugged in nor known is refused
+/// with the known phones named, and creates no record.
+#[tokio::test]
+async fn daemon_cmd_refuses_unknown_serial() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    companion::set_off(&state, "old", true).unwrap();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, true), |_| {});
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    for cmd in [DaemonCmd::Connect, DaemonCmd::Disconnect] {
+        assert_eq!(
+            daemon_cmd_reply(&ctl.sock, cmd, Some("typo")).await,
+            Control::error(
+                "no phone typo is plugged in or known; known phones: Pixel (dev), old (old)"
+            )
+        );
+    }
+    helper.assert_quiet().await;
+    assert!(companion::read_record(&state, "typo").is_none());
+    assert!(ctl.phone("typo").is_none());
+    ctl.assert_no_prompt().await;
+    // A known phone that isn't plugged in is accepted.
+    let reply = daemon_cmd_reply(&ctl.sock, DaemonCmd::Connect, Some("old")).await;
+    assert!(matches!(reply, Control::StatusReport(_)), "{reply:?}");
+    assert!(matches!(ctl.prompt().await, ConnectEvent::PlugIn { .. }));
+    ctl.shutdown().await;
+}
+
+/// With no phone plugged in or known, the refusal says so.
+#[tokio::test]
+async fn daemon_cmd_unknown_serial_with_no_phones() {
+    let (_helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let ctl = start_ctl_opts(port, &[], rules(&state, false), |_| {});
+    assert_eq!(
+        daemon_cmd_reply(&ctl.sock, DaemonCmd::Connect, Some("typo")).await,
+        Control::error("no phone typo is plugged in or known; no phone is known")
+    );
+    assert!(companion::read_record(&state, "typo").is_none());
     ctl.shutdown().await;
 }
 

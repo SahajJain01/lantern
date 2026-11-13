@@ -418,6 +418,22 @@ impl Table {
             .is_some_and(|p| p.until > Instant::now())
     }
 
+    /// Drops every connect-and-open request except `serial`'s: the user's latest choice of
+    /// phone wins, so an older request can't switch to its phone when that one is plugged.
+    fn keep_pending_for(&mut self, serial: &str) {
+        self.pending.retain(|s, p| {
+            let keep = s == serial;
+            if !keep {
+                tracing::info!(
+                    serial = s,
+                    pkg = p.pkg,
+                    "connect-and-open request dropped: another phone chosen"
+                );
+            }
+            keep
+        });
+    }
+
     /// The phones the view lists besides the plugged ones: records, else this run's flags.
     fn others(&self) -> Vec<String> {
         let mut all: Vec<String> = self.known.clone();
@@ -450,6 +466,8 @@ fn connect_event(events: Option<&mpsc::Sender<ConnectEvent>>, event: ConnectEven
 /// - Disconnect and Undo set the phone's `off` (and clear `live`) before its session closes;
 ///   Connect clears `off`. Switching to another phone closes the old one without touching its
 ///   `off`. A stop signal leaves every flag as it is; Quit clears the live phone's `live`.
+/// - The latest choice of phone wins: a Connect, or a phone connecting on plug-in, drops every
+///   other phone's connect-and-open request. A phone left waiting loses its `live` flag.
 /// - Nothing starts while an undo runs, and commands other than Quit are ignored meanwhile.
 // `release!` resets `retry_at` before a switch schedules the new phone's start.
 #[allow(clippy::too_many_arguments, unused_assignments)]
@@ -686,6 +704,7 @@ where
                                     if let Some(old) = release!("another phone connects") {
                                         table.set_live(&old, false);
                                     }
+                                    table.keep_pending_for(&serial);
                                     wanted = Some(serial);
                                     retry_at = Some(Instant::now());
                                 }
@@ -693,7 +712,14 @@ where
                                     let name = names.get(&serial).unwrap_or_else(|| serial.clone());
                                     connect_event(connect_events.as_ref(), ConnectEvent::PluggedIn { serial, name });
                                 }
-                                OnPlug::Wait | OnPlug::Ignore => {}
+                                OnPlug::Wait => {
+                                    // Left waiting: it is no longer the phone to resume, so a
+                                    // later blip doesn't connect it without a click.
+                                    if flags.live {
+                                        table.set_live(&serial, false);
+                                    }
+                                }
+                                OnPlug::Ignore => {}
                             }
                         }
                     }
@@ -902,6 +928,8 @@ where
                 Command::Connect { serial, open } => {
                     tracing::info!(serial, ?open, "connected in Lantern");
                     table.set_off(&serial, false);
+                    // The latest choice wins: a request for another phone must not switch later.
+                    table.keep_pending_for(&serial);
                     let app = open.as_ref().map(|(pkg, user)| hub.app_name(pkg, *user));
                     if let Some((pkg, user)) = open {
                         let ready = active.as_ref().is_some_and(|(s, _)| s.serial() == serial);

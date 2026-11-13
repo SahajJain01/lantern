@@ -466,7 +466,10 @@ Host-only, like `status`.
   unchanged. Without it the command is for the only plugged-in phone; with none or several
   plugged in nothing is queued and the reply is `error{msg}` instead of the report:
   `"no phone is plugged in"`, or `"several phones are plugged in: <name> (<serial>), …; name one:
-  lantern connect|disconnect <serial>"`. Under `$LANTERN_SERIAL` commands for any other serial are
+  lantern connect|disconnect <serial>"`. A named serial must be a phone lanternd lists (plugged in,
+  or with a device record); otherwise nothing is queued and the reply is `error{"no phone <serial>
+  is plugged in or known; known phones: <name> (<serial>), …"}` (`…; no phone is known` when there
+  are none), so a typo creates no record. Under `$LANTERN_SERIAL` commands for any other serial are
   ignored.
 - `disconnect`: sets the phone's `off` flag (and clears `live`) in its device record, then, if it
   is the phone being served, started, retried or reconnected, ends that session with `bye` (the

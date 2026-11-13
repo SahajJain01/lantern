@@ -206,12 +206,17 @@ class manager_env:
     def __enter__(self):
         env = systemd_env()
         self.saved = {k: env.get(k) for k in [*self.set, *self.unset]}
-        if self.set:
-            systemctl("set-environment", *(f"{k}={v}" for k, v in self.set.items()))
-        if self.unset:
-            systemctl("unset-environment", *self.unset)
-        note(f"lanternd environment: set {self.set} unset {self.unset}")
-        systemctl("restart", UNIT)
+        try:
+            if self.set:
+                systemctl("set-environment", *(f"{k}={v}" for k, v in self.set.items()))
+            if self.unset:
+                systemctl("unset-environment", *self.unset)
+            note(f"lanternd environment: set {self.set} unset {self.unset}")
+            systemctl("restart", UNIT)
+        except BaseException:
+            # A `with` never calls __exit__ when __enter__ raises: put everything back here.
+            self.__exit__(*sys.exc_info())
+            raise
         return self
 
     def __exit__(self, *exc):
@@ -1737,6 +1742,7 @@ class Suite:
             lines = [l for l in text.splitlines() if not re.match(r"\s*autoconnect\s*=", l)]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("\n".join(lines + ["autoconnect = true"]) + "\n")
+            # __enter__ puts the environment back itself if it fails part-way.
             env.__enter__()
             entered = True
             _, secs = wait_ready(15)
@@ -1762,11 +1768,15 @@ class Suite:
             note(f"ready again {secs:.1f} s after the replug")
             ok = True
         finally:
-            # 7. The file, then the environment (restarts lanternd); lanternd left ready.
+            # 7. The file, then the environment (restarts lanternd); lanternd left ready. A
+            # failure in 3-5 may have left the phone off: connect it again (wait_ready alone
+            # passes through LANTERN_SERIAL, which ignores the off flag).
             steps = [("restore settings.toml", restore_file)]
             if entered:
                 steps.append(("restore lanternd's environment",
                               lambda: env.__exit__(None if ok else Fail, None, None)))
+            if not ok:
+                steps.append(("lantern connect", lambda: lantern_cmd("connect", SERIAL)))
             steps.append(("lanternd ready", lambda: wait_ready(20)))
             cleanup(ok, *steps)
 
@@ -1856,11 +1866,12 @@ def main():
     # Preflight: lanternd serves only this phone for the run (other phones plugged in are
     # ignored); the previous value is put back at the end.
     previous = systemd_env().get("LANTERN_SERIAL")
-    if previous != SERIAL:
-        systemctl("set-environment", f"LANTERN_SERIAL={SERIAL}")
-        systemctl("restart", UNIT)
-    print(f"lanternd LANTERN_SERIAL={SERIAL} for this run", flush=True)
     try:
+        # Inside the try: a failed set or restart is still put back by the `finally`.
+        if previous != SERIAL:
+            systemctl("set-environment", f"LANTERN_SERIAL={SERIAL}")
+            systemctl("restart", UNIT)
+        print(f"lanternd LANTERN_SERIAL={SERIAL} for this run", flush=True)
         if args.nested:
             NESTED = Nested()
             print(f"nested KWin: WAYLAND_DISPLAY={NESTED.socket_path} log={NESTED.log} "

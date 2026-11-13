@@ -496,9 +496,26 @@ impl Hub {
     }
 
     /// The command `daemon{cmd, serial}` asks for. Without a serial it is for the only plugged-in
-    /// phone; `Err` is the reply when there is none or several.
+    /// phone; `Err` is the reply when there is none or several. A named serial must be a phone
+    /// the view lists (plugged in or known): a typo must not create a device record.
     fn daemon_command(&self, cmd: DaemonCmd, serial: Option<String>) -> Result<Command, String> {
         let serial = match serial {
+            Some(serial) if self.view.phone(&serial).is_none() => {
+                let known: Vec<String> = self
+                    .view
+                    .phones
+                    .iter()
+                    .map(|p| format!("{} ({})", p.display_name(), p.serial))
+                    .collect();
+                return Err(if known.is_empty() {
+                    format!("no phone {serial} is plugged in or known; no phone is known")
+                } else {
+                    format!(
+                        "no phone {serial} is plugged in or known; known phones: {}",
+                        known.join(", ")
+                    )
+                });
+            }
             Some(serial) => serial,
             None => {
                 let plugged: Vec<_> = self.view.phones.iter().filter(|p| p.plugged).collect();
