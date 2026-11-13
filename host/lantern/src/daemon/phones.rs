@@ -9,7 +9,8 @@ pub struct Timing {
     /// How long the wanted phone may be offline before it counts as unplugged (a cable blip or
     /// adb restart within it reconnects without asking).
     pub unplug_grace: Duration,
-    /// How long a `Connect` that carries an app to open waits for that phone's session.
+    /// How long a `Connect` for a phone that isn't ready is remembered: a phone not plugged in
+    /// connects if plugged in within it, and an app it carries opens once that phone is ready.
     pub pending_for: Duration,
 }
 
@@ -37,7 +38,8 @@ pub enum OnPlug {
 
 /// The rule for `serial` coming online, evaluated in this order:
 /// 1. `configured` (`$LANTERN_SERIAL`) is set: Connect for that serial, Ignore for any other.
-/// 2. `pending` (a connect-and-open request for it that hasn't expired): Connect.
+/// 2. `pending` (a connect request for it, with or without an app, that hasn't expired):
+///    Connect.
 /// 3. `live` (it was connected when lanternd stopped): Connect if nothing is `wanted`, else
 ///    Wait.
 /// 4. `autoconnect && !off`: Connect if nothing is wanted, else Prompt.

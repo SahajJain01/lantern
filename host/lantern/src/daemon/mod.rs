@@ -312,10 +312,10 @@ struct Flags {
     live: bool,
 }
 
-/// A connect-and-open request: open `pkg` for `user` once the phone is ready, until `until`.
+/// A connect request for a phone that wasn't ready: connect it when it is plugged in, and open
+/// `open` (`(pkg, user)`) once it is ready, until `until`.
 struct Pending {
-    pkg: String,
-    user: u32,
+    open: Option<(String, u32)>,
     until: Instant,
 }
 
@@ -331,7 +331,8 @@ struct Table {
     known: Vec<String>,
     /// The phone switched off most recently in this run (the top-level `paused`).
     last_off: Option<String>,
-    /// Connect-and-open requests, at most one per phone (a later one replaces it).
+    /// Connect requests (with or without an app), at most one per phone (a later one replaces
+    /// it).
     pending: HashMap<String, Pending>,
 }
 
@@ -421,14 +422,14 @@ impl Table {
         }
     }
 
-    /// Whether `serial` has a connect-and-open request that hasn't expired.
+    /// Whether `serial` has a connect request that hasn't expired.
     fn pending(&self, serial: &str) -> bool {
         self.pending
             .get(serial)
             .is_some_and(|p| p.until > Instant::now())
     }
 
-    /// Drops every connect-and-open request except `serial`'s: the user's latest choice of
+    /// Drops every connect request except `serial`'s: the user's latest choice of
     /// phone wins, so an older request can't switch to its phone when that one is plugged.
     fn keep_pending_for(&mut self, serial: &str) {
         self.pending.retain(|s, p| {
@@ -436,8 +437,8 @@ impl Table {
             if !keep {
                 tracing::info!(
                     serial = s,
-                    pkg = p.pkg,
-                    "connect-and-open request dropped: another phone chosen"
+                    open = ?p.open,
+                    "connect request dropped: another phone chosen"
                 );
             }
             keep
@@ -711,6 +712,19 @@ where
                             table.plugged.push(serial.clone());
                         }
                         names.refresh(&serial);
+                        // The wanted phone back after its grace ended (its expiry not handled
+                        // yet, e.g. a zero grace) is a real plug-in: expire it here first.
+                        if wanted.as_deref() == Some(serial.as_str())
+                            && grace.is_some_and(|until| until <= Instant::now())
+                        {
+                            grace = None;
+                            wanted = None;
+                            retry_at = None;
+                            failures = 0;
+                            tracing::info!(serial, "back after the unplug grace ended; a new plug-in");
+                            table.set_live(&serial, false);
+                            prompts.send(ConnectEvent::Gone { serial: serial.clone() });
+                        }
                         let flags = table.read(&serial);
                         // Back within the grace: a blip. A grace already over (its expiry not
                         // handled yet, e.g. a zero grace) is a real plug-in.
@@ -842,14 +856,16 @@ where
                         active = Some((session, Instant::now()));
                         table.set_live(&serial, true);
                         prompts.send(ConnectEvent::Gone { serial: serial.clone() });
-                        if let Some(p) = table.pending.remove(&serial) {
-                            if p.until > Instant::now() {
-                                tracing::info!(serial, pkg = p.pkg, user = p.user, "opening the requested app");
+                        if let Some(Pending { open: Some((pkg, user)), until }) =
+                            table.pending.remove(&serial)
+                        {
+                            if until > Instant::now() {
+                                tracing::info!(serial, pkg, user, "opening the requested app");
                                 if let Some(opener) = &opener {
-                                    opener(&serial, &p.pkg, p.user);
+                                    opener(&serial, &pkg, user);
                                 }
                             } else {
-                                tracing::info!(serial, pkg = p.pkg, "connect-and-open request expired");
+                                tracing::info!(serial, pkg, "connect-and-open request expired");
                             }
                         }
                     }
@@ -1005,19 +1021,32 @@ where
                     // The latest choice wins: a request for another phone must not switch later.
                     table.keep_pending_for(&serial);
                     let app = open.as_ref().map(|(pkg, user)| hub.app_name(pkg, *user));
-                    if let Some((pkg, user)) = open {
-                        let ready = active.as_ref().is_some_and(|(s, _)| s.serial() == serial);
-                        match (&opener, ready) {
-                            (Some(opener), true) => opener(&serial, &pkg, user),
-                            _ => {
-                                let until = Instant::now() + timing.pending_for;
-                                table
-                                    .pending
-                                    .insert(serial.clone(), Pending { pkg, user, until });
-                            }
+                    let ready = active.as_ref().is_some_and(|(s, _)| s.serial() == serial);
+                    let plugged = table.plugged(&serial);
+                    let open = match (open, &opener, ready) {
+                        (Some((pkg, user)), Some(opener), true) => {
+                            opener(&serial, &pkg, user);
+                            None
                         }
+                        (open, _, _) => open,
+                    };
+                    // Remembered for `pending_for`: an app to open once it is ready, and for a
+                    // phone that isn't plugged in, the connect itself ("It connects if you plug
+                    // it in within 2 minutes"). A plain Connect keeps an app still asked for.
+                    if open.is_some() || !plugged {
+                        let now = Instant::now();
+                        let kept = table
+                            .pending
+                            .remove(&serial)
+                            .filter(|p| p.until > now)
+                            .and_then(|p| p.open);
+                        let open = open.or(kept);
+                        let until = now + timing.pending_for;
+                        table
+                            .pending
+                            .insert(serial.clone(), Pending { open, until });
                     }
-                    if !table.plugged(&serial) {
+                    if !plugged {
                         let name = names.get(&serial).unwrap_or_else(|| serial.clone());
                         prompts.send(ConnectEvent::PlugIn { serial, name, app });
                     } else if wanted.as_deref() == Some(serial.as_str()) {

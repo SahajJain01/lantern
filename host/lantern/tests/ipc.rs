@@ -2695,6 +2695,33 @@ async fn zero_grace_replug_prompts() {
     ctl.shutdown().await;
 }
 
+/// R8: the wanted (live) phone back after its grace ended, before the expiry was handled (a
+/// zero grace), is a new plug-in: it asks instead of reconnecting.
+#[tokio::test]
+async fn wanted_phone_back_after_grace_prompts() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut opts = rules(&state, false);
+    opts.timing = Some(Timing {
+        unplug_grace: Duration::ZERO,
+        pending_for: Duration::from_secs(2),
+    });
+    let mut ctl = start_ctl_opts(port, &["dev"], opts, |_| {});
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    for n in 0..5 {
+        ctl.command(connect("dev")).await;
+        assert_eq!(helper.next_session().await, n);
+        ctl.ready("dev").await;
+        ctl.offline("dev");
+        ctl.online("dev");
+        expect_bye(&mut helper).await;
+        assert_eq!(ctl.prompt().await, plugged_in("dev", "Pixel"));
+        assert_no_session(&mut helper).await;
+        assert_eq!(flags(&state, "dev"), (false, false));
+    }
+    ctl.shutdown().await;
+}
+
 /// R7: one phone away in its grace doesn't hush another phone's first plug-in.
 #[tokio::test]
 async fn first_plug_in_still_prompts() {
@@ -3052,6 +3079,68 @@ async fn pending_expires() {
     assert_eq!(ctl.event().await, plugged_in("b", "b"));
     assert_no_session(&mut helper).await;
     assert_eq!(ctl.opened(), []);
+    ctl.shutdown().await;
+}
+
+/// R8: a Connect without an app for an unplugged phone is remembered ("It connects if you
+/// plug it in within 2 minutes"): plugged in within the window it connects, autoconnect off,
+/// without asking, and opens nothing.
+#[tokio::test]
+async fn plain_connect_for_unplugged_phone_is_remembered() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &[], rules(&state, false), |_| {});
+    ctl.command(connect("b")).await;
+    assert_eq!(
+        ctl.event().await,
+        ConnectEvent::PlugIn {
+            serial: "b".into(),
+            name: "b".into(),
+            app: None,
+        }
+    );
+    ctl.online("b");
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("b").await;
+    ctl.assert_no_prompt().await;
+    assert_eq!(ctl.opened(), [], "no app was asked for");
+    ctl.shutdown().await;
+}
+
+/// R8: past the window, a plain Connect for an unplugged phone is forgotten: plugging it in
+/// asks.
+#[tokio::test]
+async fn plain_connect_for_unplugged_phone_expires() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut opts = rules(&state, false);
+    opts.timing = Some(Timing {
+        unplug_grace: Duration::from_millis(300),
+        pending_for: Duration::from_millis(200),
+    });
+    let mut ctl = start_ctl_opts(port, &[], opts, |_| {});
+    ctl.command(connect("b")).await;
+    assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    ctl.online("b");
+    assert_eq!(ctl.event().await, plugged_in("b", "b"));
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
+
+/// R8: a plain Connect after a connect-and-open for the same unplugged phone keeps the app.
+#[tokio::test]
+async fn plain_connect_keeps_the_requested_app() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &[], rules(&state, false), |_| {});
+    ctl.command(connect_and_open("b", "com.x", 0)).await;
+    ctl.command(connect("b")).await;
+    ctl.online("b");
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("b").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(ctl.opened(), [("b".into(), "com.x".into(), 0)]);
     ctl.shutdown().await;
 }
 

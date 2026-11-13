@@ -561,7 +561,8 @@ When a phone comes online, the first rule that applies decides:
    every other serial is ignored: not listed in `phones`, never prompted, never started, and
    commands for it are refused (above). An explicit `disconnect` still switches the configured
    phone off until it comes online again.
-2. A pending connect-and-open for it: it connects (switching the wanted phone away).
+2. A pending connect request for it (with or without an app): it connects (switching the
+   wanted phone away).
 3. Its `live` flag: it connects if no other phone is wanted, else it waits (and loses `live`).
 4. `autoconnect` on and not `off`: it connects if no other phone is wanted, else lanternd shows
    "<phone> is plugged in" (one click switches to it).
@@ -572,7 +573,8 @@ Commands:
 
 - `connect` (S): clears S's `off`. A plugged-in S becomes the wanted phone: another live phone's
   session closes (`bye`; its `off` is untouched, its `live` cleared) and a backoff is skipped. An
-  S that isn't plugged in gets the notification "Plug in your <phone>".
+  S that isn't plugged in gets the notification "Plug in your <phone>" and a pending connect
+  request (below): plugged in within 120 s, it connects without asking.
 - `disconnect` (S): sets S's `off` and clears `live` **before** its session closes; if S is the
   phone being served, started, retried or reconnected, that session ends with `bye` (the helper
   restores the phone). The top-level status then reads `paused` while S stays plugged in.
@@ -592,10 +594,12 @@ Commands:
   cable never re-pops a notice. Past it, its notice closes.
 - A phone's notice closes when it gets ready or when it is gone for good (the end of its grace).
 
-**Pending connect-and-open (120 s).** A **Connect** click on "Connect your <phone>" (a refused
-`open` with `phone`) stores (S, app, user) and connects S. When S becomes ready lanternd runs
-`lantern open --phone S [--user N] -- <pkg>` once; a request older than 120 s is dropped. A later
-request for S replaces it. The latest choice of phone wins: any `connect` (or a phone connecting
+**Pending connect (120 s).** A `connect` for S that isn't plugged in stores a request for S, so
+plugging S in within 120 s connects it (rule 2). A **Connect** click on "Connect your <phone>" (a
+refused `open` with `phone`) also stores (app, user) and connects S. When S becomes ready
+lanternd runs `lantern open --phone S [--user N] -- <pkg>` once; a request older than 120 s is
+dropped. A later request for S replaces it; a `connect` without an app keeps the app still
+asked for. The latest choice of phone wins: any `connect` (or a phone connecting
 on plug-in) drops every other phone's pending request, and `disconnect`/Undo drop S's own, so a
 blip of an old phone never reconnects it over the one just chosen. `connect` with an app while S
 is already ready opens it at once.

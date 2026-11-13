@@ -33,7 +33,10 @@ primary phone keeps `lantern.<pkg>`, any other gets `-p<tag>`), 10/15/16 the per
 disconnect|connect <serial>` and the record's `off`, 20 the tray's phone checkmark row, 22 the
 per-phone Unlock row, 23 the per-phone menu folders, 24 the `live`/`off` flags with autoconnect on,
 25 the "<phone> is plugged in" notice with autoconnect off, 26 "Connect your <phone>" opening the
-app after Connect. Other phones may stay plugged in: the preflight pins LANTERN_SERIAL. The first
+app after Connect. Other phones may stay plugged in for every item but 24, 25 and 26: the
+preflight pins LANTERN_SERIAL, but those three lift it and fail at once ("unplug other phones")
+while any other phone is attached, so run them as their own `--only 24 25 26` pass with only
+SERIAL's phone attached. The first
 `build.py install` of Plan 4b migrates the real KDE menu once (journal: `menu migrated:
 primary=...`); check it by hand as docs/HANDOFF.md says, it is not an item.
 
@@ -256,6 +259,27 @@ def adb_state(serial=None):
         if len(parts) >= 2 and parts[0] == (serial or SERIAL):
             return parts[1]
     return None
+
+
+def other_phones():
+    """Serials other than SERIAL that `adb devices` lists as `device`."""
+    others = []
+    for line in sh("adb", "devices", timeout=10).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device" and parts[0] != SERIAL:
+            others.append(parts[0])
+    return others
+
+
+def only_this_phone(item):
+    """Items that lift LANTERN_SERIAL would let lanternd serve every plugged phone (connect
+    another one through its own rules, or show it notices): refuse while any other phone is
+    attached. Called before the item changes anything."""
+    others = other_phones()
+    check(not others, f"item {item} lifts LANTERN_SERIAL: unplug other phones first "
+                      f"({', '.join(others)} attached); run it as its own pass with only "
+                      f"{SERIAL} attached")
+    note(f"only {SERIAL} attached")
 
 
 def replug(manual=None):
@@ -1847,7 +1871,9 @@ class Suite:
     def autoconnect_on_remembers_off(self):
         """With `autoconnect = true` (and LANTERN_SERIAL lifted, a 0 ms unplug grace): a phone
         switched off stays off across a replug and a lanternd restart; `lantern connect` turns
-        it back on, and a replug then reconnects it by itself."""
+        it back on, and a replug then reconnects it by itself. Refused while another phone is
+        attached."""
+        only_this_phone("24")
         path = settings_file()
         saved_file = path.read_bytes() if path.exists() else None
         note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
@@ -1921,7 +1947,8 @@ class Suite:
         """With `autoconnect = false` (and LANTERN_SERIAL lifted, a 0 ms unplug grace): the
         restart reconnects the phone through its `live` flag without a "plugged in" notice; a
         replug then asks: a Notify "<phone> is plugged in" within 5 s, the phone waiting and
-        restored; clicking its tray row connects it."""
+        restored; clicking its tray row connects it. Refused while another phone is attached."""
+        only_this_phone("25")
         path = settings_file()
         saved_file = path.read_bytes() if path.exists() else None
         note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
@@ -1990,8 +2017,9 @@ class Suite:
         within 5 s and a Notify "Connect your <phone>" with the `connect` action follows within
         5 s; after the click the phone is ready within 20 s, Settings opens in a window of its
         own app_id within 20 s, and 10 s later lanternd lists exactly one Settings window. The
-        window is closed through KWin."""
+        window is closed through KWin. Refused while another phone is attached."""
         check(not NESTED, "item 26 needs the real desktop: lanternd opens the window there")
+        only_this_phone("26")
         path = settings_file()
         saved_file = path.read_bytes() if path.exists() else None
         note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None

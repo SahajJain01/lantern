@@ -78,17 +78,27 @@ first if `lantern status` shows windows he is using.
    grep '^launchers=' ~/.config/plasma-org.kde.plasma.desktop-appletsrc > $S/launchers.txt
    cp -p ~/.local/share/applications/dev.lantern.Lantern.desktop $S/
    ```
-2. **Acceptance run (Step 2).** Two phones attached is fine (the preflight pins
-   `LANTERN_SERIAL`):
-   ```sh
-   python3 tools/build.py install && python3 tools/device_test.py
-   ```
-   Expected: all automatic items PASS: 1–7, 9–13, 15–20, 22–25 (`22/22 PASS`). Then, after
-   telling Sahaj the step ("click Connect on the 'Connect your Xiaomi 11T Pro' notification"):
-   ```sh
-   python3 tools/device_test.py --manual --only 26
-   ```
-   Record the summary line and timings here.
+2. **Acceptance run (Step 2), in two passes.** Items 24, 25 and 26 lift `LANTERN_SERIAL`, so
+   lanternd would serve every plugged phone (item 24 would connect an attached Motorola through
+   rule 4; 25/26 would show it notices); they fail at once ("unplug other phones") while another
+   phone is attached. Every other item pins `LANTERN_SERIAL` in its preflight, so two phones
+   attached is fine for them.
+   - Pass 1, both phones attached:
+     ```sh
+     python3 tools/build.py install && \
+       python3 tools/device_test.py --only 1 2 3 4 5 6 7 9 10 11 12 13 15 16 17 18 19 20 22 23
+     ```
+     Expected: `20/20 PASS`.
+   - Pass 2, **only the Xiaomi attached** (ask Sahaj to unplug the Motorola):
+     ```sh
+     python3 tools/device_test.py --only 24 25
+     ```
+     Expected: `2/2 PASS`. Then, still with only the Xiaomi, after telling Sahaj the step
+     ("click Connect on the 'Connect your Xiaomi 11T Pro' notification"):
+     ```sh
+     python3 tools/device_test.py --manual --only 26
+     ```
+   Record the summary lines and timings here.
 3. **After the install (Step 3 continued):**
    ```sh
    journalctl --user -u lanternd | grep 'menu migrated'        # primary=ZD222LMDFV …
@@ -100,11 +110,15 @@ first if `lantern status` shows windows he is using.
    ```
    Ask Sahaj to look at Kickoff: Phone → "Xiaomi 11T Pro" and Phone → "edge 50 pro"; take a
    screenshot. List the Xiaomi pins that need re-pinning (none were pinned on 2026-11-14).
-4. **Two-phone hand check (Step 4):** both phones plugged in, `LANTERN_SERIAL` unset
-   (`systemctl --user show-environment | grep LANTERN` empty), `autoconnect` off:
-   - `systemctl --user restart lanternd`: the tray shows two unchecked rows, row 15 "Lantern
-     connects one phone at a time", and two "… is plugged in" notifications (phones without a
-     `live` flag are asked).
+4. **Two-phone hand check (Step 4):** plug the Motorola back in (both phones plugged in),
+   `LANTERN_SERIAL` unset (`systemctl --user show-environment | grep LANTERN` empty),
+   `autoconnect` off. The suite leaves the Xiaomi connected with `live:true`, so a plain restart
+   would reconnect it without asking (rule 3); the Motorola's `live` is already clear (under
+   `LANTERN_SERIAL` the start-up timer clears the `live` flag of a phone lanternd ignores).
+   - **Quit** from the tray (clears the Xiaomi's `live`), then `systemctl --user start lanternd`:
+     the tray shows two unchecked rows, row 15 "Lantern connects one phone at a time", and two
+     "… is plugged in" notifications (neither phone has a `live` flag, so both are asked). Check
+     first: `devices/20e9318.json` and `devices/ZD222LMDFV.json` both have `live:false`.
    - Check the Xiaomi: ready (`lantern status`). Check the Motorola: the Xiaomi is restored,
      `~/.local/state/lantern/devices/20e9318.json` has `off:false, live:false`, the Motorola is
      ready.
@@ -286,7 +300,7 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
 | `docs/protocol.md` | The wire spec, including the companion link. Keep it in step with both sides. |
 | `docs/spikes/RESULTS.md` | Risk-spike measurements, plus the Plan 2 IME display policy finding. |
 | `tools/build.py` | Targets: `helper`, `companion`, `all`, `install` (also the Lantern launcher `dev.lantern.Lantern.desktop`), `uninstall` (runs `lantern undo-setup` best effort, removes the launcher). |
-| `tools/device_test.py` | On-device acceptance suite, items 1–26 (22 automatic): `--manual` adds 8, 14, 21 and 26, `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; items 20 and 26 still need the real session bus), `--state`. The preflight pins `LANTERN_SERIAL` (restored afterwards), so other phones may stay plugged in. |
+| `tools/device_test.py` | On-device acceptance suite, items 1–26 (22 automatic): `--manual` adds 8, 14, 21 and 26, `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; items 20 and 26 still need the real session bus), `--state`. The preflight pins `LANTERN_SERIAL` (restored afterwards), so other phones may stay plugged in, except for items 24–26: they lift it and refuse to run while another phone is attached (run them as their own pass). |
 
 ## Environment facts
 - Phone: Xiaomi 11T Pro, serial `20e9318`, Android 17 / SDK 37, LineageOS 24, swipe keyguard, USB
@@ -760,6 +774,10 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
     - CLI undo-setup's check-then-act window against a lanternd that starts meanwhile
       (pre-existing).
     - Under `LANTERN_SERIAL` a ready phone can be both `off` and `live` (decision 5).
+    - Under `LANTERN_SERIAL` the start-up timer (10 s after lanternd starts) clears the `live`
+      flag of every other phone, plugged in or not: lanternd ignores the other serials, so they
+      never count as plugged in. Lifting `LANTERN_SERIAL` afterwards asks for that phone instead
+      of resuming it.
     - An open naming a phone that is already connecting gets "Connect your A" and is lost if not
       clicked; store a pending open instead.
     - Notices are not closed when lanternd quits.
