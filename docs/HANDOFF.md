@@ -294,9 +294,9 @@ the Plan 4 list below.
   `com.canonical.dbusmenu`, registered with `org.kde.StatusNotifierWatcher` and again whenever
   the watcher gets a new owner. The menu is a pure function of `View` + settings (`tray/menu.rs`,
   fixed row ids 1–12). Start at login is systemd's enable state, not a TOML key. Undo asks first
-  (`kdialog --warningcontinuecancel`), pins the phone's serial at the click and cancels with "The
-  phone changed; undo cancelled" if it changed while the dialog was open (Ruling R9). No session
-  bus or no watcher: one warning, lanternd runs on.
+  (`kdialog --warningcontinuecancel`), pins the phone's serial at the click and cancels with an
+  "Undo phone setup cancelled" notification if it changed while the dialog was open (Ruling R9).
+  No session bus or no watcher: one warning, lanternd runs on.
 - **Desktop commands** lanternd spawns (`kdialog`, `xdg-open`, `notify-send`) get
   `WAYLAND_DISPLAY`/`DISPLAY`/`XDG_CURRENT_DESKTOP` from `systemctl --user show-environment` when
   missing (`desktop::session_env`, shared with the clipboard).
