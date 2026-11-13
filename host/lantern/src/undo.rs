@@ -5,8 +5,10 @@
 //!    Lantern file in `/data/local/tmp`. `--forget` deletes the jar it runs from, so the
 //!    embedded jar is pushed first whenever it is missing.
 //! 2. `pm uninstall --user 0 dev.lantern.companion` (not installed is fine).
-//! 3. The serial's menu entries and icons (see [`remove_catalogue_entries`]).
-//! 4. The device record, only if the phone steps succeeded (it stays true otherwise).
+//! 3. The serial's menu entries, icons and folder (see [`remove_catalogue_entries`]).
+//! 4. The device record is kept and switched off (`off:true, live:false`), so lanternd does
+//!    not reconnect the phone by itself; `companion:false` too when the phone steps succeeded,
+//!    so setting the phone up again says so.
 
 use std::io::Write;
 use std::path::Path;
@@ -70,8 +72,8 @@ pub fn resolve_serial(
     }
 }
 
-/// Removes `serial`'s menu entries and icons (and the Phone submenu once no Lantern entry is
-/// left), then rebuilds the KDE menu cache. Returns how many entries there were.
+/// Removes `serial`'s menu entries, icons and folder (and the Phone submenu once no Lantern
+/// entry is left), then rebuilds the KDE menu cache. Returns how many entries there were.
 pub fn remove_catalogue_entries(serial: &str) -> Result<usize> {
     let dirs = Dirs::from_env()?;
     remove_catalogue_entries_with(dirs, serial, std::sync::Arc::new(catalog::run_kbuildsycoca))
@@ -83,8 +85,12 @@ pub fn remove_catalogue_entries_with(
     serial: &str,
     rebuild: catalog::Rebuild,
 ) -> Result<usize> {
+    // The other phones' folders keep their names from the device records.
+    let names = companion::names_in(dirs.state.clone());
+    let mut catalog = Catalog::with_rebuild(dirs, rebuild);
+    catalog.set_names(names);
     // Dropping the catalogue runs its pending rebuild before returning.
-    Catalog::with_rebuild(dirs, rebuild).remove_serial(serial)
+    catalog.remove_serial(serial)
 }
 
 async fn forget(adb: &Adb) -> Result<String> {
@@ -173,23 +179,22 @@ pub async fn run_steps(
             writeln!(out, "catalogue: FAILED: {}", first_line(&error))?;
         }
     }
-    let record = companion::record_path(state_dir, &serial);
-    if !phone_ok {
-        writeln!(out, "device record: kept (phone steps failed)")?;
-    } else {
-        match std::fs::remove_file(&record) {
-            Ok(()) => writeln!(out, "device record: removed {}", record.display())?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                writeln!(out, "device record: none")?
-            }
-            Err(error) => {
-                ok = false;
-                writeln!(
-                    out,
-                    "device record: FAILED: remove {}: {error}",
-                    record.display()
-                )?;
-            }
+    let record = companion::update_record(state_dir, &serial, |map| {
+        map.insert("off".to_owned(), true.into());
+        map.insert("live".to_owned(), false.into());
+        if phone_ok {
+            map.insert("companion".to_owned(), false.into());
+        }
+    });
+    match record {
+        Ok(_) if phone_ok => writeln!(out, "device record: kept, switched off")?,
+        Ok(_) => writeln!(
+            out,
+            "device record: kept, switched off (phone steps failed)"
+        )?,
+        Err(error) => {
+            ok = false;
+            writeln!(out, "device record: FAILED: {}", first_line(&error))?;
         }
     }
     Ok(ok)
@@ -209,6 +214,7 @@ mod tests {
             icons: root.join("icons"),
             menus: root.join("menus"),
             directories: root.join("directories"),
+            state: root.join("state"),
             exe: "/usr/bin/lantern".into(),
         };
         let mut cat = Catalog::with_rebuild(dirs.clone(), std::sync::Arc::new(|| {}));
@@ -240,8 +246,14 @@ mod tests {
             Catalog::with_rebuild(dirs.clone(), std::sync::Arc::new(|| {})).phones("com.s", 0);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(removed.unwrap(), 2);
-        // The shared entry stays, listing only the other phone.
-        assert_eq!(left, ["lantern.com.c.desktop", "lantern.com.s.desktop"]);
+        // "mine" synced first, so it kept the legacy names; the other phone's files stay.
+        assert_eq!(
+            left,
+            [
+                "lantern.com.c-pother.desktop",
+                "lantern.com.s-pother.desktop"
+            ]
+        );
         assert_eq!(shared, ["other"]);
     }
 

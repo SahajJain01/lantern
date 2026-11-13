@@ -1478,6 +1478,7 @@ fn temp_catalog() -> (PathBuf, Dirs, Catalog) {
         icons: root.join("icons"),
         menus: root.join("menus"),
         directories: root.join("directories"),
+        state: root.join("state"),
         exe: PathBuf::from("/usr/bin/lantern"),
     };
     let catalog = Catalog::with_rebuild(dirs.clone(), std::sync::Arc::new(|| {}));
@@ -1586,9 +1587,11 @@ async fn catalogue_from_helper_becomes_menu_entries() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Plants the menu entry of `pkg` (user 0) as written by phone `serial`'s sync.
+/// Plants the menu entry of `pkg` (user 0) as written by phone `serial`'s sync, under the
+/// legacy name (as if `serial` were the primary phone).
 fn plant_entry(dirs: &Dirs, pkg: &str, serial: &str) {
     use lantern::daemon::catalog::{desktop_file, AppEntry};
+    use lantern::naming::Naming;
     let e = AppEntry {
         pkg: pkg.into(),
         user: 0,
@@ -1597,7 +1600,10 @@ fn plant_entry(dirs: &Dirs, pkg: &str, serial: &str) {
         icon_png: Vec::new(),
     };
     std::fs::create_dir_all(&dirs.applications).unwrap();
-    let text = desktop_file(&e, serial, &[serial.to_owned()], &dirs.exe, None);
+    let naming = Naming {
+        primary: Some(serial.to_owned()),
+    };
+    let text = desktop_file(&e, serial, &naming, &dirs.exe, None);
     std::fs::write(
         dirs.applications.join(format!("lantern.{pkg}.desktop")),
         text,
@@ -1635,7 +1641,7 @@ async fn open_of_other_phones_app_is_refused_after_sync() {
     })
     .await;
     let x = std::fs::read_to_string(dirs.applications.join("lantern.com.x.desktop")).unwrap();
-    assert!(x.contains("X-Lantern-Serials=other;\n"), "{x}");
+    assert!(x.contains("X-Lantern-Serial=other\n"), "{x}");
 
     let (mut client, reply) = connect_open(&daemon.sock, open("com.x", 0, None)).await;
     let reply = reply.expect("a reply to the open");

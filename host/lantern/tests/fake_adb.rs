@@ -841,6 +841,7 @@ fn record_setup_is_true_only_the_first_time() {
 
 // --- lantern undo-setup -----------------------------------------------------------------------
 
+use lantern::daemon::companion::{read_record, record_name};
 use lantern::undo;
 
 /// A daemon socket path nobody listens on (lanternd stopped).
@@ -848,9 +849,13 @@ fn no_daemon() -> PathBuf {
     state_dir("nosock").join("daemon.sock")
 }
 
+/// `undo::run` minus the real catalogue: the menu-entry step must never touch the desktop's
+/// `~/.local/share/applications` from a test, so it is a no-op here (`undo.rs` unit tests cover
+/// it in scratch dirs).
 async fn run_undo(fake: &FakeAdb, state: &Path) -> (bool, String) {
+    undo::check_daemon(&no_daemon()).unwrap();
     let mut out = Vec::new();
-    let ok = undo::run(&fake.adb(), &no_daemon(), state, &mut out)
+    let ok = undo::run_steps(&fake.adb(), state, &|_: &str| Ok(0), &mut out)
         .await
         .unwrap();
     (ok, String::from_utf8(out).unwrap())
@@ -887,9 +892,15 @@ async fn undo_setup_pushes_the_jar_then_forgets_and_uninstalls() {
     })
     .unwrap_or_else(|| panic!("companion not uninstalled: {calls:#?}"));
     assert!(push < forget && forget < uninstall, "{calls:#?}");
+    let record = read_record(&state, "fake-serial").expect("the record is kept");
     assert!(
-        !state.join("devices/fake-serial.json").exists(),
-        "record kept"
+        record.off && !record.live && !record.companion,
+        "{record:?}"
+    );
+    assert_eq!(
+        out.lines().last(),
+        Some("device record: kept, switched off"),
+        "{out}"
     );
     assert_eq!(out.lines().count(), 4, "one line per step: {out}");
     let _ = std::fs::remove_dir_all(&state);
@@ -958,8 +969,41 @@ async fn undo_run_steps_keeps_record_when_forget_fails() {
     assert!(lines[0].starts_with("helper --forget: FAILED"), "{out}");
     assert!(lines[1].starts_with("companion:"), "{out}");
     assert_eq!(lines[2], "catalogue: removed 3 entries", "{out}");
-    assert!(lines[3].starts_with("device record: kept"), "{out}");
+    assert_eq!(
+        lines[3], "device record: kept, switched off (phone steps failed)",
+        "{out}"
+    );
     assert_eq!(*removed.lock().unwrap(), ["fake-serial"]);
-    assert!(state.join("devices/fake-serial.json").exists());
+    // Switched off, but still set up: the phone keeps Lantern's files.
+    let record = read_record(&state, "fake-serial").expect("the record is kept");
+    assert!(record.off && !record.live && record.companion, "{record:?}");
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+#[tokio::test]
+async fn undo_keeps_record_switched_off() {
+    let fake = FakeAdb::new("undo-off", "0");
+    fake.installed(&companion::companion_sha());
+    let state = state_dir("undo-off");
+    assert!(record_setup(&state, "fake-serial", Install::Installed).unwrap());
+    assert!(record_name(&state, "fake-serial", "Phone").unwrap());
+    lantern::daemon::companion::set_live(&state, "fake-serial", true).unwrap();
+    let mut out = Vec::new();
+    let ok = undo::run_steps(&fake.adb(), &state, &|_: &str| Ok(0), &mut out)
+        .await
+        .unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(ok, "{out}");
+    assert_eq!(
+        out.lines().last(),
+        Some("device record: kept, switched off")
+    );
+    let record = read_record(&state, "fake-serial").expect("the record is kept");
+    assert!(record.off, "{record:?}");
+    assert!(!record.live, "{record:?}");
+    assert!(!record.companion, "setting it up again says so: {record:?}");
+    assert_eq!(record.name.as_deref(), Some("Phone"), "other keys stay");
+    // Set up again: it counts as new.
+    assert!(record_setup(&state, "fake-serial", Install::Installed).unwrap());
     let _ = std::fs::remove_dir_all(&state);
 }

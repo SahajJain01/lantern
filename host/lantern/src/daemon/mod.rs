@@ -786,6 +786,49 @@ fn undo_runner() -> UndoRunner {
     })
 }
 
+/// The catalogue lanternd serves from: the one-time menu migration ([`catalog::migrate`]) runs
+/// first, so `menu.json` records the primary phone before any session is served or any window
+/// reopened (else every `lantern open --phone` window would get a suffixed app_id that matches
+/// no legacy entry). `pins` is Plasma's applets config, for picking the primary. `rebuild` runs
+/// once if the migration changed files. A failed migration gives no catalogue for this run:
+/// writing per-phone entries over unmigrated ones would mark it done; the next start retries.
+pub fn open_catalog(
+    dirs: catalog::Dirs,
+    pins: Option<&str>,
+    rebuild: catalog::Rebuild,
+) -> Option<catalog::Catalog> {
+    let pending = !crate::naming::Naming::migrated(&dirs.state);
+    match catalog::migrate(&dirs, pins) {
+        Ok(m) if pending => {
+            tracing::info!(
+                "menu migrated: primary={} written={} removed={}",
+                m.primary.as_deref().unwrap_or("none"),
+                m.written,
+                m.removed
+            );
+            if m.written + m.removed > 0 {
+                rebuild();
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "menu migration failed; no menu entries until lanternd restarts"
+            );
+            return None;
+        }
+    }
+    Some(catalog::Catalog::with_rebuild(dirs, rebuild))
+}
+
+/// Plasma's applets config (`$XDG_CONFIG_HOME/plasma-org.kde.plasma.desktop-appletsrc`), read
+/// only for its pinned launchers; `None` if unreadable.
+fn plasma_pins() -> Option<String> {
+    let config = ::dirs::config_dir()?;
+    std::fs::read_to_string(config.join("plasma-org.kde.plasma.desktop-appletsrc")).ok()
+}
+
 pub async fn run() -> Result<()> {
     let configured = std::env::var("LANTERN_SERIAL")
         .ok()
@@ -801,8 +844,17 @@ pub async fn run() -> Result<()> {
     };
     // Shared by every session start: the companion-failure notice is once per daemon run.
     let setup = std::sync::Arc::new(companion::Setup::desktop());
+    // Before anything is served: the migration records the primary phone in `menu.json`.
     let catalog = match catalog::Dirs::from_env() {
-        Ok(dirs) => Some(catalog::Catalog::new(dirs)),
+        Ok(dirs) => {
+            let names = companion::names_in(dirs.state.clone());
+            let pins = plasma_pins();
+            let rebuild: catalog::Rebuild = Arc::new(catalog::run_kbuildsycoca);
+            open_catalog(dirs, pins.as_deref(), rebuild).map(|mut catalog| {
+                catalog.set_names(names);
+                catalog
+            })
+        }
         Err(error) => {
             tracing::warn!(
                 error = format!("{error:#}"),
@@ -955,5 +1007,95 @@ mod tests {
         };
         let delays: Vec<u64> = (1..=5).map(|n| policy.delay(n).as_secs()).collect();
         assert_eq!(delays, [1, 2, 4, 5, 5]);
+    }
+
+    /// Scratch catalogue dirs (never the real XDG dirs) and a rebuild counter.
+    fn scratch_dirs(tag: &str) -> (std::path::PathBuf, catalog::Dirs) {
+        let root =
+            std::env::temp_dir().join(format!("lantern-open-catalog-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = catalog::Dirs::resolve(
+            Some(root.join("data")),
+            Some(root.join("config")),
+            Some(root.join("state")),
+            &root,
+            "/usr/bin/lantern".into(),
+        );
+        (root, dirs)
+    }
+
+    /// A Plan 3 entry for `pkg` (user 0) listing `serials`.
+    fn plant_legacy(dirs: &catalog::Dirs, pkg: &str, serials: &str) {
+        std::fs::create_dir_all(&dirs.applications).unwrap();
+        let marker = serials.split(';').next().unwrap();
+        std::fs::write(
+            dirs.applications.join(format!("lantern.{pkg}.desktop")),
+            format!(
+                "[Desktop Entry]\nType=Application\nName={pkg}\nExec=lantern open {pkg}\n\
+                 Categories=X-Lantern;\nStartupWMClass=lantern.{pkg}\n\
+                 X-Lantern-Serial={marker}\nX-Lantern-Serials={serials}\n\
+                 X-Lantern-Package={pkg}\nX-Lantern-User=0\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn counter() -> (Arc<std::sync::atomic::AtomicUsize>, catalog::Rebuild) {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = runs.clone();
+        let rebuild: catalog::Rebuild = Arc::new(move || {
+            r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        (runs, rebuild)
+    }
+
+    #[test]
+    fn startup_records_the_primary_before_the_catalogue_exists() {
+        use crate::naming::Naming;
+        let (root, dirs) = scratch_dirs("primary");
+        // B has fewer entries, but its entry is pinned.
+        plant_legacy(&dirs, "com.a", "A;");
+        plant_legacy(&dirs, "com.a2", "A;");
+        plant_legacy(&dirs, "com.b", "B;");
+        let pins = "launchers=applications:lantern.com.b.desktop\n";
+        let (runs, rebuild) = counter();
+        let catalog = open_catalog(dirs.clone(), Some(pins), rebuild);
+        // The only way to a catalogue is through the migration: menu.json is there first.
+        assert!(catalog.is_some());
+        let naming = Naming::load(&dirs.state);
+        assert!(Naming::migrated(&dirs.state));
+        assert_eq!(naming.primary.as_deref(), Some("B"));
+        // `lantern open --phone B` (a pinned launcher, or an unlock reopen) gets the legacy
+        // stem, which is still the pinned file's.
+        assert_eq!(naming.app_id("com.b", 0, "B"), "lantern.com.b");
+        let pinned =
+            std::fs::read_to_string(dirs.applications.join("lantern.com.b.desktop")).unwrap();
+        assert!(
+            pinned.contains("StartupWMClass=lantern.com.b\n"),
+            "{pinned}"
+        );
+        assert!(pinned.contains("X-Lantern-Serial=B\n"), "{pinned}");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(catalog);
+        // A later start migrates nothing and rebuilds nothing.
+        let (runs, rebuild) = counter();
+        assert!(open_catalog(dirs.clone(), None, rebuild).is_some());
+        assert_eq!(Naming::load(&dirs.state).primary.as_deref(), Some("B"));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_migration_gives_no_catalogue() {
+        use crate::naming::Naming;
+        let (root, mut dirs) = scratch_dirs("failed");
+        plant_legacy(&dirs, "com.a", "A;");
+        // The state dir cannot be created: menu.json is never written.
+        std::fs::write(root.join("blocker"), "").unwrap();
+        dirs.state = root.join("blocker").join("lantern");
+        let (_, rebuild) = counter();
+        assert!(open_catalog(dirs.clone(), None, rebuild).is_none());
+        assert!(!Naming::migrated(&dirs.state));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22, 23
     python3 tools/device_test.py --manual                            # also 8, 14, 21 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
 
-Items (22; 19 automatic, 8, 14 and 21 only with --manual):
+Items (23; 20 automatic, 8, 14 and 21 only with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -20,7 +20,8 @@ Items (22; 19 automatic, 8, 14 and 21 only with --manual):
     10 catalogue_tracks_phone              20 tray_menu (real session bus, unlocked desktop)
                                            21 unlock_prompt (manual, PIN phone, Sahaj types)
                                            22 swipe_phone_never_prompts (Xiaomi, no PIN)
-A full automatic run prints `19/19 PASS` when everything passes.
+                                           23 per_phone_folders (restarts lanternd)
+A full automatic run prints `20/20 PASS` when everything passes.
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
@@ -328,6 +329,20 @@ def applications_dir():
     return (Path(data) if data.startswith("/") else Path.home() / ".local/share") / "applications"
 
 
+def menus_dir():
+    """The merged menu files (`catalog::Dirs::menus`)."""
+    config = os.environ.get("XDG_CONFIG_HOME", "")
+    return (Path(config) if config.startswith("/") else Path.home() / ".config") / \
+        "menus" / "applications-merged"
+
+
+def directories_dir():
+    """The menu folder files (`catalog::Dirs::directories`)."""
+    data = os.environ.get("XDG_DATA_HOME", "")
+    return (Path(data) if data.startswith("/") else Path.home() / ".local/share") / \
+        "desktop-directories"
+
+
 def devices_dir():
     """lanternd's device records (`companion::state_dir()/devices`)."""
     state = os.environ.get("XDG_STATE_HOME", "")
@@ -342,17 +357,51 @@ def settings_file():
         "lantern" / "settings.toml"
 
 
-def desktop_entry(app_id):
-    """The [Desktop Entry] keys of `<applications>/<app_id>.desktop`, or None if absent."""
-    path = applications_dir() / f"{app_id}.desktop"
-    if not path.exists():
-        return None
+def read_keys(path):
+    """The [Desktop Entry] keys of the file at `path` (first value of each key)."""
     keys = {}
     for line in path.read_text(errors="replace").splitlines():
         if "=" in line and not line.startswith(("#", "[")):
             k, v = line.split("=", 1)
             keys.setdefault(k.strip(), v.strip())
     return keys
+
+
+def tag(serial):
+    """`naming::tag`: `[A-Za-z0-9_]` kept, any other character `_`, at most 64 chars."""
+    return "".join(c if (c.isascii() and c.isalnum()) or c == "_" else "_" for c in serial[:64])
+
+
+def entry_for(serial, pkg, user=0):
+    """The (path, keys) of the `lantern.*.desktop` whose X-Lantern-Serial, X-Lantern-Package
+    and X-Lantern-User are `serial`, `pkg` and `user`, or None."""
+    for path in sorted(applications_dir().glob("lantern.*.desktop")):
+        try:
+            keys = read_keys(path)
+        except OSError:
+            continue
+        if (keys.get("X-Lantern-Serial") == serial and keys.get("X-Lantern-Package") == pkg
+                and keys.get("X-Lantern-User") == str(user)):
+            return path, keys
+    return None
+
+
+def app_id_of(pkg):
+    """The app_id of `pkg` (user 0) on SERIAL: its menu entry's stem, else `lantern.<pkg>`."""
+    found = entry_for(SERIAL, pkg)
+    return found[0].stem if found else f"lantern.{pkg}"
+
+
+def per_phone_entry(pkg, serial, name):
+    """The text `catalog::desktop_file` writes for `pkg` (user 0) on non-primary phone `serial`
+    (a bare `[A-Za-z0-9._:-]` serial): (file name, text)."""
+    t = tag(serial)
+    stem = f"lantern.{pkg}-p{t}"
+    text = ("[Desktop Entry]\nType=Application\nVersion=1.5\n"
+            f"Name={name}\nExec=\"{LANTERN}\" open --phone {serial} {pkg}\n"
+            f"Categories=X-Lantern-{t};\nStartupWMClass={stem}\nStartupNotify=true\n"
+            f"X-Lantern-Serial={serial}\nX-Lantern-Package={pkg}\nX-Lantern-User=0\n")
+    return f"{stem}.desktop", text
 
 
 def klipper(*args):
@@ -792,32 +841,32 @@ class Suite:
         note(f"phone keyboard during the session: ime={ph['ime']} imes={ph['imes']}")
 
     def catalogue_tracks_phone(self):
-        settings = desktop_entry(f"lantern.{SETTINGS}")
-        check(settings is not None,
-              f"{applications_dir()}/lantern.{SETTINGS}.desktop is missing")
-        assert settings is not None
+        found = entry_for(SERIAL, SETTINGS)
+        check(found is not None, f"no menu entry of {SETTINGS} for {SERIAL} in {applications_dir()}")
+        assert found is not None
+        path, settings = found
         icon = Path(settings.get("Icon", ""))
-        note(f"lantern.{SETTINGS}.desktop: Name={settings.get('Name')} Icon={icon} "
+        note(f"{path.name}: Name={settings.get('Name')} Icon={icon} "
              f"Exec={settings.get('Exec')}")
         check(settings.get("Name") == "Settings", f"Name={settings.get('Name')!r}")
         check(icon.is_absolute() and icon.is_file()
               and icon.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", f"Icon {icon} is not a PNG")
-        comp = f"lantern.{COMPANION}"
-        if desktop_entry(comp) is not None or test_activity_listed():
+        def comp():
+            return entry_for(SERIAL, COMPANION)
+        if comp() is not None or test_activity_listed():
             note("test screen left enabled by an earlier run; disabling it first")
             test_activity(False)
             wait_until("companion entry gone before the test", 10,
-                       lambda: desktop_entry(comp) is None, interval=0.2)
+                       lambda: comp() is None, interval=0.2)
         try:
             test_activity(True)
-            entry, secs = wait_until("companion entry appears", 5, lambda: desktop_entry(comp),
-                                     interval=0.1)
-            note(f"TEST_ACTIVITY on: {comp}.desktop appeared after {secs:.1f} s "
+            (path, entry), secs = wait_until("companion entry appears", 5, comp, interval=0.1)
+            note(f"TEST_ACTIVITY on: {path.name} appeared after {secs:.1f} s "
                  f"(Name={entry.get('Name')})")
             test_activity(False)
             _, secs = wait_until("companion entry removed", 5,
-                                 lambda: desktop_entry(comp) is None, interval=0.1)
-            note(f"TEST_ACTIVITY off: {comp}.desktop removed after {secs:.1f} s")
+                                 lambda: comp() is None, interval=0.1)
+            note(f"TEST_ACTIVITY off: {path.name} removed after {secs:.1f} s")
         finally:
             test_activity(False)
 
@@ -969,17 +1018,15 @@ class Suite:
     # --- Plan 3 ----------------------------------------------------------------------------
 
     def phones_keep_their_entries(self):
-        """Another phone's menu entry survives this phone's full sync byte for byte, and this
-        phone's entries list its serial in X-Lantern-Serials."""
-        other = applications_dir() / "lantern.dev.lantern.test.other.desktop"
+        """Another phone's per-phone menu entry survives this phone's full sync byte for byte,
+        and this phone's own entry names it with --phone."""
+        # The format of catalog::desktop_file for a non-primary phone "lantern-test-other":
+        # lantern.dev.lantern.test.other-plantern_test_other.desktop.
+        name, text = per_phone_entry("dev.lantern.test.other", "lantern-test-other",
+                                     "Lantern test other")
+        other = applications_dir() / name
         check(not other.exists(), f"{other} exists before the test")
-        # The format of catalog::desktop_file for a phone "lantern-test-other".
-        planted = ("[Desktop Entry]\nType=Application\nVersion=1.5\nName=Lantern test other\n"
-                   f"Exec=\"{LANTERN}\" open dev.lantern.test.other\n"
-                   "Categories=X-Lantern;\nStartupWMClass=lantern.dev.lantern.test.other\n"
-                   "StartupNotify=true\nX-Lantern-Serial=lantern-test-other\n"
-                   "X-Lantern-Serials=lantern-test-other;\n"
-                   "X-Lantern-Package=dev.lantern.test.other\nX-Lantern-User=0\n").encode()
+        planted = text.encode()
         ok = False
         try:
             other.parent.mkdir(parents=True, exist_ok=True)
@@ -994,13 +1041,14 @@ class Suite:
             check(other.exists(), f"{other.name} was deleted by {SERIAL}'s full sync")
             check(other.read_bytes() == planted, f"{other.name} was rewritten")
             note(f"{other.name} unchanged")
-            settings = desktop_entry(f"lantern.{SETTINGS}")
-            check(settings is not None, f"lantern.{SETTINGS}.desktop is missing")
-            assert settings is not None
-            serials = settings.get("X-Lantern-Serials", "")
-            note(f"lantern.{SETTINGS}.desktop: X-Lantern-Serial={settings.get('X-Lantern-Serial')} "
-                 f"X-Lantern-Serials={serials}")
-            check(SERIAL in serials.split(";"), f"X-Lantern-Serials={serials!r} lacks {SERIAL}")
+            found = entry_for(SERIAL, SETTINGS)
+            check(found is not None, f"no menu entry of {SETTINGS} for {SERIAL}")
+            assert found is not None
+            path, settings = found
+            note(f"{path.name}: X-Lantern-Serial={settings.get('X-Lantern-Serial')} "
+                 f"Exec={settings.get('Exec')}")
+            check(f"--phone {SERIAL} " in settings.get("Exec", ""),
+                  f"Exec={settings.get('Exec')!r} lacks --phone {SERIAL}")
             ok = True
         finally:
             cleanup(ok, ("remove the planted entry", lambda: other.unlink(missing_ok=True)))
@@ -1010,16 +1058,11 @@ class Suite:
         (exit 1) with "Connect your <that phone's name>", and this phone's device record has
         its name."""
         pkg = "dev.lantern.test.absent"
-        entry = applications_dir() / f"lantern.{pkg}.desktop"
+        name, planted = per_phone_entry(pkg, "lantern-test-other", "Lantern test absent")
+        entry = applications_dir() / name
         record = devices_dir() / "lantern-test-other.json"
         check(not entry.exists(), f"{entry} exists before the test")
         check(not record.exists(), f"{record} exists before the test")
-        planted = ("[Desktop Entry]\nType=Application\nVersion=1.5\nName=Lantern test absent\n"
-                   f"Exec=\"{LANTERN}\" open {pkg}\n"
-                   f"Categories=X-Lantern;\nStartupWMClass=lantern.{pkg}\n"
-                   "StartupNotify=true\nX-Lantern-Serial=lantern-test-other\n"
-                   "X-Lantern-Serials=lantern-test-other;\n"
-                   f"X-Lantern-Package={pkg}\nX-Lantern-User=0\n")
         ok = False
         try:
             entry.parent.mkdir(parents=True, exist_ok=True)
@@ -1489,6 +1532,66 @@ class Suite:
         check(13 not in rows, f"the tray shows an Unlock row: {rows}")
         check(not rows.get(1, "").endswith("(locked)"), f"the tray says locked: {rows.get(1)!r}")
 
+    # --- Plan 4b ---------------------------------------------------------------------------
+
+    def per_phone_folders(self):
+        """The menu has a folder for this phone, named after it; this phone's entries open
+        with --phone; no entry is a shared (X-Lantern-Serials) one any more; a foreign
+        lantern.*.desktop survives a restart and a full sync byte for byte."""
+        foreign = applications_dir() / "lantern.dev.lantern.test.foreign.desktop"
+        check(not foreign.exists(), f"{foreign} exists before the test")
+        planted = ("[Desktop Entry]\nType=Application\nName=Not Lantern's\nExec=true\n"
+                   "X-Lantern-Package=dev.lantern.test.foreign\nX-Lantern-User=0\n").encode()
+        ok = False
+        try:
+            # 1. Someone else's file with a Lantern-like name (no X-Lantern-Serial=).
+            foreign.parent.mkdir(parents=True, exist_ok=True)
+            foreign.write_bytes(planted)
+            # 2. A fresh lanternd and a full sync.
+            systemctl("restart", UNIT)
+            _, secs = wait_ready(15)
+            _, csecs = wait_until("companion ready", 10,
+                                  lambda: status().get("companion") == "ready")
+            note(f"ready {secs:.1f} s, companion ready {csecs:.1f} s after; "
+                 "waiting 10 s for the full sync")
+            time.sleep(10)
+            t = tag(SERIAL)
+            # 3. This phone's submenu.
+            menu = menus_dir() / "lantern.menu"
+            check(menu.exists(), f"{menu} is missing")
+            text = menu.read_text(errors="replace")
+            check(f"<Category>X-Lantern-{t}</Category>" in text,
+                  f"{menu.name} has no submenu for X-Lantern-{t}")
+            # 4. Its folder, named after the phone.
+            device = adb("shell", "settings get global device_name").strip()
+            folder = directories_dir() / f"lantern-phone-{t}.directory"
+            check(folder.exists(), f"{folder} is missing")
+            keys = read_keys(folder)
+            note(f"{folder.name}: Name={keys.get('Name')!r} (device_name {device!r})")
+            check(keys.get("Name") == device, f"folder Name={keys.get('Name')!r}, want {device!r}")
+            check(keys.get("X-Lantern-Serial") == SERIAL,
+                  f"folder X-Lantern-Serial={keys.get('X-Lantern-Serial')!r}")
+            # 5. This phone's Settings entry opens on this phone.
+            found = entry_for(SERIAL, SETTINGS)
+            check(found is not None, f"no menu entry of {SETTINGS} for {SERIAL}")
+            assert found is not None
+            path, entry = found
+            note(f"{path.name}: Exec={entry.get('Exec')}")
+            check(f" open --phone {SERIAL} " in entry.get("Exec", ""),
+                  f"Exec={entry.get('Exec')!r} lacks --phone {SERIAL}")
+            # 6. No shared entries are left.
+            shared = [p.name for p in sorted(applications_dir().glob("lantern.*.desktop"))
+                      if "\nX-Lantern-Serials=" in "\n" + p.read_text(errors="replace")]
+            check(not shared, f"shared entries left: {shared}")
+            # 7. The foreign file is untouched.
+            check(foreign.exists() and foreign.read_bytes() == planted,
+                  f"{foreign.name} was changed or removed")
+            note(f"{foreign.name} unchanged")
+            ok = True
+        finally:
+            # 8.
+            cleanup(ok, ("remove the planted file", lambda: foreign.unlink(missing_ok=True)))
+
 
 ITEMS = [
     "session_starts_on_plug",
@@ -1513,6 +1616,7 @@ ITEMS = [
     "tray_menu",
     "unlock_prompt",
     "swipe_phone_never_prompts",
+    "per_phone_folders",
 ]
 # Need a person: pull the cable (8, 14) or type the phone's PIN (21).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt"}

@@ -29,6 +29,7 @@ fn open_without_a_daemon_exits_1() {
     let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .args(["open", "com.example"])
         .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -51,6 +52,17 @@ fn missing_subcommand_prints_usage() {
 }
 
 /// A session bus address nobody listens on, inside the test's scratch `dir`.
+/// Scratch `XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME` under `dir`: a `lantern` run from a
+/// test must never read or write the desktop's menu entries, menu files, settings or state
+/// (lanternd migrates the menu at startup).
+fn scratch_xdg(dir: &std::path::Path) -> [(&'static str, std::path::PathBuf); 3] {
+    [
+        ("XDG_DATA_HOME", dir.join("data")),
+        ("XDG_CONFIG_HOME", dir.join("config")),
+        ("XDG_STATE_HOME", dir.join("state")),
+    ]
+}
+
 fn no_bus(dir: &std::path::Path) -> String {
     format!("unix:path={}", dir.join("no-bus").display())
 }
@@ -72,6 +84,7 @@ fn status_without_a_daemon_exits_1() {
     let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("status")
         .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -100,6 +113,7 @@ fn connect_and_disconnect_without_a_daemon_exit_1() {
         let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
             .arg(cmd)
             .env("XDG_RUNTIME_DIR", &dir)
+            .envs(scratch_xdg(&dir))
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -126,6 +140,7 @@ fn daemon_runtime_failure_exits_1() {
     let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env_remove("XDG_RUNTIME_DIR")
+        .envs(scratch_xdg(&scratch("no-runtime")))
         .output()
         .unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -151,6 +166,7 @@ fn status_prints_the_running_daemons_state_as_json() {
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
         // No tray on the real session bus from a test: the daemon logs "no tray" and runs on.
         .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
         .env("PATH", &path)
@@ -169,12 +185,14 @@ fn status_prints_the_running_daemons_state_as_json() {
     let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("status")
         .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
         .output()
         .unwrap();
     // `lantern disconnect` with nothing live: the report, exit 0, still idle.
     let disconnect = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("disconnect")
         .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
         .output()
         .unwrap();
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
@@ -212,6 +230,7 @@ fn open_user_usage_errors_exit_2() {
         let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
             .args(args)
             .env("XDG_RUNTIME_DIR", &dir)
+            .envs(scratch_xdg(&dir))
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -233,6 +252,7 @@ fn open_with_user_reaches_the_daemon_step() {
         let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
             .args(args)
             .env("XDG_RUNTIME_DIR", &dir)
+            .envs(scratch_xdg(&dir))
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -260,6 +280,7 @@ fn open_rejects_bad_packages_and_user_forms() {
         let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
             .args(args)
             .env("XDG_RUNTIME_DIR", &dir)
+            .envs(scratch_xdg(&dir))
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -357,7 +378,7 @@ fn failed_open_prints_the_error_once_and_exits_1() {
     let child = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .args(["open", "com.example"])
         .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_STATE_HOME", dir.join("state"))
+        .envs(scratch_xdg(&dir))
         .env("WAYLAND_DISPLAY", &wayland)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -406,9 +427,9 @@ fn undo_setup_refuses_live_session() {
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
         // No tray on the real session bus from a test: the daemon logs "no tray" and runs on.
         .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
-        .env("XDG_STATE_HOME", dir.join("state"))
         .env("PATH", &path)
         .env_remove("LANTERN_SERIAL")
         .stderr(std::process::Stdio::null())
@@ -419,6 +440,7 @@ fn undo_setup_refuses_live_session() {
         let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
             .arg("status")
             .env("XDG_RUNTIME_DIR", &dir)
+            .envs(scratch_xdg(&dir))
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -433,7 +455,7 @@ fn undo_setup_refuses_live_session() {
     let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .args(["undo-setup", "--serial", "dev"])
         .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_STATE_HOME", dir.join("state"))
+        .envs(scratch_xdg(&dir))
         .env("PATH", &path)
         .output()
         .unwrap();
@@ -482,9 +504,9 @@ fn undo_setup_refuses_idle_daemon() {
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
         // No tray on the real session bus from a test: the daemon logs "no tray" and runs on.
         .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
-        .env("XDG_STATE_HOME", dir.join("state"))
         .env("PATH", &path)
         .env_remove("LANTERN_SERIAL")
         .stderr(std::process::Stdio::null())
@@ -495,6 +517,7 @@ fn undo_setup_refuses_idle_daemon() {
         let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
             .arg("status")
             .env("XDG_RUNTIME_DIR", &dir)
+            .envs(scratch_xdg(&dir))
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -508,7 +531,7 @@ fn undo_setup_refuses_idle_daemon() {
     let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .args(["undo-setup", "--serial", "dev"])
         .env("XDG_RUNTIME_DIR", &dir)
-        .env("XDG_STATE_HOME", dir.join("state"))
+        .envs(scratch_xdg(&dir))
         .env("PATH", &path)
         .output()
         .unwrap();
@@ -527,6 +550,76 @@ fn undo_setup_refuses_idle_daemon() {
         !new_calls.contains("-s dev"),
         "undo-setup touched the phone: {new_calls}"
     );
+}
+
+/// lanternd migrates the menu (and records the primary phone in `menu.json`) before it answers
+/// any client, so no window or session is served with names from a missing `menu.json`. Only
+/// the scratch XDG dirs are used.
+#[test]
+fn daemon_migrates_the_menu_before_it_answers() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("migrate");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let adb = bin.join("adb");
+    std::fs::write(
+        &adb,
+        "#!/bin/sh\ncase \"$*\" in *track-devices*) exec sleep 30;; esac\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let apps = dir.join("data/applications");
+    std::fs::create_dir_all(&apps).unwrap();
+    for (pkg, serials) in [("com.a", "A;"), ("com.a2", "A;"), ("com.s", "A;B;")] {
+        std::fs::write(
+            apps.join(format!("lantern.{pkg}.desktop")),
+            format!(
+                "[Desktop Entry]\nType=Application\nName={pkg}\nExec=lantern open {pkg}\n\
+                 Categories=X-Lantern;\nStartupWMClass=lantern.{pkg}\nX-Lantern-Serial=A\n\
+                 X-Lantern-Serials={serials}\nX-Lantern-Package={pkg}\nX-Lantern-User=0\n"
+            ),
+        )
+        .unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
+        .arg("daemon")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .envs(scratch_xdg(&dir))
+        .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
+        .env("PATH", &path)
+        .env_remove("LANTERN_SERIAL")
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_lantern"))
+            .arg("status")
+            .env("XDG_RUNTIME_DIR", &dir)
+            .envs(scratch_xdg(&dir))
+            .output()
+            .unwrap();
+        if output.status.success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "lanternd never answered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The first answer comes after the migration.
+    let menu = std::fs::read_to_string(dir.join("state/lantern/menu.json"));
+    let shared_b = std::fs::read_to_string(apps.join("lantern.com.s-pB.desktop"));
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    let menu: serde_json::Value = serde_json::from_str(&menu.expect("menu.json")).unwrap();
+    assert_eq!(menu, serde_json::json!({"version": 2, "primary": "A"}));
+    let shared_b = shared_b.expect("B's own entry");
+    assert!(
+        shared_b.contains("StartupWMClass=lantern.com.s-pB\n"),
+        "{shared_b}"
+    );
+    assert!(shared_b.contains(" open --phone B com.s\n"), "{shared_b}");
 }
 
 #[test]
