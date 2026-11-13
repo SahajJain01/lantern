@@ -66,17 +66,43 @@ and let him unlock the phone from the PC without picking it up.
   to the helper in one new host → helper message `unlock{pin}` on stream 0. lanternd and the
   helper must never log it; the message type is excluded from every log path (as `ime` and
   `clip` text already are).
-- **Unlock sequence (helper)**, display 0: wake (`KEYCODE_WAKEUP`), panel power on, dismiss the
-  swipe layer (`KEYCODE_MENU` or a swipe-up), wait for the PIN pad, inject the digits as key
-  events, `KEYCODE_ENTER`, wait up to 3 s for `isDeviceLocked()` to turn false, then panel off
-  again. Reply `unlock_result{ok}`. One attempt per `unlock` message.
+- **Unlock sequence (helper)**, every event targeted at display 0 (see the spike): wake
+  (`KEYCODE_WAKEUP`), swipe up (ends a screensaver and opens the PIN pad), check display 0's
+  focus is the keyguard, inject the digits and `KEYCODE_ENTER` as key events, wait up to 3 s for
+  `isDeviceLocked()` to turn false, then put the panel back off if Lantern had it off. Reply
+  `unlock_result{ok}` (or `reason: "lock screen not reached"`). One attempt per `unlock`.
 - **After success**: lanternd re-sends the last PC `clip` it held back, and a window whose open
   failed for the lock retries once.
 
+## Spike result (2026-11-13, Motorola edge 50 pro, Lantern session live, panel off)
+
+The blind PIN path works: **deviceLocked 1 → 0 in 2.3 s** after the digits, with Lantern's
+session (and its Windows App window) running throughout. What it took, and what broke first:
+
+- **Every injected key must target display 0** (`input -d 0`, i.e. `KeyEvent.setDisplayId(0)`).
+  An untargeted key goes to the top-focused display, which during a session is usually a Lantern
+  window: the first attempt typed the digits into Windows App's home screen instead of the lock
+  screen. The helper must inject with an explicit display id, never the default.
+- **The phone may be in its screensaver** (Motorola: `screensaver_enabled=1`, activate while
+  charging; display 0 focus was `com.google.android.deskclock/…DreamActivity`, wakefulness
+  `Dreaming`). `KEYCODE_WAKEUP` alone did not end it; `cmd dreams stop-dreaming` needs root. A
+  swipe-up on display 0 after the wake-up ended the dream and opened the PIN pad: display 0's
+  focus became `NotificationShade`.
+- **Check display 0's focus right before typing** and type only when it is the keyguard
+  (`NotificationShade`); otherwise type nothing and report "couldn't reach the lock screen".
+  After a correct PIN the focus becomes the launcher.
+- `screencap` of display 0 shows black while the keyguard/dream is up (secure layers), so it
+  can't be used to check the screen.
+- Sequence used: `input -d 0 keyevent KEYCODE_WAKEUP`, 0.5 s, `input -d 0 swipe 600 2200 600 600
+  200`, 1 s, focus check, `input -d 0 text <pin>`, `input -d 0 keyevent KEYCODE_ENTER`, poll
+  `deviceLocked` every 0.5 s. The real build injects KeyEvents from the helper (no PIN in any
+  process's arguments, unlike this spike's `input text`).
+- Not yet verified: the Xiaomi (swipe keyguard only, so nothing to unlock), whether the panel
+  physically lit during the attempt, and a wrong PIN.
+
 ## Left to the builder
 
-- Exact waits and the PIN-pad readiness check (verify on both phones; a spike first is
-  recommended: wake + dismiss + digits + Enter with the panel off, on the Motorola).
+- Exact waits; a wrong-PIN run on the Motorola.
 - How the window learns to retry its open (a new error string, like `NOT_ON_THIS_PHONE`).
 - Whether `deviceLocked` is polled or read on demand.
 - The "Try again" path after a wrong PIN (re-open the dialog from the failure notification).
