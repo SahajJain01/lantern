@@ -1,4 +1,4 @@
-# Lantern — handoff (Plan 4a implemented, 2026-11-13)
+# Lantern — handoff (end of Plan 4a, 2026-11-13)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -28,18 +28,17 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   - The SDD ledger and per-task reports are in the main checkout's gitignored
     `.superpowers/sdd/2026-11-10-lantern-phones-and-tray/`.
 - **Plan 4a** (`docs/superpowers/plans/2026-11-13-lantern-unlock-prompt.md`, design
-  `docs/superpowers/specs/2026-11-13-lantern-unlock-prompt-design.md`): **implemented on branch
-  `plan4a-unlock-prompt`, host tests passing, device acceptance passed 2026-11-13** (see "Plan
-  4a device acceptance"). Worktree `.worktrees/plan4a`, base `main` `5d83b8b`. Device steps were
+  `docs/superpowers/specs/2026-11-13-lantern-unlock-prompt-design.md`): **done and merged into
+  `main`** (fast-forward to `08b974b`, 2026-11-13), device acceptance passed (see "Plan 4a
+  device acceptance"). Device steps were
   deferred by Sahaj's instruction to one run at the end (he typed the PIN). Tasks 1–3 each passed their own review after one fix round; Task 4 (tray row,
   item 22, docs) passed review without one. The final branch review asked for two fixes (the
-  keyguard focus check now rejects any `pkg/cls` title; these docs), both done. The SDD ledger and reports are in the worktree's gitignored
-  `.superpowers/sdd/2026-11-13-lantern-unlock-prompt/` (copy it to the main checkout before
-  removing the worktree).
+  keyguard focus check now rejects any `pkg/cls` title; these docs), both done. The SDD ledger and reports are in the main checkout's gitignored
+  `.superpowers/sdd/2026-11-13-lantern-unlock-prompt/`.
   - Host: `cargo test --workspace --offline` 341 passed, 1 ignored; clippy clean (2026-11-13).
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
-Lantern is **installed and running** on the PC from the **Plan 3** branch build (2026-11-13):
+Lantern is **installed and running** on the PC from the **Plan 4a** branch build (2026-11-13; same code as `main` `08b974b`):
 `~/.local/bin/lantern`, user unit `lanternd.service` (enabled). When the phone is plugged in, its
 screen turns off, the Lantern keyboard is selected, and its apps are in the KDE menu under
 **Phone**.
@@ -362,8 +361,7 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
 
 ## Next: Plan 4 (not yet written)
 
-Plan 3 is merged. Plan 4a (unlocking a PIN-locked phone from the PC) is implemented on its branch;
-finish it first: run its device checks, final review, merge. Then write Plan 4 with
+Plans 3 and 4a are merged. Write Plan 4 with
 superpowers:writing-plans and run it with
 superpowers:subagent-driven-development. Candidates (Plan 3's "Out of scope" plus the field
 findings):
