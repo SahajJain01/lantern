@@ -1,4 +1,4 @@
-# Lantern — handoff (Plan 3 implemented and device-accepted, not yet merged, 2026-11-13)
+# Lantern — handoff (end of Plan 3, 2026-11-13)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -20,8 +20,9 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   "Plan 3 device acceptance"). Tasks 1–7 each passed their own review (Tasks 6 and 7 after one fix
   round). The final whole-branch review found 1 important issue (a single `paused` slot let a
   disconnected phone restart) plus 1 minor; both fixed in `8c05253` and re-reviewed clean. Every
-  other `minor (deferred)` line was triaged OK-TO-DEFER (listed under Known minor issues). Not
-  merged yet.
+  other `minor (deferred)` line was triaged OK-TO-DEFER (listed under Known minor issues).
+  Rebased onto `main` and fast-forward merged (`a865291`); the worktree was removed and the SDD
+  ledger copied to the main checkout's gitignored `.superpowers/sdd/`.
   - Host: `cargo test --workspace --offline` 308 passed, 1 ignored (2026-11-13). Helper build:
     170 host-JVM tests, companion build: 41, all passing.
   - The SDD ledger and per-task reports are in the worktree's gitignored
@@ -321,7 +322,8 @@ the Plan 4 list below.
 
 ## Next: Plan 4 (not yet written)
 
-Plan 3 is device-accepted and reviewed; merge `plan3-phones-and-tray` into `main`. Then write Plan 4 with superpowers:writing-plans and run it with
+Plan 3 is merged. Next is Plan 4a, unlocking a PIN-locked phone from the PC (design:
+`docs/superpowers/specs/2026-11-13-lantern-unlock-prompt-design.md`, spike done). Then write Plan 4 with superpowers:writing-plans and run it with
 superpowers:subagent-driven-development. Candidates (Plan 3's "Out of scope" plus the field
 findings):
 
