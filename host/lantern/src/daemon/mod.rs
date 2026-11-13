@@ -246,12 +246,12 @@ where
 fn target(
     configured: Option<&str>,
     connected: &[String],
-    paused: Option<&str>,
+    paused: &[String],
     current: Option<&str>,
 ) -> Option<String> {
     let online: Vec<String> = connected
         .iter()
-        .filter(|serial| Some(serial.as_str()) != paused)
+        .filter(|serial| !paused.contains(serial))
         .cloned()
         .collect();
     select_serial(configured, &online, current).filter(|serial| online.contains(serial))
@@ -287,8 +287,9 @@ type Undoing = Option<(String, BoxFuture<'static, (bool, String)>)>;
 /// device events or clients, and helper death is noticed through `SessionConn::closed`. The live
 /// session's inbound frames are always drained (routed to window clients).
 ///
-/// `paused` (Disconnect, Undo) is set before the session is closed. Nothing starts for a paused
-/// phone until it goes offline or gets Connect, and nothing starts at all while an undo runs.
+/// A phone joins `paused` (Disconnect, Undo) before its session is closed. Nothing starts for a
+/// paused phone until it goes offline or gets Connect, and nothing starts at all while an undo
+/// runs. The most recently paused phone is the one shown and the one Connect resumes.
 #[allow(clippy::too_many_arguments)]
 async fn drive<E, S, F, D>(
     mut hub: Hub,
@@ -325,13 +326,13 @@ where
     let mut starting: Starting<F> = None;
     let mut retry_at: Option<Instant> = None;
     let mut failures: u32 = 0;
-    // The phone the user disconnected (or undid); never a start target while set.
-    let mut paused: Option<String> = None;
+    // The phones the user disconnected (or undid), oldest first; never start targets.
+    let mut paused: Vec<String> = Vec::new();
     let mut undoing: Undoing = None;
 
     loop {
         let idle = active.is_none() && starting.is_none() && undoing.is_none();
-        match (&active, &starting, &paused) {
+        match (&active, &starting, paused.last()) {
             (Some((session, _)), _, _) => hub.set_session(
                 SessionState::Ready,
                 Some(session.serial().to_owned()),
@@ -359,8 +360,8 @@ where
                 Phone::Starting {
                     serial: serial.clone(),
                 }
-            } else if let Some(serial) = retry_at
-                .and_then(|_| target(configured.as_deref(), &connected, paused.as_deref(), None))
+            } else if let Some(serial) =
+                retry_at.and_then(|_| target(configured.as_deref(), &connected, &paused, None))
             {
                 // A start due now (a phone just came online) is as good as starting.
                 if failures > 0 {
@@ -368,7 +369,7 @@ where
                 } else {
                     Phone::Starting { serial }
                 }
-            } else if let Some(serial) = &paused {
+            } else if let Some(serial) = paused.last() {
                 Phone::Paused {
                     serial: serial.clone(),
                 }
@@ -423,11 +424,11 @@ where
                             connected.push(serial.clone());
                         }
                         names.refresh(&serial);
-                        if paused.as_deref() == Some(serial.as_str()) {
+                        if paused.contains(&serial) {
                             tracing::info!(serial, "phone is disconnected in Lantern; not starting");
                         }
                         let current = active.as_ref().map(|(s, _)| s.serial().to_owned());
-                        let target = target(configured.as_deref(), &connected, paused.as_deref(), current.as_deref());
+                        let target = target(configured.as_deref(), &connected, &paused, current.as_deref());
                         if idle && target.as_deref() == Some(serial.as_str()) {
                             failures = 0;
                             retry_at = Some(Instant::now());
@@ -435,11 +436,11 @@ where
                     }
                     DeviceEvent::Offline(serial) => {
                         tracing::info!(serial, "device offline");
-                        let before = target(configured.as_deref(), &connected, paused.as_deref(), None);
+                        let before = target(configured.as_deref(), &connected, &paused, None);
                         connected.retain(|s| *s != serial);
-                        if paused.as_deref() == Some(serial.as_str()) {
+                        if paused.contains(&serial) {
                             tracing::info!(serial, "unplugged: no longer disconnected in Lantern");
-                            paused = None;
+                            paused.retain(|s| *s != serial);
                         }
                         if starting.as_ref().map(|(s, _)| s.as_str()) == Some(serial.as_str()) {
                             cancel_start(&mut starting, "device offline");
@@ -448,7 +449,7 @@ where
                             close_session(&mut active, &mut hub).await;
                         }
                         let current = active.as_ref().map(|(s, _)| s.serial().to_owned());
-                        let after = target(configured.as_deref(), &connected, paused.as_deref(), current.as_deref());
+                        let after = target(configured.as_deref(), &connected, &paused, current.as_deref());
                         let idle = active.is_none() && starting.is_none() && undoing.is_none();
                         match after {
                             None => {
@@ -468,7 +469,7 @@ where
             }
             _ = tokio::time::sleep_until(wake), if idle && retry_at.is_some() => {
                 retry_at = None;
-                if let Some(serial) = target(configured.as_deref(), &connected, paused.as_deref(), None) {
+                if let Some(serial) = target(configured.as_deref(), &connected, &paused, None) {
                     tracing::info!(serial, attempt = failures + 1, "starting session");
                     starting = Some((serial.clone(), Box::pin(starter(serial))));
                 }
@@ -502,7 +503,11 @@ where
                 let (serial, _) = undoing.take().expect("guarded");
                 undo_done(&serial, ok, &output, &mut names, notify.as_ref());
                 // Paused until replugged or connected again (unless it was unplugged meanwhile).
-                paused = connected.contains(&serial).then_some(serial);
+                if connected.contains(&serial) && !paused.contains(&serial) {
+                    paused.push(serial);
+                }
+                // Another online phone is served now.
+                serve_next(configured.as_deref(), &connected, &paused, &mut retry_at, &mut failures);
             }
             event = hub.next_event() => {
                 let helper = active.as_ref().map(|(session, _)| session.tx.clone());
@@ -579,9 +584,7 @@ where
                 .map(|(session, _)| session.serial().to_owned())
                 .or_else(|| starting.as_ref().map(|(serial, _)| serial.clone()))
                 .or_else(|| {
-                    retry_at.and_then(|_| {
-                        target(configured.as_deref(), &connected, paused.as_deref(), None)
-                    })
+                    retry_at.and_then(|_| target(configured.as_deref(), &connected, &paused, None))
                 });
             match cmd {
                 Command::Disconnect => {
@@ -591,26 +594,37 @@ where
                     };
                     tracing::info!(serial, "disconnected in Lantern");
                     // Paused first: nothing may restart it while the session closes.
-                    paused = Some(serial);
+                    pause(&mut paused, serial);
                     retry_at = None;
                     failures = 0;
                     cancel_start(&mut starting, "disconnected in Lantern");
                     // `bye`: the helper restores the phone.
                     close_session(&mut active, &mut hub).await;
+                    // Another online phone is served now.
+                    serve_next(
+                        configured.as_deref(),
+                        &connected,
+                        &paused,
+                        &mut retry_at,
+                        &mut failures,
+                    );
                 }
                 Command::Connect => {
-                    if let Some(serial) = paused.take() {
+                    // Only the phone the view shows: a served phone hides the paused ones.
+                    if live.is_some() {
+                        tracing::info!("connect: a phone is already being served");
+                        continue;
+                    }
+                    if let Some(serial) = paused.pop() {
                         tracing::info!(serial, "connected in Lantern");
                     }
-                    let current = active.as_ref().map(|(s, _)| s.serial().to_owned());
-                    let idle = active.is_none() && starting.is_none();
-                    if idle
-                        && target(configured.as_deref(), &connected, None, current.as_deref())
-                            .is_some()
-                    {
-                        failures = 0;
-                        retry_at = Some(Instant::now());
-                    }
+                    serve_next(
+                        configured.as_deref(),
+                        &connected,
+                        &paused,
+                        &mut retry_at,
+                        &mut failures,
+                    );
                 }
                 Command::UndoSetup => {
                     let Some(run) = &undo else {
@@ -618,14 +632,14 @@ where
                         continue;
                     };
                     let serial = live
-                        .or_else(|| paused.clone())
+                        .or_else(|| paused.last().cloned())
                         .filter(|serial| connected.contains(serial));
                     let Some(serial) = serial else {
                         tracing::info!("undo-setup: no phone online");
                         continue;
                     };
                     tracing::info!(serial, "undo-setup requested");
-                    paused = Some(serial.clone());
+                    pause(&mut paused, serial.clone());
                     retry_at = None;
                     failures = 0;
                     cancel_start(&mut starting, "undo-setup");
@@ -637,6 +651,28 @@ where
                 Command::Quit => unreachable!("Quit is handled when it arrives"),
             }
         }
+    }
+}
+
+/// Adds `serial` to `paused` as its most recent phone.
+fn pause(paused: &mut Vec<String>, serial: String) {
+    paused.retain(|s| *s != serial);
+    paused.push(serial);
+}
+
+/// Schedules a start now (a fresh backoff) if an online phone that is not paused is a target.
+/// Called only when nothing is live, starting or undoing.
+fn serve_next(
+    configured: Option<&str>,
+    connected: &[String],
+    paused: &[String],
+    retry_at: &mut Option<Instant>,
+    failures: &mut u32,
+) {
+    if let Some(serial) = target(configured, connected, paused, None) {
+        tracing::info!(serial, "next online phone");
+        *failures = 0;
+        *retry_at = Some(Instant::now());
     }
 }
 
@@ -822,14 +858,17 @@ mod tests {
     #[test]
     fn target_skips_the_paused_phone() {
         let both = online(&["a", "b"]);
-        assert_eq!(target(None, &both, None, None), Some("a".into()));
-        assert_eq!(target(None, &both, Some("a"), None), Some("b".into()));
-        assert_eq!(target(None, &both, Some("a"), Some("a")), Some("b".into()));
-        assert_eq!(target(None, &online(&["a"]), Some("a"), None), None);
+        let a = online(&["a"]);
+        assert_eq!(target(None, &both, &[], None), Some("a".into()));
+        assert_eq!(target(None, &both, &a, None), Some("b".into()));
+        assert_eq!(target(None, &both, &a, Some("a")), Some("b".into()));
+        assert_eq!(target(None, &a, &a, None), None);
+        // Every paused phone is skipped.
+        assert_eq!(target(None, &both, &online(&["b", "a"]), None), None);
         // A configured phone is the only target: paused or offline means none.
-        assert_eq!(target(Some("a"), &both, Some("a"), None), None);
-        assert_eq!(target(Some("x"), &both, None, None), None);
-        assert_eq!(target(Some("b"), &both, Some("a"), None), Some("b".into()));
+        assert_eq!(target(Some("a"), &both, &a, None), None);
+        assert_eq!(target(Some("x"), &both, &[], None), None);
+        assert_eq!(target(Some("b"), &both, &a, None), Some("b".into()));
     }
 
     #[test]

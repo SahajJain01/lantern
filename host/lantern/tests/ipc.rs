@@ -2062,3 +2062,87 @@ async fn offline_of_live_phone_skips_a_paused_phone() {
     assert_eq!(report.serial.as_deref(), Some("c"));
     ctl.shutdown().await;
 }
+
+/// Every disconnected phone stays disconnected: pausing a second phone does not un-pause the
+/// first, so unplugging the second starts nothing.
+#[tokio::test]
+async fn second_disconnect_keeps_the_first_phone_paused() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let mut ctl = start_ctl(port, &["a"], None);
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("a").await;
+    ctl.command(Command::Disconnect).await;
+    expect_bye(&mut helper).await;
+    ctl.view_until(|p| *p == paused("a")).await;
+    ctl.online("b");
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("b").await;
+    ctl.command(Command::Disconnect).await;
+    expect_bye(&mut helper).await;
+    // The most recent disconnected phone is shown.
+    ctl.view_until(|p| *p == paused("b")).await;
+    ctl.offline("b");
+    ctl.view_until(|p| *p == paused("a")).await;
+    assert_no_session(&mut helper).await;
+    assert_eq!(ctl.view.borrow().phone, paused("a"));
+    let report = status(&ctl.sock).await;
+    assert_eq!(
+        (report.state, report.serial.as_deref()),
+        (SessionState::Paused, Some("a"))
+    );
+    // Connect resumes the phone shown.
+    ctl.command(Command::Connect).await;
+    assert_eq!(helper.next_session().await, 2);
+    ctl.ready("a").await;
+    ctl.shutdown().await;
+}
+
+/// Disconnect with another phone online: that phone is served at once.
+#[tokio::test]
+async fn disconnect_starts_the_other_online_phone() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let mut ctl = start_ctl(port, &["a", "b"], None);
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("a").await;
+    ctl.command(Command::Disconnect).await;
+    expect_bye(&mut helper).await;
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("b").await;
+    let report = status(&ctl.sock).await;
+    assert_eq!(report.serial.as_deref(), Some("b"));
+    ctl.shutdown().await;
+}
+
+/// When an undo ends with another phone online, that phone is served; the undone one stays
+/// paused.
+#[tokio::test]
+async fn undo_end_starts_the_other_online_phone() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let undo: UndoRunner = Arc::new(move |_serial: String| {
+        let gate = gate.clone();
+        Box::pin(async move {
+            gate.acquire().await.unwrap().forget();
+            (true, "companion: uninstalled".to_owned())
+        })
+    });
+    let mut ctl = start_ctl(port, &["a", "b"], Some(undo));
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("a").await;
+    ctl.command(Command::UndoSetup).await;
+    expect_bye(&mut helper).await;
+    ctl.view_until(|p| matches!(p, Phone::Undoing { serial } if serial == "a"))
+        .await;
+    // Nothing starts while the undo runs.
+    assert_no_session(&mut helper).await;
+    release.add_permits(1);
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("b").await;
+    // b goes away: a is still paused, so nothing starts.
+    ctl.offline("b");
+    expect_bye(&mut helper).await;
+    ctl.view_until(|p| *p == paused("a")).await;
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
