@@ -23,7 +23,8 @@ use zbus::Connection;
 use crate::daemon::control::{Command, View};
 use crate::settings::{self, Key, Settings, SettingsHandle};
 use crate::unlock;
-use menu::{Action, Item};
+use lantern_proto::PhoneState;
+use menu::{Action, Item, Slots};
 
 pub(crate) const MENU_PATH: &str = "/MenuBar";
 const SNI_PATH: &str = "/StatusNotifierItem";
@@ -44,11 +45,19 @@ pub(crate) struct State {
     /// The dbusmenu layout revision, bumped whenever `items` changes.
     pub(crate) revision: u32,
     pub(crate) items: Vec<Item>,
+    /// Each phone's row ids, bound to its serial for the tray's lifetime.
+    slots: Slots,
 }
 
 impl State {
     fn rebuild(&mut self) -> bool {
-        let items = menu::items(&self.view, &self.settings, self.login, self.settings_error);
+        let items = menu::items(
+            &self.view,
+            &self.settings,
+            self.login,
+            self.settings_error,
+            &mut self.slots,
+        );
         if items == self.items {
             return false;
         }
@@ -131,6 +140,7 @@ pub async fn run(
         login,
         revision: 0,
         items: Vec::new(),
+        slots: Slots::default(),
     };
     state.rebuild();
     let shared = Arc::new(Shared {
@@ -321,26 +331,16 @@ fn send(shared: &Shared, cmd: Command) {
     }
 }
 
-/// The serial of the phone the menu shows now.
-fn shown_serial(shared: &Shared) -> Option<String> {
-    menu::shown(&shared.state().view).map(|p| p.serial.clone())
-}
-
 /// Does what a menu click asks. Returns at once; slow work runs in its own task.
 pub(crate) fn perform(shared: &Arc<Shared>, action: Action) {
     match action {
-        // Row 3 acts on the phone the menu shows.
-        Action::Connect => match shown_serial(shared) {
-            Some(serial) => send(shared, Command::Connect { serial, open: None }),
-            None => tracing::info!("tray: no phone to connect; click dropped"),
-        },
-        Action::Disconnect => match shown_serial(shared) {
-            Some(serial) => send(shared, Command::Disconnect { serial }),
-            None => tracing::info!("tray: no phone to disconnect; click dropped"),
-        },
+        // A phone row names its phone; lanternd refuses a serial it doesn't know.
+        Action::Connect { serial } => send(shared, Command::Connect { serial, open: None }),
+        Action::Disconnect { serial } => send(shared, Command::Disconnect { serial }),
         Action::Quit => send(shared, Command::Quit),
         Action::ToggleClipboard => toggle(shared, Key::ClipboardSync),
         Action::ToggleKeyboard => toggle(shared, Key::LanternKeyboard),
+        Action::ToggleAutoconnect => toggle(shared, Key::Autoconnect),
         Action::ToggleLogin => {
             let shared = shared.clone();
             tokio::spawn(async move { toggle_login(&shared).await });
@@ -348,14 +348,14 @@ pub(crate) fn perform(shared: &Arc<Shared>, action: Action) {
         Action::OpenSettings => {
             tokio::spawn(open_settings(shared.settings.clone()));
         }
-        Action::UndoSetup => {
+        Action::UndoSetup { serial } => {
             let shared = shared.clone();
-            tokio::spawn(async move { confirm_undo(&shared).await });
+            tokio::spawn(async move { confirm_undo(&shared, serial).await });
         }
-        // The same request as the notification's action: the prompt pins the phone shown at
-        // the click and opens one dialog at a time.
-        Action::Unlock => match &shared.unlock {
-            Some(request) => request.ask(),
+        // The same request as the notification's action: the prompt opens a dialog only for
+        // the live, locked phone, pins the answer to it and opens one dialog at a time.
+        Action::Unlock { serial } => match &shared.unlock {
+            Some(request) => request.ask(serial),
             None => tracing::warn!("tray: no unlock prompt (no notification bus); click dropped"),
         },
     }
@@ -432,21 +432,24 @@ fn undo_question(name: &str) -> String {
     )
 }
 
-/// Whether an Undo the user confirmed may go ahead: only when the phone the dialog named
-/// (`clicked`) is still the phone the tray shows (`now`).
-fn confirm_target(clicked: Option<&str>, now: Option<&str>) -> bool {
-    clicked.is_some() && clicked == now
+/// Whether an Undo the user confirmed for `serial` may go ahead: only while that phone is
+/// still plugged in (and not already being undone) in the current view.
+fn may_undo(view: &View, serial: &str) -> bool {
+    view.phone(serial)
+        .is_some_and(|p| p.plugged && p.state != PhoneState::Undoing)
 }
 
-/// Asks with kdialog; on "Remove" (exit 0) sends `Command::UndoSetup`, but only if the phone
-/// is still the one the dialog named. Without kdialog it only shows a notification.
-async fn confirm_undo(shared: &Shared) {
-    let (name, clicked) = {
+/// Asks with kdialog, naming the phone clicked (`serial`); on "Remove" (exit 0) sends
+/// `Command::UndoSetup{serial}`, but only if that phone is still plugged in (R9: the confirm is
+/// pinned to the phone it named). Without kdialog it only shows a notification.
+async fn confirm_undo(shared: &Shared, serial: String) {
+    let name = {
         let state = shared.state();
-        (
-            menu::name(&state.view).to_owned(),
-            menu::shown(&state.view).map(|p| p.serial.clone()),
-        )
+        state
+            .view
+            .phone(&serial)
+            .map_or(serial.as_str(), |p| p.display_name())
+            .to_owned()
     };
     let question = undo_question(&name);
     let spawned = tokio::task::spawn_blocking(move || {
@@ -468,8 +471,8 @@ async fn confirm_undo(shared: &Shared) {
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!("tray: kdialog is missing; undo-setup not asked");
             crate::notify::send(
-                "Lantern can't ask before undoing phone setup",
-                "Install kdialog to use Undo phone setup from the tray.",
+                "Lantern can't ask before removing itself from a phone",
+                "Install kdialog to use \"Remove Lantern from a phone\" from the tray.",
                 None,
             );
             return;
@@ -485,20 +488,24 @@ async fn confirm_undo(shared: &Shared) {
     };
     match child.wait().await {
         Ok(status) if status.code() == Some(0) => {
-            let now = shown_serial(shared);
-            if let (true, Some(serial)) = (confirm_target(clicked.as_deref(), now.as_deref()), now)
-            {
+            if may_undo(&shared.state().view, &serial) {
                 send(shared, Command::UndoSetup { serial });
             } else {
-                tracing::info!("undo cancelled: the phone changed while asking");
+                tracing::info!(
+                    serial,
+                    "undo cancelled: the phone was unplugged while asking"
+                );
                 crate::notify::send(
                     "Undo phone setup cancelled",
-                    "The phone changed while Lantern was asking. Choose \"Undo phone setup…\" again.",
+                    &format!(
+                        "{name} was unplugged while Lantern was asking. Plug it in and choose \
+                         \"Remove Lantern from a phone…\" again."
+                    ),
                     None,
                 );
             }
         }
-        Ok(_) => tracing::info!("tray: undo-setup cancelled"),
+        Ok(_) => tracing::info!(serial, "tray: undo-setup cancelled"),
         Err(error) => tracing::warn!(%error, "tray: kdialog wait failed"),
     }
 }
@@ -506,26 +513,37 @@ async fn confirm_undo(shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::control::PhoneView;
 
-    #[test]
-    fn confirm_target_same_phone() {
-        assert!(confirm_target(Some("A"), Some("A")));
+    fn phone(serial: &str, state: PhoneState, plugged: bool) -> PhoneView {
+        PhoneView {
+            serial: serial.into(),
+            name: None,
+            state,
+            plugged,
+            off: false,
+            locked: false,
+            companion: None,
+        }
     }
 
     #[test]
-    fn confirm_target_phone_changed() {
-        assert!(!confirm_target(Some("A"), Some("B")));
-    }
-
-    #[test]
-    fn confirm_target_phone_gone() {
-        assert!(!confirm_target(Some("A"), None));
-    }
-
-    #[test]
-    fn confirm_target_no_phone_when_clicked() {
-        assert!(!confirm_target(None, None));
-        assert!(!confirm_target(None, Some("A")));
+    fn may_undo_only_a_plugged_phone_it_named() {
+        let view = View {
+            phones: vec![
+                phone("A", PhoneState::Ready, true),
+                phone("B", PhoneState::Waiting, true),
+                phone("C", PhoneState::Unplugged, false),
+                phone("D", PhoneState::Undoing, true),
+            ],
+        };
+        assert!(may_undo(&view, "A"));
+        // Another phone being connected doesn't matter: the answer stays with its phone.
+        assert!(may_undo(&view, "B"));
+        assert!(!may_undo(&view, "C"), "unplugged while asking");
+        assert!(!may_undo(&view, "D"), "already being undone");
+        assert!(!may_undo(&view, "E"), "gone from the view");
+        assert!(!may_undo(&View::default(), "A"));
     }
 
     #[test]
@@ -549,6 +567,7 @@ mod tests {
                 login: None,
                 revision: 0,
                 items: Vec::new(),
+                slots: Slots::default(),
             }),
             commands: tx,
             unlock: None,

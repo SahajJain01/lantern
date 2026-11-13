@@ -573,17 +573,17 @@ async fn answer_after_the_stretch_ended_is_dropped() {
 async fn request_prompts_only_while_locked() {
     let mut rig = Rig::start(true, echo_prompt("1234")).await;
     // Not locked yet (or the click raced the unlock): no dialog.
-    rig.request.ask();
+    rig.request.ask("s1".into());
     rig.assert_no_pin().await;
     rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
     rig.notify_id(1).await;
-    rig.request.ask();
+    rig.request.ask("s1".into());
     assert_eq!(rig.next_pin().await, pin("1234"));
     rig.assert_no_pin().await;
     // After the stretch ends, a request does nothing again.
     rig.send(LockEvent::Unlocked).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    rig.request.ask();
+    rig.request.ask("s1".into());
     rig.assert_no_pin().await;
 }
 
@@ -594,13 +594,28 @@ async fn second_click_while_dialog_open_does_nothing() {
     let mut rig = Rig::start(true, slow_prompt("0.5", "1234")).await;
     rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
     let id = rig.notify_id(1).await;
-    rig.request.ask();
+    rig.request.ask("s1".into());
     tokio::time::sleep(Duration::from_millis(100)).await;
     rig.click(id, "unlock").await;
-    rig.request.ask();
+    rig.request.ask("s1".into());
     assert_eq!(rig.next_pin().await, pin("1234"));
     rig.assert_no_pin_within(Duration::from_millis(1500)).await;
     // Once it answered, the next click opens a new one.
     rig.click(id, "unlock").await;
     assert_eq!(rig.next_pin().await, pin("1234"));
+}
+
+/// The tray's request names its phone: a request for a phone that isn't the live, locked one
+/// opens no dialog (the answer would go to another phone).
+#[tokio::test]
+async fn tray_request_for_another_phone_opens_nothing() {
+    let mut rig = Rig::start(true, echo_prompt("1234")).await;
+    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.notify_id(1).await;
+    rig.request.ask("s2".into());
+    rig.assert_no_pin().await;
+    // The live phone's own request still prompts, pinned to it.
+    rig.request.ask("s1".into());
+    assert_eq!(rig.next_pin().await, pin("1234"));
+    rig.assert_no_pin().await;
 }

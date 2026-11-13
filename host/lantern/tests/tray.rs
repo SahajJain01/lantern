@@ -215,35 +215,47 @@ impl Tray {
         reply.body().deserialize().unwrap()
     }
 
-    /// `GetLayout(0, -1, [])`: the revision and `(id, label)` per row (`""` for separators).
-    async fn layout(&self) -> (u32, Vec<(i32, String)>) {
-        type Layout = (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>));
-        let (revision, (root, props, children)): Layout = self
+    /// `GetLayout(parent, -1, [])`: the revision, the parent's id and properties, and its
+    /// rows.
+    async fn get_layout(&self, parent: i32) -> (u32, Row) {
+        let (revision, (id, props, children)): (u32, Layout) = self
             .call(
                 "/MenuBar",
                 "com.canonical.dbusmenu",
                 "GetLayout",
-                &(0i32, -1i32, Vec::<String>::new()),
+                &(parent, -1i32, Vec::<String>::new()),
             )
             .await;
-        assert_eq!(root, 0);
-        assert_eq!(
-            String::try_from(props["children-display"].try_clone().unwrap()).unwrap(),
-            "submenu"
-        );
-        let rows = children
-            .into_iter()
-            .map(|child| {
-                let (id, props, _): (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>) =
-                    Value::from(child).try_into().unwrap();
-                let label = props
-                    .get("label")
-                    .map(|l| String::try_from(l.try_clone().unwrap()).unwrap())
-                    .unwrap_or_default();
-                (id, label)
-            })
-            .collect();
-        (revision, rows)
+        assert_eq!(id, parent);
+        (revision, Row::parse(id, props, children))
+    }
+
+    /// `GetLayout(0, -1, [])`: the revision and `(id, label)` per row (`""` for separators).
+    async fn layout(&self) -> (u32, Vec<(i32, String)>) {
+        let (revision, root) = self.get_layout(0).await;
+        assert_eq!(root.string("children-display"), "submenu");
+        (revision, root.labels())
+    }
+
+    /// Row `id`'s `toggle-state` (`GetProperty`).
+    async fn toggle_state(&self, id: i32) -> i32 {
+        let value: OwnedValue = self
+            .call(
+                "/MenuBar",
+                "com.canonical.dbusmenu",
+                "GetProperty",
+                &(id, "toggle-state"),
+            )
+            .await;
+        i32::try_from(value).unwrap()
+    }
+
+    /// The next command the tray sent, within `within`.
+    async fn command(&mut self, within: Duration) -> Command {
+        tokio::time::timeout(within, self.commands.recv())
+            .await
+            .expect("no command in time")
+            .expect("commands closed")
     }
 
     async fn click(&self, id: i32) {
@@ -255,6 +267,48 @@ impl Tray {
                 &(id, "clicked", Value::I32(0), 0u32),
             )
             .await;
+    }
+}
+
+type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+
+/// A dbusmenu row and its rows, as `GetLayout` gives them.
+struct Row {
+    id: i32,
+    props: HashMap<String, OwnedValue>,
+    children: Vec<Row>,
+}
+
+impl Row {
+    fn parse(id: i32, props: HashMap<String, OwnedValue>, children: Vec<OwnedValue>) -> Self {
+        let children = children
+            .into_iter()
+            .map(|child| {
+                let (id, props, children): Layout = Value::from(child).try_into().unwrap();
+                Row::parse(id, props, children)
+            })
+            .collect();
+        Self {
+            id,
+            props,
+            children,
+        }
+    }
+
+    /// A string property, `""` when absent.
+    fn string(&self, name: &str) -> String {
+        self.props
+            .get(name)
+            .map(|v| String::try_from(v.try_clone().unwrap()).unwrap())
+            .unwrap_or_default()
+    }
+
+    /// `(id, label)` per child row.
+    fn labels(&self) -> Vec<(i32, String)> {
+        self.children
+            .iter()
+            .map(|row| (row.id, row.string("label")))
+            .collect()
     }
 }
 
@@ -275,20 +329,22 @@ async fn registers_and_serves_layout() {
     assert_eq!(
         without_login(rows),
         owned(&[
-            (1, "Connected to Test Phone"),
-            (3, "Disconnect"),
+            (100, "Test Phone"),
             (4, ""),
             (5, "Sync clipboard"),
             (
                 6,
                 "Type with the Lantern keyboard (from the next connection)"
             ),
+            (14, "Connect phones when plugged in"),
             (8, "Open settings folder"),
             (9, ""),
-            (10, "Undo phone setup…"),
+            (10, "Remove Lantern from a phone…"),
             (11, "Quit Lantern"),
         ])
     );
+    // The phone row is a checkmark, on while the phone is live.
+    assert_eq!(tray.toggle_state(100).await, 1);
     let status: OwnedValue = tray
         .call(
             "/StatusNotifierItem",
@@ -315,18 +371,63 @@ async fn registers_and_serves_layout() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn click_sends_command() {
+async fn click_phone_row_sends_connect_or_disconnect() {
     let mut tray = Tray::start().await;
-    tray.click(3).await;
-    let cmd = tokio::time::timeout(Duration::from_secs(2), tray.commands.recv())
-        .await
-        .expect("no command within 2 s");
+    tray.click(100).await;
     assert_eq!(
-        cmd,
-        Some(Command::Disconnect {
+        tray.command(Duration::from_secs(2)).await,
+        Command::Disconnect {
             serial: "s1".into()
-        })
+        }
     );
+    // Switched off: the same row is unchecked and connects it.
+    tray.view.send_replace(one(PhoneState::Off));
+    wait_for_toggle(&tray, 100, 0).await;
+    tray.click(100).await;
+    assert_eq!(
+        tray.command(Duration::from_secs(2)).await,
+        Command::Connect {
+            serial: "s1".into(),
+            open: None
+        }
+    );
+}
+
+/// Waits until row `id`'s `toggle-state` is `want`.
+async fn wait_for_toggle(tray: &Tray, id: i32, want: i32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while tray.toggle_state(id).await != want {
+        assert!(
+            Instant::now() < deadline,
+            "row {id} never had toggle-state {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn autoconnect_toggle_writes_settings() {
+    let tray = Tray::start().await;
+    let path = tray.settings_path.clone();
+    let read = move || -> Option<bool> {
+        let text = std::fs::read_to_string(&path).ok()?;
+        lantern::settings::parse(&text)
+            .ok()
+            .map(|(s, _)| s.autoconnect)
+    };
+    assert_eq!(tray.toggle_state(14).await, 0, "autoconnect defaults off");
+    tray.click(14).await;
+    let r = read.clone();
+    wait_for("autoconnect = true", Duration::from_secs(5), || {
+        (r() == Some(true)).then_some(())
+    })
+    .await;
+    wait_for_toggle(&tray, 14, 1).await;
+    tray.click(14).await;
+    wait_for("autoconnect = false", Duration::from_secs(5), || {
+        (read() == Some(false)).then_some(())
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -379,8 +480,8 @@ async fn view_change_emits_layout_updated() {
     assert!(revision > before, "{revision} after {before}");
     let (now, rows) = tray.layout().await;
     assert!(now >= revision);
-    assert_eq!(rows[0], (1, "Disconnected from Test Phone".to_owned()));
-    assert_eq!(rows[1], (3, "Connect".to_owned()));
+    assert_eq!(rows[0], (100, "Test Phone".to_owned()));
+    assert_eq!(tray.toggle_state(100).await, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -398,7 +499,7 @@ async fn reregisters_when_watcher_returns() {
 }
 
 /// The Unlock row takes the notification action's path: the unlock prompt opens its PIN dialog
-/// and hands the PIN on tagged with the phone shown at the click; the tray never sees the PIN.
+/// and hands the PIN on tagged with the row's phone; the tray never sees the PIN.
 /// A second click while the dialog is open does nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn unlock_row_click_prompts() {
@@ -428,10 +529,11 @@ async fn unlock_row_click_prompts() {
         .await
         .unwrap();
     let (_, rows) = tray.layout().await;
-    assert_eq!(rows[0], (1, "Connected to Test Phone (locked)".to_owned()));
-    assert_eq!(rows[1], (13, "Unlock Test Phone…".to_owned()));
-    tray.click(13).await;
-    tray.click(13).await;
+    assert_eq!(rows[0], (100, "Test Phone".to_owned()));
+    assert_eq!(rows[1], (101, "Locked".to_owned()));
+    assert_eq!(rows[2], (102, "Unlock Test Phone…".to_owned()));
+    tray.click(102).await;
+    tray.click(102).await;
     let (serial, pin) = tokio::time::timeout(Duration::from_secs(5), pins.recv())
         .await
         .expect("no PIN within 5 s")
@@ -447,41 +549,173 @@ async fn unlock_row_click_prompts() {
 
 const CHILD: &str = "LANTERN_TRAY_TEST_CHILD";
 
-#[test]
-fn no_bus_leaves_daemon_running() {
-    if std::env::var_os(CHILD).is_some() {
-        // In the child: the session bus address is a socket nobody listens on.
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let (_view, view_rx) = watch::channel(ready());
-            let (tx, _rx) = mpsc::channel(8);
-            let settings = SettingsHandle::new(None);
-            assert!(lantern::tray::spawn(view_rx, settings, tx, None)
-                .await
-                .is_none());
-        });
-        return;
-    }
+/// Whether this process is a child [`run_child`] started.
+fn is_child() -> bool {
+    std::env::var_os(CHILD).is_some()
+}
+
+/// Runs test `name` again in a child process with `envs` set (and a fresh scratch dir for
+/// them, removed after), and asserts it passed; the child then runs the test's body. A child
+/// keeps the process environment (PATH, the session bus) away from the other tests running in
+/// this one.
+fn run_child(name: &str, envs: impl FnOnce(&std::path::Path) -> Vec<(&'static str, String)>) {
     let dir = scratch();
-    let dead = dir.join("dead");
-    drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+    let envs = envs(&dir);
     let out = Process::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "no_bus_leaves_daemon_running",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
-        .env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}", dead.display()),
-        )
+        .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
         .output()
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(stdout.contains("1 passed"), "{stdout}");
+}
+
+/// A dead session bus address (a socket nobody listens on) in `dir`.
+fn dead_bus(dir: &std::path::Path) -> String {
+    let dead = dir.join("dead");
+    drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+    format!("unix:path={}", dead.display())
+}
+
+/// The environment for a Remove-submenu child: a PATH whose `kdialog` answers "Remove" (exit
+/// 0) after `$LANTERN_FAKE_KDIALOG_SLEEP` seconds and whose `notify-send` appends its
+/// arguments to `<dir>/notes`, and a dead session bus (nothing reaches the real desktop).
+fn fake_desktop(dir: &std::path::Path, kdialog_sleep: &str) -> Vec<(&'static str, String)> {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let scripts = [
+        (
+            "kdialog",
+            "#!/bin/sh\nsleep \"${LANTERN_FAKE_KDIALOG_SLEEP:-0}\"\nexit 0\n".to_owned(),
+        ),
+        (
+            "notify-send",
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n",
+                dir.join("notes").display()
+            ),
+        ),
+    ];
+    for (name, text) in scripts {
+        let path = bin.join(name);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    vec![
+        ("PATH", path),
+        ("DBUS_SESSION_BUS_ADDRESS", dead_bus(dir)),
+        ("LANTERN_FAKE_KDIALOG_SLEEP", kdialog_sleep.to_owned()),
+        (
+            "LANTERN_FAKE_NOTES",
+            dir.join("notes").display().to_string(),
+        ),
+    ]
+}
+
+/// The Remove submenu: `GetLayout(10)` gives its rows, nested ids answer `GetProperty` and
+/// `GetGroupProperties`, and a click on a phone's entry goes through the kdialog confirm (faked:
+/// "Remove") to `UndoSetup{serial}`.
+#[test]
+fn submenu_layout_and_click() {
+    if !is_child() {
+        return run_child("submenu_layout_and_click", |dir| fake_desktop(dir, "0"));
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut tray = Tray::start().await;
+        let (_, submenu) = tray.get_layout(10).await;
+        assert_eq!(submenu.string("children-display"), "submenu");
+        assert_eq!(submenu.string("label"), "Remove Lantern from a phone…");
+        assert_eq!(submenu.labels(), owned(&[(150, "Test Phone")]));
+        // The root's layout carries the submenu's rows too.
+        let (_, root) = tray.get_layout(0).await;
+        let row = root.children.iter().find(|r| r.id == 10).unwrap();
+        assert_eq!(row.labels(), owned(&[(150, "Test Phone")]));
+        let label: OwnedValue = tray
+            .call(
+                "/MenuBar",
+                "com.canonical.dbusmenu",
+                "GetProperty",
+                &(150i32, "label"),
+            )
+            .await;
+        assert_eq!(String::try_from(label).unwrap(), "Test Phone");
+        let group: Vec<(i32, HashMap<String, OwnedValue>)> = tray
+            .call(
+                "/MenuBar",
+                "com.canonical.dbusmenu",
+                "GetGroupProperties",
+                &(vec![150i32], vec!["enabled".to_owned()]),
+            )
+            .await;
+        assert_eq!(group.len(), 1);
+        assert_eq!(group[0].0, 150);
+        assert!(bool::try_from(group[0].1["enabled"].try_clone().unwrap()).unwrap());
+        tray.click(150).await;
+        assert_eq!(
+            tray.command(Duration::from_secs(5)).await,
+            Command::UndoSetup {
+                serial: "s1".into()
+            }
+        );
+    });
+}
+
+/// R9: the confirm is pinned to the phone it named. Unplugged while kdialog was open, the
+/// "Remove" answer sends nothing and says so.
+#[test]
+fn remove_cancelled_when_the_phone_was_unplugged() {
+    if !is_child() {
+        let name = "remove_cancelled_when_the_phone_was_unplugged";
+        return run_child(name, |dir| fake_desktop(dir, "1"));
+    }
+    let notes = PathBuf::from(std::env::var("LANTERN_FAKE_NOTES").unwrap());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut tray = Tray::start().await;
+        tray.click(150).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tray.view.send_modify(|view| {
+            view.phones[0].state = PhoneState::Unplugged;
+            view.phones[0].plugged = false;
+            view.phones[0].companion = None;
+        });
+        if let Ok(cmd) = tokio::time::timeout(Duration::from_secs(3), tray.commands.recv()).await {
+            panic!("a command after the phone was unplugged: {cmd:?}");
+        }
+        let text = wait_for("the cancelled notice", Duration::from_secs(2), || {
+            std::fs::read_to_string(&notes).ok()
+        })
+        .await;
+        assert!(text.contains("Undo phone setup cancelled"), "{text}");
+    });
+}
+
+#[test]
+fn no_bus_leaves_daemon_running() {
+    if !is_child() {
+        return run_child("no_bus_leaves_daemon_running", |dir| {
+            vec![("DBUS_SESSION_BUS_ADDRESS", dead_bus(dir))]
+        });
+    }
+    // In the child: the session bus address is a socket nobody listens on.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let (_view, view_rx) = watch::channel(ready());
+        let (tx, _rx) = mpsc::channel(8);
+        let settings = SettingsHandle::new(None);
+        assert!(lantern::tray::spawn(view_rx, settings, tx, None)
+            .await
+            .is_none());
+    });
 }

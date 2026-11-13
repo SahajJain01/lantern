@@ -1,7 +1,9 @@
 //! `com.canonical.dbusmenu` at `/MenuBar`: the tray's menu, built from [`menu::items`].
 //!
-//! The layout is one level deep (root 0 with every row as a child). Each row carries `label`,
-//! `enabled`, `visible`, and `type = "separator"` or `toggle-type`/`toggle-state` as needed.
+//! The root (id 0) has every top-level row as a child; a submenu row (`children-display =
+//! "submenu"`) has its own rows. Each row carries `label`, `enabled`, `visible`, and
+//! `type = "separator"` or `toggle-type`/`toggle-state` as needed. Every method finds rows at
+//! any depth.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +47,11 @@ pub(crate) fn properties(item: &Item, names: &[String]) -> HashMap<String, Owned
             props.push(("toggle-type", owned("checkmark")));
             props.push(("toggle-state", owned(i32::from(*on))));
         }
+        Item::Submenu { text, .. } => {
+            props.push(("label", owned(escape(text))));
+            props.push(("enabled", owned(true)));
+            props.push(("children-display", owned("submenu")));
+        }
     }
     props
         .into_iter()
@@ -63,6 +70,27 @@ fn root_properties(names: &[String]) -> HashMap<String, OwnedValue> {
 }
 
 type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+
+/// The layouts of `items`, each with its own rows while `depth` allows (`-1`: all levels,
+/// `0`: none).
+fn children(items: &[Item], depth: i32, names: &[String]) -> Vec<OwnedValue> {
+    if depth == 0 {
+        return Vec::new();
+    }
+    items
+        .iter()
+        .map(|item| owned(layout(item, depth - i32::from(depth > 0), names)))
+        .collect()
+}
+
+/// `item`'s layout with its rows down to `depth` more levels.
+fn layout(item: &Item, depth: i32, names: &[String]) -> Layout {
+    (
+        item.id(),
+        properties(item, names),
+        children(item.children(), depth, names),
+    )
+}
 
 pub struct Menu {
     pub(crate) shared: Arc<Shared>,
@@ -101,7 +129,8 @@ impl Menu {
         Vec::new()
     }
 
-    /// The layout under `parent_id`: the root with every row, or one row (no children).
+    /// The layout under `parent_id` (the root 0 or any row, submenu rows included), its rows
+    /// down to `recursion_depth` levels (`-1`: all).
     fn get_layout(
         &self,
         parent_id: i32,
@@ -110,28 +139,11 @@ impl Menu {
     ) -> fdo::Result<(u32, Layout)> {
         let (revision, items) = self.items();
         if parent_id == 0 {
-            let children = if recursion_depth == 0 {
-                Vec::new()
-            } else {
-                items
-                    .iter()
-                    .map(|item| {
-                        let child: Layout =
-                            (item.id(), properties(item, &property_names), Vec::new());
-                        owned(child)
-                    })
-                    .collect()
-            };
-            return Ok((revision, (0, root_properties(&property_names), children)));
+            let rows = children(&items, recursion_depth, &property_names);
+            return Ok((revision, (0, root_properties(&property_names), rows)));
         }
-        let item = items
-            .iter()
-            .find(|item| item.id() == parent_id)
-            .ok_or_else(|| Self::unknown(parent_id))?;
-        Ok((
-            revision,
-            (parent_id, properties(item, &property_names), Vec::new()),
-        ))
+        let item = menu::find(&items, parent_id).ok_or_else(|| Self::unknown(parent_id))?;
+        Ok((revision, layout(item, recursion_depth, &property_names)))
     }
 
     /// Properties of `ids` (every row when empty); unknown ids are skipped.
@@ -146,8 +158,8 @@ impl Menu {
             out.push((0, root_properties(&property_names)));
         }
         out.extend(
-            items
-                .iter()
+            menu::flatten(&items)
+                .into_iter()
                 .filter(|item| ids.is_empty() || ids.contains(&item.id()))
                 .map(|item| (item.id(), properties(item, &property_names))),
         );
@@ -159,10 +171,7 @@ impl Menu {
         let mut props = if id == 0 {
             root_properties(&[])
         } else {
-            let item = items
-                .iter()
-                .find(|item| item.id() == id)
-                .ok_or_else(|| Self::unknown(id))?;
+            let item = menu::find(&items, id).ok_or_else(|| Self::unknown(id))?;
             properties(item, &[])
         };
         props
@@ -180,7 +189,7 @@ impl Menu {
         let (_, items) = self.items();
         let mut unknown = Vec::new();
         for (id, event_id, _, _) in events {
-            if items.iter().any(|item| item.id() == id) {
+            if menu::find(&items, id).is_some() {
                 self.on_event(id, &event_id);
             } else {
                 unknown.push(id);
@@ -269,5 +278,48 @@ mod tests {
         let sep = properties(&Item::Separator { id: 4 }, &["type".to_owned()]);
         assert_eq!(sep.len(), 1);
         assert_eq!(String::try_from(get(&sep, "type")).unwrap(), "separator");
+    }
+
+    fn submenu() -> Item {
+        Item::Submenu {
+            id: 10,
+            text: "Remove Lantern from a phone…".into(),
+            children: vec![Item::Button {
+                id: 150,
+                text: "my_phone".into(),
+                enabled: true,
+                action: Action::UndoSetup {
+                    serial: "s1".into(),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn submenu_properties_and_depth() {
+        let props = properties(&submenu(), &[]);
+        assert_eq!(
+            String::try_from(get(&props, "children-display")).unwrap(),
+            "submenu"
+        );
+        assert!(bool::try_from(get(&props, "enabled")).unwrap());
+        let items = [submenu()];
+        // Depth 1 from the root: the submenu without its rows; -1 and 2: with them.
+        let one = children(&items, 1, &[]);
+        let (_, _, rows): Layout = Value::from(one[0].try_clone().unwrap()).try_into().unwrap();
+        assert!(rows.is_empty());
+        for depth in [-1, 2] {
+            let all = children(&items, depth, &[]);
+            let (id, _, rows): Layout =
+                Value::from(all[0].try_clone().unwrap()).try_into().unwrap();
+            assert_eq!(id, 10);
+            assert_eq!(rows.len(), 1, "depth {depth}");
+            let (child, props, _): Layout = Value::from(rows[0].try_clone().unwrap())
+                .try_into()
+                .unwrap();
+            assert_eq!(child, 150);
+            assert_eq!(String::try_from(get(&props, "label")).unwrap(), "my__phone");
+        }
+        assert!(children(&items, 0, &[]).is_empty());
     }
 }

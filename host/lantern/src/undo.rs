@@ -21,7 +21,7 @@ use crate::daemon::{companion, ipc, session};
 
 /// Why undo-setup refuses while lanternd runs.
 pub const STOP_FIRST: &str = "stop lanternd first (systemctl --user stop lanternd), or use \
-     \"Undo phone setup…\" in Lantern's tray menu";
+     \"Remove Lantern from a phone…\" in Lantern's tray menu";
 
 /// True if `error` (from [`ipc::query_status`]) means no lanternd is listening.
 fn daemon_absent(error: &anyhow::Error) -> bool {
@@ -145,8 +145,8 @@ pub async fn run(
 }
 
 /// Steps 1–4 for `adb`'s serial, one line each to `out` (see the module doc); `remove_entries`
-/// removes the serial's menu entries. lanternd runs this itself (tray "Undo phone setup…")
-/// once its session on the phone is closed. `Err` only if writing to `out` fails; otherwise
+/// removes the serial's menu entries. lanternd runs this itself (tray "Remove Lantern from a
+/// phone…") once its session on the phone is closed. `Err` only if writing to `out` fails; otherwise
 /// `Ok(all steps ok)`. (`Sync`/`Send` so lanternd can run it on its multi-threaded runtime.)
 pub async fn run_steps(
     adb: &Adb,
@@ -261,7 +261,7 @@ mod tests {
     fn stop_first_points_at_the_tray() {
         assert_eq!(
             STOP_FIRST,
-            "stop lanternd first (systemctl --user stop lanternd), or use \"Undo phone setup…\" in Lantern's tray menu"
+            "stop lanternd first (systemctl --user stop lanternd), or use \"Remove Lantern from a phone…\" in Lantern's tray menu"
         );
     }
 

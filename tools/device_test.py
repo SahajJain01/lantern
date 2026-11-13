@@ -1403,10 +1403,11 @@ class Suite:
 
     def tray_menu(self):
         """The tray (real session bus, desktop unlocked): lanternd's StatusNotifierItem is
-        registered with the watcher, its menu shows `Connected to <device_name>` and `Quit
-        Lantern`, clicking row 3 (Disconnect) pauses and restores the phone within 5 s, and
-        clicking it again (Connect) makes it ready within 15 s. Opening the menu by hand stays a
-        manual check; a screenshot is saved for it."""
+        registered with the watcher, its menu has a checked row named after the phone (id
+        100n), `Quit Lantern` (11) and the Autoconnect row (14). Clicking the phone row switches
+        it off (state `off`) and restores the phone within 5 s and unchecks the row; clicking
+        it again makes it ready within 15 s. Opening the menu by hand stays a manual check; a
+        screenshot is saved for it."""
         # baseline() restarts lanternd, which gives the tray a new bus name: take it first.
         base = baseline()
         note(f"originals: stay_on={base['stay_on']} ime={base['ime']} imes={base['imes']}")
@@ -1423,45 +1424,54 @@ class Suite:
         items, secs = wait_until("lantern's tray item registered", 10, registered)
         note(f"registered {items} ({secs:.1f} s)")
 
-        def labels():
+        def rows():
+            """Top-level rows: {id: (label, toggle-state or None)}."""
             out = sh("busctl", "--user", "--json=short", "call", name, "/MenuBar",
                      "com.canonical.dbusmenu", "GetLayout", "iias", "--", "0", "-1", "0")
             _, (_, _, children) = json.loads(out)["data"]
-            rows = {}
+            found = {}
             for child in children:
                 cid, props, _ = child["data"]
-                rows[cid] = props.get("label", {}).get("data", "")
-            return rows
+                found[cid] = (props.get("label", {}).get("data", ""),
+                              props.get("toggle-state", {}).get("data"))
+            return found
 
         def click(cid):
             sh("busctl", "--user", "call", name, "/MenuBar", "com.canonical.dbusmenu", "Event",
                "isvu", "--", str(cid), "clicked", "i", "0", "0")
 
         device = adb("shell", "settings get global device_name").strip()
-        want = f"Connected to {device}".replace("_", "__")  # dbusmenu escapes mnemonics
-        rows, _ = wait_until(f"menu shows {want!r}", 15,
-                             lambda: (r := labels()).get(1) == want and r)
-        note(f"menu: {rows}")
-        check(rows.get(11) == "Quit Lantern", f"no Quit Lantern row: {rows}")
-        check(rows.get(3) == "Disconnect", f"row 3 is not Disconnect: {rows}")
+        want = device.replace("_", "__")  # dbusmenu escapes mnemonics
+
+        def phone_row():
+            r = rows()
+            ids = [cid for cid, (label, toggle) in r.items()
+                   if label == want and toggle is not None and cid >= 100 and cid % 100 == 0]
+            return ids and (ids[0], r)
+        (row, menu), _ = wait_until(f"a checkmark row {want!r}", 15, phone_row)
+        note(f"menu: {menu}; the phone's row is {row}")
+        check(menu[row][1] == 1, f"row {row} is not checked: {menu[row]}")
+        check(menu.get(11, ("",))[0] == "Quit Lantern", f"no Quit Lantern row: {menu}")
+        check(14 in menu, f"no Autoconnect row (14): {menu}")
         connected = False
         try:
-            click(3)
-            st, secs = wait_until("paused after the tray's Disconnect", 5,
-                                  lambda: status()["state"] == "paused" and status())
-            note(f"paused {secs:.1f} s after the click: {json.dumps(st)}")
+            click(row)
+            st, secs = wait_until("off after the tray click", 5,
+                                  lambda: (p := phone_status(SERIAL)).get("state") == "off"
+                                  and p)
+            note(f"off {secs:.1f} s after the click: {json.dumps(st)}")
             st, secs = wait_until("phone restored", 5,
                                   lambda: restored(s := phone_state()) and s, interval=0.2)
             note(f"restored {secs:.1f} s later")
-            rows, _ = wait_until("row 3 is Connect", 5,
-                                 lambda: (r := labels()).get(3) == "Connect" and r)
-            click(3)
+            wait_until(f"row {row} unchecked", 5,
+                       lambda: rows().get(row, ("", None))[1] == 0)
+            click(row)
             _, secs = wait_ready(15)
             connected = True
-            note(f"ready {secs:.1f} s after the tray's Connect")
+            note(f"ready {secs:.1f} s after the tray's second click")
         finally:
             if not connected:
-                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect")),
+                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect", SERIAL)),
                         ("lanternd ready", lambda: wait_ready(15)))
         shot = LOG_DIR / "tray.png"
         r = subprocess.run(["spectacle", "-b", "-n", "-o", str(shot)], capture_output=True,
@@ -1599,7 +1609,8 @@ class Suite:
         """A phone without a PIN (the Xiaomi: swipe or no lock screen) never gets the unlock
         prompt. Copies on the PC and on the phone as item 13 does, then checks: no `lock: phone
         locked` line in the helper log, no "phone locked" in lanternd's journal, the tray menu
-        (lanternd's view) not locked (row 1 without "(locked)", no Unlock row 13), and no Notify
+        (lanternd's view) not locked (no row label starting with "Unlock", none equal to
+        "Locked"), and no Notify
         titled "Unlock ..." on the session bus during the copies and 5 s after."""
         check(SERIAL != "ZD222LMDFV",
               "item 22 is for a phone without a PIN (the Xiaomi), not the PIN-locked Motorola")
@@ -1643,9 +1654,10 @@ class Suite:
                  "/MenuBar", "com.canonical.dbusmenu", "GetLayout", "iias", "--", "0", "-1", "0")
         _, (_, _, children) = json.loads(out)["data"]
         rows = {c["data"][0]: c["data"][1].get("label", {}).get("data", "") for c in children}
-        note(f"tray rows 1/13: {rows.get(1)!r} / {rows.get(13)!r}")
-        check(13 not in rows, f"the tray shows an Unlock row: {rows}")
-        check(not rows.get(1, "").endswith("(locked)"), f"the tray says locked: {rows.get(1)!r}")
+        note(f"tray rows: {rows}")
+        check(not any(l.startswith("Unlock") for l in rows.values()),
+              f"the tray shows an Unlock row: {rows}")
+        check("Locked" not in rows.values(), f"the tray says locked: {rows}")
 
     # --- Plan 4b ---------------------------------------------------------------------------
 
