@@ -1247,6 +1247,10 @@ class Suite:
         Lantern`, clicking row 3 (Disconnect) pauses and restores the phone within 5 s, and
         clicking it again (Connect) makes it ready within 15 s. Opening the menu by hand stays a
         manual check; a screenshot is saved for it."""
+        # baseline() restarts lanternd, which gives the tray a new bus name: take it first.
+        base = baseline()
+        note(f"originals: stay_on={base['stay_on']} ime={base['ime']} imes={base['imes']}")
+        wait_ready(15)
         pid = systemctl("show", "-p", "MainPID", "--value", UNIT).strip()
         check(pid not in ("", "0"), f"{UNIT} is not running")
         name = f"org.kde.StatusNotifierItem-{pid}-1"
@@ -1261,7 +1265,7 @@ class Suite:
 
         def labels():
             out = sh("busctl", "--user", "--json=short", "call", name, "/MenuBar",
-                     "com.canonical.dbusmenu", "GetLayout", "iias", "0", "-1", "0")
+                     "com.canonical.dbusmenu", "GetLayout", "iias", "--", "0", "-1", "0")
             _, (_, _, children) = json.loads(out)["data"]
             rows = {}
             for child in children:
@@ -1271,7 +1275,7 @@ class Suite:
 
         def click(cid):
             sh("busctl", "--user", "call", name, "/MenuBar", "com.canonical.dbusmenu", "Event",
-               "isvu", str(cid), "clicked", "i", "0", "0")
+               "isvu", "--", str(cid), "clicked", "i", "0", "0")
 
         device = adb("shell", "settings get global device_name").strip()
         want = f"Connected to {device}".replace("_", "__")  # dbusmenu escapes mnemonics
@@ -1280,8 +1284,6 @@ class Suite:
         note(f"menu: {rows}")
         check(rows.get(11) == "Quit Lantern", f"no Quit Lantern row: {rows}")
         check(rows.get(3) == "Disconnect", f"row 3 is not Disconnect: {rows}")
-        base = baseline()
-        note(f"originals: stay_on={base['stay_on']} ime={base['ime']} imes={base['imes']}")
         connected = False
         try:
             click(3)
