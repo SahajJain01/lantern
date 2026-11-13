@@ -409,10 +409,22 @@ fn undo_question(name: &str) -> String {
     )
 }
 
-/// Asks with kdialog; on "Remove" (exit 0) sends `Command::UndoSetup`. Without kdialog it
-/// only shows a notification.
+/// Whether an Undo the user confirmed may go ahead: only when the phone the dialog named
+/// (`clicked`) is still the phone the tray shows (`now`).
+fn confirm_target(clicked: Option<&str>, now: Option<&str>) -> bool {
+    clicked.is_some() && clicked == now
+}
+
+/// Asks with kdialog; on "Remove" (exit 0) sends `Command::UndoSetup`, but only if the phone
+/// is still the one the dialog named. Without kdialog it only shows a notification.
 async fn confirm_undo(shared: &Shared) {
-    let name = menu::name(&shared.state().view).to_owned();
+    let (name, clicked) = {
+        let state = shared.state();
+        (
+            menu::name(&state.view).to_owned(),
+            state.view.phone.serial().map(str::to_owned),
+        )
+    };
     let question = undo_question(&name);
     let spawned = tokio::task::spawn_blocking(move || {
         crate::desktop::spawn(
@@ -449,7 +461,19 @@ async fn confirm_undo(shared: &Shared) {
         }
     };
     match child.wait().await {
-        Ok(status) if status.code() == Some(0) => send(shared, Command::UndoSetup),
+        Ok(status) if status.code() == Some(0) => {
+            let now = shared.state().view.phone.serial().map(str::to_owned);
+            if confirm_target(clicked.as_deref(), now.as_deref()) {
+                send(shared, Command::UndoSetup);
+            } else {
+                tracing::info!("undo cancelled: the phone changed while asking");
+                crate::notify::send(
+                    "Undo phone setup cancelled",
+                    "The phone changed while Lantern was asking. Choose \"Undo phone setup…\" again.",
+                    None,
+                );
+            }
+        }
         Ok(_) => tracing::info!("tray: undo-setup cancelled"),
         Err(error) => tracing::warn!(%error, "tray: kdialog wait failed"),
     }
@@ -458,6 +482,27 @@ async fn confirm_undo(shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirm_target_same_phone() {
+        assert!(confirm_target(Some("A"), Some("A")));
+    }
+
+    #[test]
+    fn confirm_target_phone_changed() {
+        assert!(!confirm_target(Some("A"), Some("B")));
+    }
+
+    #[test]
+    fn confirm_target_phone_gone() {
+        assert!(!confirm_target(Some("A"), None));
+    }
+
+    #[test]
+    fn confirm_target_no_phone_when_clicked() {
+        assert!(!confirm_target(None, None));
+        assert!(!confirm_target(None, Some("A")));
+    }
 
     #[test]
     fn undo_question_text() {
