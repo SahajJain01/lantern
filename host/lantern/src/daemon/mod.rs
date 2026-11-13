@@ -6,7 +6,7 @@ pub mod phones;
 pub mod registry;
 pub mod session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -454,13 +454,37 @@ impl Table {
     }
 }
 
-/// Hands `event` to the connect prompt without waiting; a full channel drops it.
-fn connect_event(events: Option<&mpsc::Sender<ConnectEvent>>, event: ConnectEvent) {
-    let Some(events) = events else {
-        return;
-    };
-    if let Err(error) = events.try_send(event) {
-        tracing::warn!(%error, "connect prompt not listening; event dropped");
+/// The connect prompt's side in the run loop: the events channel, and which phones have a
+/// notice up (one was sent and no `Gone` since).
+struct Prompts {
+    events: Option<mpsc::Sender<ConnectEvent>>,
+    shown: HashSet<String>,
+}
+
+impl Prompts {
+    /// Hands `event` to the connect prompt without waiting; a full channel drops it.
+    fn send(&mut self, event: ConnectEvent) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        match &event {
+            ConnectEvent::Gone { serial } => {
+                self.shown.remove(serial);
+            }
+            ConnectEvent::PluggedIn { serial, .. }
+            | ConnectEvent::OpenRefused { serial, .. }
+            | ConnectEvent::PlugIn { serial, .. } => {
+                self.shown.insert(serial.clone());
+            }
+        }
+        if let Err(error) = events.try_send(event) {
+            tracing::warn!(%error, "connect prompt not listening; event dropped");
+        }
+    }
+
+    /// Whether `serial` has a notice up.
+    fn shown(&self, serial: &str) -> bool {
+        self.shown.contains(serial)
     }
 }
 
@@ -479,6 +503,9 @@ fn connect_event(events: Option<&mpsc::Sender<ConnectEvent>>, event: ConnectEven
 /// - The latest choice of phone wins: a Connect, or a phone connecting on plug-in, drops every
 ///   other phone's connect-and-open request. A phone left waiting loses its `live` flag.
 /// - Nothing starts while an undo runs, and commands other than Quit are ignored meanwhile.
+/// - A phone's connect notice closes (`Gone`) when it gets ready or is gone for good: the wanted
+///   phone at the end of its grace, a waiting phone once it stayed away for the grace (back
+///   within it, its notice stays and it isn't asked again, so a loose cable doesn't re-pop it).
 // `release!` resets `retry_at` before a switch schedules the new phone's start.
 #[allow(clippy::too_many_arguments, unused_assignments)]
 async fn drive<E, S, F, D>(
@@ -522,10 +549,17 @@ where
         .as_ref()
         .map(|_| Instant::now() + timing.unplug_grace);
     let mut table = Table::new(state_dir);
+    let mut prompts = Prompts {
+        events: connect_events,
+        shown: HashSet::new(),
+    };
     // The one phone to serve.
     let mut wanted: Option<String> = None;
     // The wanted phone is offline: the end of its unplug grace.
     let mut grace: Option<Instant> = None;
+    // Unwanted phones gone offline with a notice up: when each notice closes unless the phone
+    // comes back.
+    let mut leaving: HashMap<String, Instant> = HashMap::new();
     let mut active: Option<(SessionConn, Instant)> = None;
     let mut starting: Starting<F> = None;
     let mut retry_at: Option<Instant> = None;
@@ -641,6 +675,7 @@ where
         let wake = retry_at.unwrap_or_else(Instant::now);
         let grace_end = grace.unwrap_or_else(Instant::now);
         let startup_end = startup.unwrap_or_else(Instant::now);
+        let leave_end = leaving.values().min().copied().unwrap_or_else(Instant::now);
         // Set when the live session must be torn down and restarted.
         let mut ended: Option<&'static str> = None;
         // Set when the daemon must end (signal or Quit).
@@ -687,6 +722,8 @@ where
                         }
                         names.refresh(&serial);
                         let flags = table.read(&serial);
+                        // Back within the grace: its notice is still on screen.
+                        let blip = leaving.remove(&serial).is_some();
                         if wanted.as_deref() == Some(serial.as_str()) {
                             if grace.take().is_some() {
                                 tracing::info!(serial, "back within the unplug grace; reconnecting");
@@ -718,9 +755,12 @@ where
                                     wanted = Some(serial);
                                     retry_at = Some(Instant::now());
                                 }
+                                OnPlug::Prompt if blip => {
+                                    tracing::info!(serial, "back within the unplug grace; not asking again");
+                                }
                                 OnPlug::Prompt => {
                                     let name = names.get(&serial).unwrap_or_else(|| serial.clone());
-                                    connect_event(connect_events.as_ref(), ConnectEvent::PluggedIn { serial, name });
+                                    prompts.send(ConnectEvent::PluggedIn { serial, name });
                                 }
                                 OnPlug::Wait => {
                                     // Left waiting: it is no longer the phone to resume, so a
@@ -745,7 +785,10 @@ where
                             grace = Some(Instant::now() + timing.unplug_grace);
                         } else if was_plugged {
                             tracing::info!(serial, "device offline");
-                            connect_event(connect_events.as_ref(), ConnectEvent::Gone { serial });
+                            // Its notice closes only if it stays away for the grace.
+                            if prompts.shown(&serial) {
+                                leaving.insert(serial, Instant::now() + timing.unplug_grace);
+                            }
                         }
                     }
                 }
@@ -762,9 +805,23 @@ where
                 if let Some(serial) = wanted.take() {
                     tracing::info!(serial, "unplugged (offline past the grace)");
                     table.set_live(&serial, false);
+                    prompts.send(ConnectEvent::Gone { serial });
                 }
                 retry_at = None;
                 failures = 0;
+            }
+            _ = tokio::time::sleep_until(leave_end), if !leaving.is_empty() => {
+                let now = Instant::now();
+                let gone: Vec<String> = leaving
+                    .iter()
+                    .filter(|(_, until)| **until <= now)
+                    .map(|(serial, _)| serial.clone())
+                    .collect();
+                for serial in gone {
+                    leaving.remove(&serial);
+                    tracing::debug!(serial, "away past the grace; closing its notice");
+                    prompts.send(ConnectEvent::Gone { serial });
+                }
             }
             _ = tokio::time::sleep_until(startup_end), if startup.is_some() => {
                 startup = None;
@@ -788,7 +845,7 @@ where
                         names.refresh(&serial);
                         active = Some((session, Instant::now()));
                         table.set_live(&serial, true);
-                        connect_event(connect_events.as_ref(), ConnectEvent::Gone { serial: serial.clone() });
+                        prompts.send(ConnectEvent::Gone { serial: serial.clone() });
                         if let Some(p) = table.pending.remove(&serial) {
                             if p.until > Instant::now() {
                                 tracing::info!(serial, pkg = p.pkg, user = p.user, "opening the requested app");
@@ -859,8 +916,9 @@ where
                 for (serial, pkg, user) in hub.take_refused() {
                     let name = names.get(&serial).unwrap_or_else(|| serial.clone());
                     let app = hub.app_name(&pkg, user);
-                    connect_event(
-                        connect_events.as_ref(),
+                    // Its new notice replaces the old one; the grace mustn't close it.
+                    leaving.remove(&serial);
+                    prompts.send(
                         ConnectEvent::OpenRefused { serial, name, app, pkg, user },
                     );
                 }
@@ -945,6 +1003,8 @@ where
             match cmd {
                 Command::Connect { serial, open } => {
                     tracing::info!(serial, ?open, "connected in Lantern");
+                    // Its "Plug in" notice (or its session's Gone) takes over from the grace.
+                    leaving.remove(&serial);
                     table.set_off(&serial, false);
                     // The latest choice wins: a request for another phone must not switch later.
                     table.keep_pending_for(&serial);
@@ -963,10 +1023,7 @@ where
                     }
                     if !table.plugged(&serial) {
                         let name = names.get(&serial).unwrap_or_else(|| serial.clone());
-                        connect_event(
-                            connect_events.as_ref(),
-                            ConnectEvent::PlugIn { serial, name, app },
-                        );
+                        prompts.send(ConnectEvent::PlugIn { serial, name, app });
                     } else if wanted.as_deref() == Some(serial.as_str()) {
                         // Already wanted: a start in backoff is retried now.
                         if active.is_none() && starting.is_none() && retry_at.is_some() {

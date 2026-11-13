@@ -26,25 +26,29 @@ const ACTION: &str = "connect";
 /// How often an unhealthy prompt asks the server whether it is back.
 const PROBE_EVERY: Duration = Duration::from_secs(3);
 
-/// "{name} is plugged in" and its body (`name` escaped).
+/// "{name} is plugged in" and its body. Summaries are plain text in Plasma, so only bodies
+/// are escaped for markup.
 pub fn plugged_notice(name: &str) -> (String, String) {
     (
-        format!("{} is plugged in", escape_markup(name)),
+        format!("{name} is plugged in"),
         "Connect it to use its apps on this PC. Its screen turns off while it is connected."
             .to_owned(),
     )
 }
 
-/// "Connect your {name}" for an open of `app` refused because its phone isn't connected.
+/// "Connect your {name}" for an open of `app` refused because its phone isn't connected
+/// (`name` and `app` escaped in the body only).
 pub fn offered_notice(name: &str, app: &str) -> (String, String) {
+    let summary = format!("Connect your {name}");
     let (name, app) = (escape_markup(name), escape_markup(app));
     (
-        format!("Connect your {name}"),
+        summary,
         format!("{app} is on your {name}. Connect it to open {app} here."),
     )
 }
 
-/// "Plug in your {name}" after Connect for a phone that isn't plugged in (`app` opens on it).
+/// "Plug in your {name}" after Connect for a phone that isn't plugged in (`app` opens on it;
+/// escaped in the body).
 pub fn plug_in_notice(name: &str, app: Option<&str>) -> (String, String) {
     let body = match app {
         Some(app) => format!(
@@ -53,7 +57,7 @@ pub fn plug_in_notice(name: &str, app: Option<&str>) -> (String, String) {
         ),
         None => "It connects if you plug it in within 2 minutes.".to_owned(),
     };
-    (format!("Plug in your {}", escape_markup(name)), body)
+    (format!("Plug in your {name}"), body)
 }
 
 /// Whether the connect prompt's notifications get through: false until the server first

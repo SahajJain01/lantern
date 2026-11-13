@@ -264,11 +264,6 @@ def replug(manual=None):
     note(f"phone back on adb after {secs:.1f} s")
 
 
-def markup(text):
-    """`text` as lanternd's notices send it (Plasma markup: & < > escaped)."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
 def device_name():
     """The phone's friendly name (Settings > About), else its serial."""
     return adb("shell", "settings", "get", "global", "device_name").strip() or SERIAL
@@ -1928,7 +1923,7 @@ class Suite:
                 path.write_bytes(saved_file)
 
         device = device_name()
-        summary = f"{markup(device)} is plugged in"
+        summary = f"{device} is plugged in"
         env = manager_env(set={"LANTERN_UNPLUG_GRACE_MS": "0"}, unset=["LANTERN_SERIAL"])
         ok = False
         entered = False
@@ -2005,7 +2000,7 @@ class Suite:
                 kwin_on(SETTINGS, CLOSE, "lantern_close")
                 wait_until("Settings window gone", 10, lambda: not settings_windows())
 
-        summary = f"Connect your {markup(device_name())}"
+        summary = f"Connect your {device_name()}"
         env = manager_env(set={"LANTERN_UNPLUG_GRACE_MS": "0"}, unset=["LANTERN_SERIAL"])
         ok = False
         entered = False

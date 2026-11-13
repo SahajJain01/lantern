@@ -2462,6 +2462,73 @@ async fn unplug_beyond_grace_clears_live() {
     ctl.shutdown().await;
 }
 
+/// R6: a wanted phone that never got ready (its starts keep failing) and is unplugged past the
+/// grace gets its notice closed: a `Gone` when the grace ends.
+#[tokio::test]
+async fn wanted_phone_gone_past_grace_closes_its_notice() {
+    // Nothing listens on this port: every session start fails.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, true), |_| {});
+    ctl.state_until("dev", PhoneState::Retrying).await;
+    ctl.offline("dev");
+    ctl.state_until("dev", PhoneState::Reconnecting).await;
+    ctl.state_until("dev", PhoneState::Unplugged).await;
+    let events = ctl.events_for_a_while().await;
+    assert_eq!(
+        events,
+        [ConnectEvent::Gone {
+            serial: "dev".into()
+        }]
+    );
+    ctl.shutdown().await;
+}
+
+/// R6: a loose cable on a phone that is only waiting doesn't re-pop "is plugged in": back
+/// within the grace, its notice stays as it is; away past the grace, it is closed, and the
+/// next plug-in asks again.
+#[tokio::test]
+async fn waiting_phone_blip_keeps_its_notice() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    for _ in 0..3 {
+        ctl.offline("dev");
+        ctl.state_until("dev", PhoneState::Unplugged).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ctl.online("dev");
+        ctl.state_until("dev", PhoneState::Waiting).await;
+    }
+    assert_eq!(
+        ctl.events_for_a_while().await,
+        [],
+        "no Gone, no second prompt"
+    );
+    ctl.offline("dev");
+    assert_eq!(
+        ctl.event().await,
+        ConnectEvent::Gone {
+            serial: "dev".into()
+        }
+    );
+    ctl.online("dev");
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    // Connect while it is away within the grace: its "Plug in" notice is not closed when the
+    // grace ends.
+    ctl.offline("dev");
+    ctl.state_until("dev", PhoneState::Unplugged).await;
+    ctl.command(connect("dev")).await;
+    assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
+    tokio::time::sleep(2 * fast_timing().unplug_grace).await;
+    assert_eq!(ctl.events_for_a_while().await, []);
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
+
 /// Review Focus 2: a stale `live` flag (the phone stayed away for the grace after start) is
 /// cleared, so plugging it in later asks.
 #[tokio::test]

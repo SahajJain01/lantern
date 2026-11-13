@@ -383,12 +383,13 @@ async fn no_notification_server_is_harmless() {
         .unwrap();
 }
 
+/// Plasma shows a summary as plain text and a body as markup: names are escaped in bodies only.
 #[tokio::test]
 async fn names_are_escaped() {
     let rig = Rig::start(true).await;
     rig.send(plugged("dev", "A&B <1>")).await;
     match rig.notify(1).await {
-        Call::Notify { summary, .. } => assert_eq!(summary, "A&amp;B &lt;1&gt; is plugged in"),
+        Call::Notify { summary, .. } => assert_eq!(summary, "A&B <1> is plugged in"),
         _ => unreachable!(),
     }
     rig.send(ConnectEvent::OpenRefused {
@@ -401,10 +402,26 @@ async fn names_are_escaped() {
     .await;
     match rig.notify(2).await {
         Call::Notify { summary, body, .. } => {
-            assert_eq!(summary, "Connect your A&amp;B &lt;1&gt;");
+            assert_eq!(summary, "Connect your A&B <1>");
             assert_eq!(
                 body,
                 "&lt;X&amp;Y&gt; is on your A&amp;B &lt;1&gt;. Connect it to open &lt;X&amp;Y&gt; here."
+            );
+        }
+        _ => unreachable!(),
+    }
+    rig.send(ConnectEvent::PlugIn {
+        serial: "c".into(),
+        name: "A&B <1>".into(),
+        app: Some("<X&Y>".into()),
+    })
+    .await;
+    match rig.notify(3).await {
+        Call::Notify { summary, body, .. } => {
+            assert_eq!(summary, "Plug in your A&B <1>");
+            assert_eq!(
+                body,
+                "&lt;X&amp;Y&gt; opens if you plug it in within 2 minutes."
             );
         }
         _ => unreachable!(),

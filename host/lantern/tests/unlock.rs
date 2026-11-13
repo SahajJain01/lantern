@@ -447,3 +447,53 @@ async fn tray_request_for_another_phone_opens_nothing() {
     assert_eq!(rig.next_pin().await, pin("1234"));
     rig.assert_no_pin().await;
 }
+
+/// Plasma shows a summary as plain text and a body as markup: the phone's name and the
+/// failure reason are escaped in bodies only.
+#[tokio::test]
+async fn names_are_escaped() {
+    let rig = Rig::start(true, echo_prompt("12a4")).await;
+    rig.view
+        .send_modify(|view| view.phones[0].name = Some("A&B <1>".into()));
+    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    let id = rig.notify_id(1).await;
+    rig.send(LockEvent::Result {
+        ok: false,
+        reason: Some("<odd> & more".into()),
+    })
+    .await;
+    rig.notify_id(2).await;
+    rig.send(LockEvent::Result {
+        ok: false,
+        reason: Some("unlock not confirmed".into()),
+    })
+    .await;
+    rig.notify_id(3).await;
+    // The dialog's answer is not a PIN: its own notice.
+    rig.click(id, "unlock").await;
+    rig.notify_id(4).await;
+    let texts: Vec<(String, String)> = rig
+        .notifies()
+        .into_iter()
+        .map(|call| match call {
+            Call::Notify { summary, body, .. } => (summary, body),
+            _ => unreachable!(),
+        })
+        .collect();
+    let pair = |s: &str, b: &str| (s.to_owned(), b.to_owned());
+    assert_eq!(
+        texts,
+        [
+            pair(
+                "Unlock your A&B <1>",
+                "Lantern can't paste or open apps while A&amp;B &lt;1&gt; is locked."
+            ),
+            pair("Couldn't unlock A&B <1>", "&lt;odd&gt; &amp; more"),
+            pair(
+                "Couldn't unlock A&B <1>",
+                "Lantern couldn't confirm A&amp;B &lt;1&gt; unlocked. Check the phone before trying again."
+            ),
+            pair("Couldn't unlock A&B <1>", "the PIN must be 4 to 16 digits"),
+        ]
+    );
+}

@@ -182,15 +182,20 @@ impl Prompt {
 /// The notification action that opens the PIN dialog.
 const ACTION: &str = "unlock";
 
-/// "Unlock your {name}" and its body.
+/// "Unlock your {name}" and its body. Summaries are plain text in Plasma, so `name` is
+/// escaped for markup in the body only.
 pub fn locked_notice(name: &str) -> (String, String) {
     (
         format!("Unlock your {name}"),
-        format!("Lantern can't paste or open apps while {name} is locked."),
+        format!(
+            "Lantern can't paste or open apps while {} is locked.",
+            escape_markup(name)
+        ),
     )
 }
 
-/// The notification for a failed unlock (`unlock_result{ok:false, reason}`).
+/// The notification for a failed unlock (`unlock_result{ok:false, reason}`); `name` and
+/// `reason` are escaped in the body only, as [`locked_notice`].
 pub fn failed_notice(name: &str, reason: Option<&str>) -> (String, String) {
     match reason {
         Some("wrong PIN") => (
@@ -201,12 +206,13 @@ pub fn failed_notice(name: &str, reason: Option<&str>) -> (String, String) {
         Some("unlock not confirmed") => (
             format!("Couldn't unlock {name}"),
             format!(
-                "Lantern couldn't confirm {name} unlocked. Check the phone before trying again."
+                "Lantern couldn't confirm {} unlocked. Check the phone before trying again.",
+                escape_markup(name)
             ),
         ),
         other => (
             format!("Couldn't unlock {name}"),
-            other.unwrap_or("unlock failed").to_owned(),
+            escape_markup(other.unwrap_or("unlock failed")),
         ),
     }
 }
@@ -233,8 +239,7 @@ fn phone_name(view: &watch::Receiver<View>) -> String {
         .unwrap_or_else(|| "phone".to_owned())
 }
 
-/// Shows (or replaces `replaces`) the notice with the `unlock` action labelled `label`; the
-/// phone name in it is escaped by the caller ([`notice_name`]).
+/// Shows (or replaces `replaces`) the notice with the `unlock` action labelled `label`.
 async fn show(
     notices: &mut Notices,
     replaces: u32,
@@ -244,11 +249,6 @@ async fn show(
     notices
         .notify(replaces, &summary, &body, &[(ACTION, label)])
         .await
-}
-
-/// The phone's name for a notice: [`phone_name`] escaped for the server's markup.
-fn notice_name(view: &watch::Receiver<View>) -> String {
-    escape_markup(&phone_name(view))
 }
 
 /// Runs the PIN dialog (blocking): its stdout parsed as a [`Pin`], `Ok(None)` if the user
@@ -366,13 +366,12 @@ pub async fn run(
                         }
                         stretch = true;
                         tracing::info!(?reason, "phone locked: asking for its PIN");
-                        let name = notice_name(&view);
+                        let name = phone_name(&view);
                         shown = show(&mut notices, 0, locked_notice(&name), "Enter PIN…").await;
                     }
                     LockEvent::Result { ok: false, reason } => {
                         tracing::info!(reason = reason.as_deref().unwrap_or(""), "unlock failed");
-                        let name = notice_name(&view);
-                        let reason = reason.as_deref().map(escape_markup);
+                        let name = phone_name(&view);
                         let notice = failed_notice(&name, reason.as_deref());
                         shown = show(&mut notices, shown, notice, "Try again").await;
                     }
@@ -428,7 +427,7 @@ pub async fn run(
                     Ok(Ok(None)) => {}
                     Ok(Err(message)) => {
                         tracing::warn!(message, "PIN not sent");
-                        let name = notice_name(&view);
+                        let name = phone_name(&view);
                         let notice = (format!("Couldn't unlock {name}"), escape_markup(&message));
                         shown = show(&mut notices, shown, notice, "Try again").await;
                     }
