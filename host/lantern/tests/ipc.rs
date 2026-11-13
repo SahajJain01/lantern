@@ -2990,6 +2990,37 @@ async fn daemon_cmd_refuses_unknown_serial() {
     ctl.shutdown().await;
 }
 
+/// Under `LANTERN_SERIAL` a CLI command naming another phone (plugged in, known from a record,
+/// or a typo) is refused with the reason, not as unknown; the configured phone is accepted.
+#[tokio::test]
+async fn daemon_cmd_for_another_serial_under_lantern_serial_is_refused() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    companion::set_off(&state, "old", true).unwrap();
+    let mut opts = rules(&state, false);
+    opts.configured = Some("dev".into());
+    let mut ctl = start_ctl_opts(port, &["dev", "b"], opts, |_| {});
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    for serial in ["b", "old", "typo"] {
+        for cmd in [DaemonCmd::Connect, DaemonCmd::Disconnect] {
+            assert_eq!(
+                daemon_cmd_reply(&ctl.sock, cmd, Some(serial)).await,
+                Control::error(format!(
+                    "phone {serial} is not served: lanternd serves only dev because \
+                     LANTERN_SERIAL=dev is set"
+                ))
+            );
+        }
+    }
+    helper.assert_quiet().await;
+    assert!(companion::read_record(&state, "typo").is_none());
+    assert!(companion::read_record(&state, "b").is_none());
+    let reply = daemon_cmd_reply(&ctl.sock, DaemonCmd::Connect, Some("dev")).await;
+    assert!(matches!(reply, Control::StatusReport(_)), "{reply:?}");
+    ctl.shutdown().await;
+}
+
 /// With no phone plugged in or known, the refusal says so.
 #[tokio::test]
 async fn daemon_cmd_unknown_serial_with_no_phones() {

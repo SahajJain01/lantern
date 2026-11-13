@@ -45,10 +45,11 @@ protocol is in [`docs/protocol.md`](docs/protocol.md).
   `PD_TC`.
 - `adb` on `PATH`, with the phone authorized for USB debugging. The phone must run Android 15 or
   newer (API 35).
-- lanternd serves one phone at a time. With several devices connected it keeps the one it is
-  serving, else takes the first that came online; when that one goes away it starts the next one
-  still online. To pin one, set `LANTERN_SERIAL`: run `systemctl --user edit lanternd` and add
-  `[Service]` / `Environment=LANTERN_SERIAL=<serial>`. `adb devices` lists the serials.
+- lanternd connects one phone at a time. With several phones plugged in you pick which one from
+  the tray (see [Phones: connect, autoconnect](#phones-connect-autoconnect)). To make lanternd
+  serve only one phone and ignore every other, set `LANTERN_SERIAL`: run `systemctl --user edit
+  lanternd` and add `[Service]` / `Environment=LANTERN_SERIAL=<serial>`. That phone then
+  connects whenever it is plugged in. `adb devices` lists the serials.
 
 lanternd runs `adb` from the systemd user manager's `PATH`, not your shell's. If `adb` lives
 somewhere else (for example `~/Android/Sdk/platform-tools`), add it to that `PATH` in one of two
@@ -99,26 +100,42 @@ Tests: `cd host && cargo test`.
 ```sh
 lantern open com.android.settings     # one window per app; opening it again focuses that window
 lantern open --user 10 com.android.settings   # the same app from Android user/profile 10 (e.g. work)
+lantern open --phone 20e9318 com.android.settings   # on that phone (adb serial)
 lantern status                        # daemon state as JSON
-lantern disconnect                    # end the session (phone restored) and stay disconnected
-lantern connect                       # connect again (also: unplug and replug the phone)
+lantern disconnect [<serial>]         # switch the phone off in Lantern (phone restored); it stays off
+lantern connect [<serial>]            # switch it on and connect it
 ```
 
-You rarely need the command: once the phone has connected, every app on its launcher (each
-profile's, work apps too) has an entry with its icon in the **Phone** submenu of the KDE
-application menu (and in KRunner). The entries follow the phone while it is connected: an app
-installed or removed there is added or removed here. They stay when the phone is unplugged, and
-the menu keeps the apps of every phone you have connected: switching phones adds the new phone's
-apps and leaves the other phone's entries (and your pins) alone. An app both phones have is one
-entry. Opening an app while no phone that has it is connected shows a notification "Connect your
-Xiaomi 11T Pro" (the phone's name from its settings), or, once the connected phone's app list has
-arrived and it lacks the app, which phone has it. They are
-`~/.local/share/applications/lantern.*.desktop` (the line `X-Lantern-Serials=` lists the phones),
-with icons in `~/.local/share/lantern/icons/`.
+You rarely need the command: once a phone has connected, every app on its launcher (each
+profile's, work apps too) has an entry with its icon in the KDE application menu (and in
+KRunner), under **Phone** → *the phone's name* (for example Phone → "Xiaomi 11T Pro" and Phone →
+"edge 50 pro"). Each phone has its own entries, even for an app both phones have, and each entry
+opens on its own phone (`lantern open --phone <serial>`). The entries follow the phone while it
+is connected: an app installed or removed there is added or removed here. They stay when the
+phone is unplugged or switched off, and syncing one phone never touches another phone's entries
+(or your pins).
+
+Opening an entry while its phone isn't connected shows a notification **"Connect your Xiaomi
+11T Pro"** (the phone's name from its settings) with a **Connect** button: it connects that phone
+(switching another one off) and opens the app once the phone is ready (within 2 minutes). If the
+phone isn't plugged in, Lantern says "Plug in your …" and opens the app when you plug it in
+within 2 minutes. Without `--phone`, `lantern open` picks the connected phone that has the app,
+else the phone with the app you connected last.
+
+The entries are `~/.local/share/applications/lantern.*.desktop` (each with `X-Lantern-Serial=`,
+its phone), with icons in `~/.local/share/lantern/icons/`. One phone, the *primary*, keeps the
+names Lantern used before it had per-phone folders (`lantern.<pkg>[-u<N>].desktop`); every other
+phone's entries end in `-p<serial>` (any character other than a letter, digit or `_` in the
+serial becomes `_`; e.g. `lantern.org.lineageos.jelly-p20e9318.desktop`). The
+first start of this version splits the old shared entries per phone once and picks as primary
+the phone whose entries you pinned to the task manager, so those pins keep working. **Pins of
+another phone's apps need re-pinning once** (unpin the old launcher, pin the app again from its
+phone's folder): its windows now have a new app_id.
 
 `--user N` (default `0`) picks the Android user or profile the app runs as; `adb shell pm list
 users` lists them. Each user's copy of an app is its own window: Wayland app_id
-`lantern.<pkg>` for user 0 and `lantern.<pkg>-u<N>` otherwise, and its own remembered size. The
+`lantern.<pkg>` for user 0 and `lantern.<pkg>-u<N>` otherwise (plus `-p<serial>` for a phone
+other than the primary), and its own remembered size (per phone). The
 title (and menu entry) is the app's name on the phone, with ` (work)` for a work-profile app and
 ` (user N)` for another user, e.g. `Files (work)`. `<pkg>` must be a package name (letters,
 digits, `_`, `.`), and `N` a plain decimal number; anything else is a usage error (exit 2).
@@ -142,11 +159,15 @@ phone (on its screen or in recents) may be moved onto its Lantern window (Launch
 for a new task); the window then prints `lantern: <pkg> (user N) was already open on the phone; it
 moved into this window and closing the window will quit it`.
 
-`lantern status` prints `{"state":"idle|starting|ready|paused","serial":…,"helper":<jar sha256>,"windows":[{"id","pkg","user"}],"companion":"ready|unavailable"}`
-(`companion` is omitted until known; `paused` means you disconnected the phone in Lantern).
-`lantern connect` and `lantern disconnect` print the same report (the state before the command)
-and exit 1 if lanternd isn't running. A disconnected phone stays disconnected until you connect
-it again or unplug and replug it; opening an app meanwhile shows "Lantern is disconnected".
+`lantern status` prints `{"state":"idle|starting|ready|paused","serial":…,"helper":<jar sha256>,"windows":[{"id","pkg","user"}],"companion":"ready|unavailable","phones":[…]}`
+(`companion` is omitted until known; `paused` means you switched the phone off in Lantern;
+`phones` lists every phone Lantern knows or sees plugged in, with its `state`, `plugged`, `off`
+and `connected_at`). `lantern connect` and `lantern disconnect` print the same report (the state
+before the command) and exit 1 if lanternd isn't running or refuses. Without a serial they act on
+the only plugged-in phone; with several plugged in, name one (the error lists them). A serial
+lanternd doesn't know is refused, and so is any phone but `LANTERN_SERIAL`'s while that is set.
+A phone you switched off stays off, across unplugging and lanternd restarts, until you connect it
+again (tray, notification or `lantern connect`).
 Logs: `journalctl --user -u lanternd`. Set `LANTERN_LOG=debug` for more detail.
 
 Exit statuses: 0 ok, 1 runtime failure, 2 usage error, 3 helper protocol mismatch (`daemon`
@@ -155,29 +176,36 @@ only; systemd does not restart it).
 ## Tray and settings
 
 lanternd puts a phone icon in the KDE system tray (when there is a tray; without one it runs as
-before). Its menu shows what Lantern is doing ("Connected to Xiaomi 11T Pro", "Reconnecting to …",
-"Disconnected from …"), and a line when the companion isn't fully ready (for example "Typing
-through the Lantern keyboard is off"). It holds:
+before). Its tooltip says what Lantern is doing ("Connected to Xiaomi 11T Pro", "Reconnecting
+to …", "2 phones plugged in, none connected"). The menu is the phone switchboard:
 
-- **Unlock {phone}…** (only while the phone is locked, see below; the first line then reads
-  "Connected to … (locked)"): opens the same PIN dialog as the "Unlock your …" notification.
-- **Disconnect / Connect**: the same as `lantern disconnect` / `lantern connect`.
-- **Sync clipboard**, **Type with the Lantern keyboard (from the next connection)**: check items
-  over the settings file below.
+- **One checkmark row per plugged-in phone**, named after it. Checked = connected. Check a phone
+  to connect it (another connected phone is switched off first: Lantern connects one phone at a
+  time, and the row "Lantern connects one phone at a time" shows while two or more are listed);
+  uncheck it to disconnect it, the same as `lantern disconnect <serial>`. Under a phone's row a
+  note shows "Connecting…", "Reconnecting…", "Locked", "Removing Lantern…" or the companion's
+  state, and **Unlock {phone}…** while it is locked (see below). "No phone plugged in" when there
+  is none.
+- **Sync clipboard**, **Type with the Lantern keyboard (from the next connection)** and
+  **Connect phones when plugged in** (autoconnect): check items over the settings file below.
 - **Start Lantern at login**: whether `lanternd.service` is enabled (`systemctl --user
   enable|disable`); not stored in the settings file.
 - **Open settings folder**: `~/.config/lantern/` (the file is created with its defaults).
-- **Undo phone setup…**: asks first, then ends the session and does what `lantern undo-setup`
-  does, for the phone shown; the phone then stays disconnected until replugged or connected.
+- **Remove Lantern from a phone… ▸** one entry per known phone (greyed out unless it is plugged
+  in): asks first, then ends that phone's session and does what `lantern undo-setup` does for
+  it. The phone then stays switched off until you connect it again. If the phone was unplugged
+  (or is already being removed) while Lantern was asking, nothing happens and a notification
+  says why.
 - **Quit Lantern**: stops lanternd (systemd doesn't restart it). Start it again from the
   **Lantern** entry in the app menu, or `systemctl --user start lanternd`.
 
 Settings live in `~/.config/lantern/settings.toml` (`$XDG_CONFIG_HOME` is honoured). A missing
-file or key means the default; edits by hand apply within 2 s, no restart needed:
+file or key means the default (on, except `autoconnect`); edits by hand apply within 2 s, no restart needed:
 
 ```toml
 clipboard_sync = true     # copy text between the PC and the phone; applies at once
 lantern_keyboard = true   # type through the Lantern keyboard; applies at the next connection
+autoconnect = false       # connect a phone as soon as it is plugged in (false: Lantern asks)
 ```
 
 With `lantern_keyboard = false` the session changes only stay-awake: the phone's keyboard settings
@@ -186,6 +214,25 @@ Disconnect then Connect applies a change at once. A value of the wrong type fall
 key's default; a file that doesn't parse gives the defaults and the tray shows "Settings file has
 an error; using defaults" and won't overwrite it. When the tray writes the file it keeps unknown
 keys but rewrites the header comment and drops any other comments.
+
+## Phones: connect, autoconnect
+
+**Autoconnect is off by default**: plugging in a phone doesn't connect it (the phone's screen
+stays on and nothing on it changes). Lantern shows a notification **"{phone} is plugged in"**
+with a **Connect** button instead; clicking it, checking the phone in the tray, or `lantern connect`
+connects it (opening one of its menu entries offers the same button). Turn on **Connect phones when plugged in**
+(`autoconnect = true`) to have a plugged-in phone connect by itself, except a phone you switched
+off, which stays off until you connect it, and except while another phone is connected (you get
+the notification then, so one click switches).
+
+- A phone that was connected when lanternd stopped (logout, restart, `build.py install`)
+  reconnects by itself when lanternd starts again, without asking. Unplugging it for real (more
+  than 10 s), unchecking it, removing Lantern from it, switching to another phone or **Quit**
+  ends that.
+- A brief USB drop (a loose cable, adb restarting) of up to 10 s is not an unplug: the connected
+  phone reconnects at once, and no phone is asked about again.
+- With `LANTERN_SERIAL` set, that phone always connects when plugged in and every other phone is
+  ignored (no row, no notification).
 
 ## Locked phones
 
@@ -214,8 +261,9 @@ button. The tray's **Unlock {phone}…** row does the same.
 
 ## What it does to your phone
 
-Whenever the phone is plugged in and lanternd is running (the service starts with your login
-session), lanternd starts a session on the phone at once, even if no window is open:
+While a phone is connected (see [Phones](#phones-connect-autoconnect): you connect it, or it
+connects by itself with autoconnect or after a lanternd restart), lanternd keeps a session on it,
+even if no window is open:
 
 - **The phone's own screen (panel) is off while a session runs.** The phone stays awake, and
   the apps keep drawing to their Lantern displays. The panel comes back on when the session ends.
@@ -279,7 +327,7 @@ systemctl --user stop lanternd        # pause: ends the session and restores the
 systemctl --user disable --now lanternd   # stop starting it at login
 
 lantern undo-setup [--serial <serial>]   # with lanternd stopped: undo what Lantern did to the phone
-                                         # (or "Undo phone setup…" in the tray, lanternd running)
+                                         # (or "Remove Lantern from a phone…" in the tray, lanternd running)
 python3 tools/build.py uninstall      # disable --now, undo-setup (best effort), remove the unit
                                       # and ~/.local/bin/lantern
 ```
@@ -291,12 +339,13 @@ notification "Lantern set up your phone" and records the phone in
 companion and one notification per daemon run says so (details in `journalctl --user -u lanternd`).
 
 `lantern undo-setup` refuses whenever lanternd answers on its socket, even when idle (it may be
-about to retry a session); use the tray's "Undo phone setup…" then. It cannot see a lanternd on another runtime dir or another program using
+about to retry a session); use the tray's "Remove Lantern from a phone…" then. It cannot see a lanternd on another runtime dir or another program using
 adb on the phone; stop those first. It restores any
 setting a dead session left changed, the keyboard included (only where the setting still holds
 Lantern's value), deletes Lantern's files from `/data/local/tmp`, uninstalls the companion,
-takes that phone off its KDE menu entries (an entry and its icon go when no other phone lists
-the app), and forgets the phone. It prints one
+removes that phone's KDE menu entries, icons and folder (other phones' entries stay), and keeps
+the phone's record switched off (so it doesn't reconnect by itself; setting it up again shows
+"Lantern set up your phone" again). It prints one
 line per step and exits 0 only if every step succeeded. Without `--serial` it uses `$LANTERN_SERIAL`
 or the only connected phone.
 
@@ -307,8 +356,8 @@ reinstall or remove the companion with `adb uninstall dev.lantern.companion`).
 ## Acceptance test (real phone + KDE desktop)
 
 ```sh
-python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, 22, unattended
-python3 tools/device_test.py --manual                            # adds 8, 14 and 21: USB unplug, PIN
+python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, 22–25, unattended
+python3 tools/device_test.py --manual                            # adds 8, 14, 21, 26: USB unplug, PIN, a Connect click
 python3 tools/device_test.py --only 12 13                        # some items, by number or name
 python3 tools/device_test.py --nested                            # windows in a headless nested KWin
 python3 tools/device_test.py --signal=KILL                       # item 7 with SIGKILL
@@ -323,9 +372,15 @@ survive this phone's sync, 16 "Connect your …" for another phone's app, 17 cli
 18 keyboard setting off, 19 `lantern disconnect`/`connect`, 20 the tray menu (needs the real,
 unlocked desktop and its session bus), 21 the unlock prompt (manual: a PIN-locked phone, you
 type its PIN into the real dialog; `LANTERN_SERIAL` must name that phone), 22 a phone without a
-PIN never gets the unlock prompt.
+PIN never gets the unlock prompt, 23 per-phone menu folders, 24 autoconnect on remembers a phone
+switched off, 25 autoconnect off asks with "… is plugged in" and connects from the tray row, 26
+"Connect your …" from a menu entry connects the phone and opens the app (manual: you click
+Connect; real desktop only).
 
-The test restarts lanternd. Item 1 stops it first and reads the phone's own
+The test restarts lanternd, and serves only `LANTERN_SERIAL`'s phone (default the Xiaomi
+`20e9318`) for the run: it sets `LANTERN_SERIAL` in the systemd user environment if needed and
+puts the previous value back at the end, so other phones may stay plugged in. Items 24–26 lift
+it for their own steps and save/restore `settings.toml`. Item 1 stops it first and reads the phone's own
 `stay_on_while_plugged_in`, `default_input_method` and `enabled_input_methods`, which later items
 expect to see restored; set `LANTERN_STAY_ON_RESTORED=<value>` to give the first instead.
 `--signal=KILL` checks that systemd restarts a SIGKILLed lanternd and that the new session
@@ -356,21 +411,27 @@ apps, window titles with the app's name (and "(work)"), typing any text through 
 Lantern keyboard, text clipboard both ways, `lantern undo-setup`, and phone-safety hardening of
 the settings journal.
 
-Plan 3 (phones and tray) is implemented, with its on-device acceptance run still to do: menu
-entries for every phone you use, phone names in "Connect your …" notices, the tray with
-Connect/Disconnect, Undo phone setup and Quit, `settings.toml` (clipboard sync, the Lantern
-keyboard), start at login, and `lantern connect|disconnect`. Next:
+Plan 3 (phones and tray) is done: menu entries for every phone you use, phone names in "Connect
+your …" notices, the tray, `settings.toml` (clipboard sync, the Lantern keyboard), start at
+login, and `lantern connect|disconnect`. Plan 4a (unlocking a PIN-locked phone from the PC) is
+done.
 
-**Plan 4: integration**
+Plan 4b (phone switchboard) is implemented, with its on-device acceptance still to do: one menu
+folder per phone with entries that open on their own phone, the tray's per-phone checkmarks and
+Remove submenu, autoconnect (default off) with the "… is plugged in" and "Connect your …"
+notifications, per-phone "switched off" memory, and `lantern connect|disconnect [serial]` /
+`lantern open --phone`. Next, Plan 4c: several phones connected at once (each with its own
+session, clipboard to every phone, unlock per phone).
+
+**Plan 4: integration (later)**
 - Phone notifications in KDE. Clicking one opens that app's window.
 - Drag and drop files from the PC to the phone, through Android share with a Downloads fallback.
 - Phone audio on the PC (one stream).
 - Gamepads, following whichever Lantern window is active.
 - Pausing a window's encoder while it is minimised.
 - A latency harness, with a target of no more than 5 ms glass-to-glass behind scrcpy.
-- Choosing between two phones plugged in at once, and a settings window.
-- Clipboard with a PIN-locked phone (Android returns no clipboard until it is unlocked once), and
-  Ctrl shortcuts in Microsoft Windows App's remote sessions.
+- A settings window.
+- Ctrl shortcuts in Microsoft Windows App's remote sessions.
 
 **Later / ideas**
 - Wi-Fi or Tailscale transport (the transport is already replaceable).
@@ -385,7 +446,6 @@ Not yet verified:
 - typing through a real PC input method (ibus, fcitx5) and on a real (unlocked) Plasma desktop;
   so far the composition path ran through test hooks in a headless KWin;
 - a real password manager's secret hint (tested with a stand-in client, not KeePassXC);
-- a PIN keyguard;
 - third-party notification clicks;
 - app-initiated rotation on a real device;
 - long runs with 5–6 windows;

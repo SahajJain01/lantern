@@ -432,11 +432,44 @@ fn undo_question(name: &str) -> String {
     )
 }
 
-/// Whether an Undo the user confirmed for `serial` may go ahead: only while that phone is
-/// still plugged in (and not already being undone) in the current view.
-fn may_undo(view: &View, serial: &str) -> bool {
-    view.phone(serial)
-        .is_some_and(|p| p.plugged && p.state != PhoneState::Undoing)
+/// Why an Undo the user confirmed can't go ahead any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndoBlocked {
+    /// The phone was unplugged while Lantern was asking.
+    Unplugged,
+    /// Lantern is already being removed from it.
+    AlreadyRemoving,
+    /// The phone left the view (no longer plugged in or known).
+    Gone,
+}
+
+impl UndoBlocked {
+    /// The "Undo phone setup cancelled" notification's body for the phone called `name`
+    /// (escaped: the body is markup).
+    fn body(self, name: &str) -> String {
+        let name = crate::notices::escape_markup(name);
+        let again = "Plug it in and choose \"Remove Lantern from a phone…\" again.";
+        match self {
+            UndoBlocked::Unplugged => {
+                format!("{name} was unplugged while Lantern was asking. {again}")
+            }
+            UndoBlocked::AlreadyRemoving => {
+                format!("Lantern is already being removed from {name}.")
+            }
+            UndoBlocked::Gone => format!("Lantern no longer lists {name}. {again}"),
+        }
+    }
+}
+
+/// Whether an Undo the user confirmed for `serial` may go ahead (`None`): only while that
+/// phone is still plugged in, and not already being undone, in the current view.
+fn undo_blocked(view: &View, serial: &str) -> Option<UndoBlocked> {
+    match view.phone(serial) {
+        None => Some(UndoBlocked::Gone),
+        Some(p) if p.state == PhoneState::Undoing => Some(UndoBlocked::AlreadyRemoving),
+        Some(p) if !p.plugged => Some(UndoBlocked::Unplugged),
+        Some(_) => None,
+    }
 }
 
 /// Asks with kdialog, naming the phone clicked (`serial`); on "Remove" (exit 0) sends
@@ -488,21 +521,13 @@ async fn confirm_undo(shared: &Shared, serial: String) {
     };
     match child.wait().await {
         Ok(status) if status.code() == Some(0) => {
-            if may_undo(&shared.state().view, &serial) {
-                send(shared, Command::UndoSetup { serial });
-            } else {
-                tracing::info!(
-                    serial,
-                    "undo cancelled: the phone was unplugged while asking"
-                );
-                crate::notify::send(
-                    "Undo phone setup cancelled",
-                    &format!(
-                        "{name} was unplugged while Lantern was asking. Plug it in and choose \
-                         \"Remove Lantern from a phone…\" again."
-                    ),
-                    None,
-                );
+            let blocked = undo_blocked(&shared.state().view, &serial);
+            match blocked {
+                None => send(shared, Command::UndoSetup { serial }),
+                Some(reason) => {
+                    tracing::info!(serial, ?reason, "undo cancelled after the confirm");
+                    crate::notify::send("Undo phone setup cancelled", &reason.body(&name), None);
+                }
             }
         }
         Ok(_) => tracing::info!(serial, "tray: undo-setup cancelled"),
@@ -528,22 +553,41 @@ mod tests {
     }
 
     #[test]
-    fn may_undo_only_a_plugged_phone_it_named() {
+    fn undo_blocked_only_for_a_phone_it_named_and_says_why() {
         let view = View {
             phones: vec![
                 phone("A", PhoneState::Ready, true),
                 phone("B", PhoneState::Waiting, true),
                 phone("C", PhoneState::Unplugged, false),
                 phone("D", PhoneState::Undoing, true),
+                phone("F", PhoneState::Undoing, false),
             ],
         };
-        assert!(may_undo(&view, "A"));
+        assert_eq!(undo_blocked(&view, "A"), None);
         // Another phone being connected doesn't matter: the answer stays with its phone.
-        assert!(may_undo(&view, "B"));
-        assert!(!may_undo(&view, "C"), "unplugged while asking");
-        assert!(!may_undo(&view, "D"), "already being undone");
-        assert!(!may_undo(&view, "E"), "gone from the view");
-        assert!(!may_undo(&View::default(), "A"));
+        assert_eq!(undo_blocked(&view, "B"), None);
+        assert_eq!(undo_blocked(&view, "C"), Some(UndoBlocked::Unplugged));
+        assert_eq!(undo_blocked(&view, "D"), Some(UndoBlocked::AlreadyRemoving));
+        assert_eq!(undo_blocked(&view, "F"), Some(UndoBlocked::AlreadyRemoving));
+        assert_eq!(undo_blocked(&view, "E"), Some(UndoBlocked::Gone));
+        assert_eq!(undo_blocked(&View::default(), "A"), Some(UndoBlocked::Gone));
+    }
+
+    #[test]
+    fn undo_cancelled_text_follows_the_reason() {
+        let again = "Plug it in and choose \"Remove Lantern from a phone…\" again.";
+        assert_eq!(
+            UndoBlocked::Unplugged.body("A&B"),
+            format!("A&amp;B was unplugged while Lantern was asking. {again}")
+        );
+        assert_eq!(
+            UndoBlocked::AlreadyRemoving.body("Pixel"),
+            "Lantern is already being removed from Pixel."
+        );
+        assert_eq!(
+            UndoBlocked::Gone.body("Pixel"),
+            format!("Lantern no longer lists Pixel. {again}")
+        );
     }
 
     #[test]

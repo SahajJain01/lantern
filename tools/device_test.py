@@ -6,6 +6,7 @@
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
+    python3 tools/device_test.py --manual --only 26                  # Plan 4b: Connect from a notice
 
 Items (26; 22 automatic, 8, 14, 21 and 26 only with --manual):
      1 session_starts_on_plug              11 title_is_label
@@ -25,6 +26,16 @@ Items (26; 22 automatic, 8, 14, 21 and 26 only with --manual):
                                            25 autoconnect_off_asks_on_plug (adb reconnect, tray)
                                            26 connect_from_entry_opens_app (manual, Sahaj clicks)
 A full automatic run prints `22/22 PASS` when everything passes.
+
+Plan 4b (phone switchboard) items: 2 checks the window's app_id from the phone's names (the
+primary phone keeps `lantern.<pkg>`, any other gets `-p<tag>`), 10/15/16 the per-phone entries
+(`Exec=... open --phone <serial>`), 11 the per-phone `windows.json` size key, 19 `lantern
+disconnect|connect <serial>` and the record's `off`, 20 the tray's phone checkmark row, 22 the
+per-phone Unlock row, 23 the per-phone menu folders, 24 the `live`/`off` flags with autoconnect on,
+25 the "<phone> is plugged in" notice with autoconnect off, 26 "Connect your <phone>" opening the
+app after Connect. Other phones may stay plugged in: the preflight pins LANTERN_SERIAL. The first
+`build.py install` of Plan 4b migrates the real KDE menu once (journal: `menu migrated:
+primary=...`); check it by hand as docs/HANDOFF.md says, it is not an item.
 
 lanternd serves only LANTERN_SERIAL's phone during the run: the suite sets
 `LANTERN_SERIAL=<SERIAL>` in the systemd user environment (restarting lanternd) if it isn't set

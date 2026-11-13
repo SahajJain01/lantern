@@ -1,4 +1,4 @@
-# Lantern — handoff (end of Plan 4a, 2026-11-13)
+# Lantern — handoff (Plan 4b implemented, device acceptance pending, 2026-11-14)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -36,12 +36,83 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   keyguard focus check now rejects any `pkg/cls` title; these docs), both done. The SDD ledger and reports are in the main checkout's gitignored
   `.superpowers/sdd/2026-11-13-lantern-unlock-prompt/`.
   - Host: `cargo test --workspace --offline` 341 passed, 1 ignored; clippy clean (2026-11-13).
+- **Plan 4b** (`docs/superpowers/plans/2026-11-14-lantern-phone-switchboard.md`, design
+  `docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md` G1–G5): **implemented on
+  branch `plan4b-phone-switchboard`** (worktree `.worktrees/plan4b`, base `main` `eda6412`),
+  **host tests passing, device acceptance pending** (Task 7 Steps 2–4, see "Plan 4b device
+  acceptance (pending)"). Device steps were deferred by Sahaj's instruction to one run at the
+  end. Tasks 1, 4 and 5 passed review without a fix round, Tasks 2 and 3 after one, Task 6 after
+  two; Task 7 (these docs plus three small ledger fixes: the `LANTERN_SERIAL` refusal text, the
+  Remove-cancel notice reason, the asserted fake kdialog) is the last. Not yet merged and not installed.
+  - Host: `cargo test --workspace --offline` all passing (see the Task 7 report for counts);
+    clippy `-D warnings` clean; `git diff --stat host/proto/golden` empty for the whole plan.
+  - The SDD ledger and per-task reports are in the worktree's gitignored
+    `.superpowers/sdd/2026-11-14-lantern-phone-switchboard/` (copy them to the main checkout
+    before `git worktree remove`).
+  - **Menu incident (Task 2, 2026-11-14):** a Task 2 test run spawned `lantern daemon` on the real
+    XDG dirs and migrated Sahaj's real KDE menu (Exec lines pointed into the worktree), and a
+    fake_adb undo test then deleted `lantern.menu` and `lantern-phone.directory`. It was restored
+    to the Plan 3 format the same day (70 entries, `Exec` = `~/.local/bin/lantern`, serial counts
+    15/3/52 as at the Plan 3 acceptance, menu files back; residual: every shared entry's
+    `X-Lantern-Serial` marker reads `ZD222LMDFV` and mtimes are new, both rewritten on the real
+    migration). Since then every test that spawns `lantern` uses scratch XDG dirs (incl. cache),
+    a dead session bus and stubbed `kbuildsycoca6`/`notify-send`/`kdialog` with asserted markers,
+    and every task checked a before/after fingerprint of his real files (identical).
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
-Lantern is **installed and running** on the PC from the **Plan 4a** branch build (2026-11-13; same code as `main` `08b974b`):
+Lantern is **installed and running** on the PC from the **Plan 4a** branch build (2026-11-13; same code as `main` `08b974b`); the Plan 4b build is not installed yet (its first `build.py install` migrates the real menu):
 `~/.local/bin/lantern`, user unit `lanternd.service` (enabled). When the phone is plugged in, its
 screen turns off, the Lantern keyboard is selected, and its apps are in the KDE menu under
 **Phone**.
+
+### Plan 4b device acceptance (pending: plan Task 7 Steps 2–4)
+
+Run in `.worktrees/plan4b` with Sahaj, the desktop **unlocked**. `build.py install` restarts
+lanternd from the Plan 4b build: the served phone's panel goes off and stay-awake reads 7. Ask
+first if `lantern status` shows windows he is using.
+
+1. **Migration check (Step 3), before the install.** Save the real menu and pins:
+   ```sh
+   S=~/.hermes/cache/scratch/plan4b-menu-before; mkdir -p $S
+   cp -p ~/.local/share/applications/lantern.*.desktop $S/
+   grep '^launchers=' ~/.config/plasma-org.kde.plasma.desktop-appletsrc > $S/launchers.txt
+   cp -p ~/.local/share/applications/dev.lantern.Lantern.desktop $S/
+   ```
+2. **Acceptance run (Step 2).** Two phones attached is fine (the preflight pins
+   `LANTERN_SERIAL`):
+   ```sh
+   python3 tools/build.py install && python3 tools/device_test.py
+   ```
+   Expected: all automatic items PASS: 1–7, 9–13, 15–20, 22–25 (`22/22 PASS`). Then, after
+   telling Sahaj the step ("click Connect on the 'Connect your Xiaomi 11T Pro' notification"):
+   ```sh
+   python3 tools/device_test.py --manual --only 26
+   ```
+   Record the summary line and timings here.
+3. **After the install (Step 3 continued):**
+   ```sh
+   journalctl --user -u lanternd | grep 'menu migrated'        # primary=ZD222LMDFV …
+   ls ~/.local/share/applications/lantern.com.microsoft.rdc.androidx-u10.desktop  # pinned launcher still there
+   ls ~/.local/share/applications/ | grep -- '-p20e9318\.desktop$' | wc -l         # the Xiaomi's apps
+   grep -l '^X-Lantern-Serials=' ~/.local/share/applications/lantern.*.desktop    # expect nothing
+   cmp ~/.local/share/applications/dev.lantern.Lantern.desktop ~/.hermes/cache/scratch/plan4b-menu-before/dev.lantern.Lantern.desktop
+   cat ~/.local/state/lantern/menu.json                        # {"version":2,"primary":"ZD222LMDFV"}
+   ```
+   Ask Sahaj to look at Kickoff: Phone → "Xiaomi 11T Pro" and Phone → "edge 50 pro"; take a
+   screenshot. List the Xiaomi pins that need re-pinning (none were pinned on 2026-11-14).
+4. **Two-phone hand check (Step 4):** both phones plugged in, `LANTERN_SERIAL` unset
+   (`systemctl --user show-environment | grep LANTERN` empty), `autoconnect` off:
+   - `systemctl --user restart lanternd`: the tray shows two unchecked rows, row 15 "Lantern
+     connects one phone at a time", and two "… is plugged in" notifications (phones without a
+     `live` flag are asked).
+   - Check the Xiaomi: ready (`lantern status`). Check the Motorola: the Xiaomi is restored,
+     `~/.local/state/lantern/devices/20e9318.json` has `off:false, live:false`, the Motorola is
+     ready.
+   - Uncheck the Motorola: `devices/ZD222LMDFV.json` has `off:true`.
+   - Open a Xiaomi entry from Kickoff: "Connect your Xiaomi 11T Pro"; its **Connect** connects
+     the Xiaomi and opens the app.
+   - Tell Sahaj which phone was left connected.
+5. Commit the results here (`docs: Plan 4b acceptance, protocol and README updates`).
 
 ### Plan 2 acceptance (`tools/device_test.py`, Xiaomi 20e9318, 2026-11-10)
 
@@ -172,6 +243,9 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
    first with a probe.
 
 ### Still unverified
+- **All of Plan 4b on a device** (pending acceptance above): the real menu migration, per-phone
+  folders in Kickoff, the tray switchboard, the plugged-in / Connect-your notifications on
+  Plasma, the unplug grace on a real cable, and a two-phone switch.
 - The Motorola work-profile catalogue, badged icons and the `Files (work)` title (Task 5/6/10).
 - Typing on the real desktop: real focus, a physical `abc`, and any real PC input method (none
   runs on this PC: no ibus, no fcitx5). The composition path ran only through `LANTERN_DEBUG_INPUT`
@@ -208,11 +282,11 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
 | `android/helper/` | Java helper. It runs as the shell user via `app_process` and owns the virtual displays, encoders, input, power, settings, the companion link and the phone clipboard. Built with `source ~/.local/opt/pd-toolchain/env.sh && python3 tools/build.py helper`; host-JVM tests run as part of the build. |
 | `android/companion/` | Companion APK `dev.lantern.companion`: `LinkProvider` (the link), `LanternIme` (the invisible keyboard), the launcher catalogue, `LinkReceiver` (test-only `TEST_ACTIVITY`) and the disabled `TestActivity`. Built without Gradle by `python3 tools/build.py companion`. |
 | `host/proto/` | Rust crate `lantern-proto`: the wire protocol v1 and golden vectors that both sides test against. |
-| `host/lantern/` | Rust crate `lantern`. `lantern daemon` is lanternd: device tracking, helper and companion deploy, session, window IPC, KDE menu catalogue for every phone (`daemon/catalog.rs`), commands and the published view (`daemon/control.rs`), PC clipboard (`clipboard/`), settings file (`settings.rs`), the tray (`tray/`: `menu.rs` pure menu model, row ids 1–13, `sni.rs`, `dbusmenu.rs`, `mod.rs`), desktop command env (`desktop.rs`), the unlock prompt (`unlock.rs`: notification, PIN dialog, `Pin`, the tray's `Request` handle). `lantern open <pkg>` is one process per window (winit/wgpu, VA-API decode, text input). `lantern status` prints the daemon state; `lantern connect`/`disconnect` pause and resume the phone. `lantern undo-setup` reverses the phone setup. |
+| `host/lantern/` | Rust crate `lantern`. `lantern daemon` is lanternd: device tracking, helper and companion deploy, session, window IPC, KDE menu catalogue for every phone (`daemon/catalog.rs`), commands and the published view (`daemon/control.rs`), PC clipboard (`clipboard/`), settings file (`settings.rs`), the tray (`tray/`: `menu.rs` pure menu model, fixed row ids 1, 4–12, 14 and 15 plus `100n`, `100n+1`, `100n+2` per phone slot and `100n+50` Remove children, `sni.rs`, `dbusmenu.rs` with submenus, `mod.rs`), desktop command env (`desktop.rs`), the unlock prompt (`unlock.rs`: PIN dialog, `Pin`, the tray's `Request` handle), notifications with actions (`notices.rs`), the connect prompt (`connect.rs`: "… is plugged in" / "Connect your …" / "Plug in your …"), the pure connect rules (`daemon/phones.rs`), per-phone names and `menu.json` (`naming.rs`). `lantern open [--phone S] <pkg>` is one process per window (winit/wgpu, VA-API decode, text input; `window/resolve.rs` picks the phone without `--phone`). `lantern status` prints the daemon state; `lantern connect`/`disconnect [<serial>]` switch a phone on and off. `lantern undo-setup` reverses the phone setup. |
 | `docs/protocol.md` | The wire spec, including the companion link. Keep it in step with both sides. |
 | `docs/spikes/RESULTS.md` | Risk-spike measurements, plus the Plan 2 IME display policy finding. |
 | `tools/build.py` | Targets: `helper`, `companion`, `all`, `install` (also the Lantern launcher `dev.lantern.Lantern.desktop`), `uninstall` (runs `lantern undo-setup` best effort, removes the launcher). |
-| `tools/device_test.py` | On-device acceptance suite, items 1–22 (19 automatic): `--manual` adds 8, 14 and 21, `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; item 20 still needs the real session bus), `--state`. |
+| `tools/device_test.py` | On-device acceptance suite, items 1–26 (22 automatic): `--manual` adds 8, 14, 21 and 26, `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; items 20 and 26 still need the real session bus), `--state`. The preflight pins `LANTERN_SERIAL` (restored afterwards), so other phones may stay plugged in. |
 
 ## Environment facts
 - Phone: Xiaomi 11T Pro, serial `20e9318`, Android 17 / SDK 37, LineageOS 24, swipe keyguard, USB
@@ -242,9 +316,12 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
   or battery death mid-session (it persists `ime_prev` in device-protected storage and arms when
   the Lantern IME is created with no link). After such a reboot, stay-awake (7) and the Lantern
   entry in `enabled_input_methods` stay until the next session restores them from the journal.
-- Lantern's PC-side files: `~/.config/lantern/settings.toml` (Plan 3), the device records
-  `~/.local/state/lantern/devices/<serial>.json` (now with the phone's `name`), the menu entries
-  `~/.local/share/applications/lantern.*.desktop` (+ `X-Lantern-Serials=`), icons in
+- Lantern's PC-side files: `~/.config/lantern/settings.toml` (Plan 3; `autoconnect` from 4b),
+  the device records `~/.local/state/lantern/devices/<serial>.json` (`name`, `companion`,
+  `off`, `live`, `connected_at`, `serial`; `.lock` beside them), `~/.local/state/lantern/menu.json`
+  (Plan 4b: the primary phone), the menu entries `~/.local/share/applications/lantern.*.desktop`
+  (Plan 4b: one per phone and app, `X-Lantern-Serial=`; until the migration runs, Plan 3's shared
+  `X-Lantern-Serials=`), the folder files `lantern-phone[-<tag>].directory`, icons in
   `~/.local/share/lantern/icons/`, and the launcher `dev.lantern.Lantern.desktop`.
 - A locked Plasma session gives windows no frames. Window checks then need `--nested` (or
   `kwin_wayland --virtual --no-lockscreen --socket <name>` and `WAYLAND_DISPLAY=<name>`); that
@@ -305,14 +382,73 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
   "Lantern set up your phone" the first time (record in `~/.local/state/lantern/devices/`). A
   failed install leaves a session without the companion and one notification per daemon run.
 
+## Plan 4b decisions (Sahaj may override)
+The design (`docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md`) left these to
+the builder; the plan's numbering:
+
+1. **Primary phone keeps the old names.** The migration picks as primary the phone with the most
+   legacy entries pinned in Plasma's task manager (`launchers=` in
+   `plasma-org.kde.plasma.desktop-appletsrc`, read only), then the most legacy entries, then the
+   smallest serial. On this PC the only pinned Lantern launcher is
+   `lantern.com.microsoft.rdc.androidx-u10.desktop`, so the Motorola becomes primary and the
+   Xiaomi's apps get new names (re-pin them once). On a fresh install the first phone that starts
+   a session is primary. Recorded in `~/.local/state/lantern/menu.json`.
+2. **Names.** `tag(serial)` = `[A-Za-z0-9_]` kept, anything else `_`, at most 64 chars. app_id
+   `lantern.<pkg>[-u<N>]` (primary) or `…-p<tag>`; `windows.json` key `<pkg>[:<N>]` or
+   `…@<serial>`; category `X-Lantern-<tag>`; folder `lantern-phone-<tag>.directory`. A second
+   serial with the same tag is refused with a warning; the first phone's files stay untouched
+   (and a refused phone's legacy files are kept, Ruling R4).
+3. **`live` is cleared by** a real unplug (absent past the grace), unchecking, Undo, being
+   switched away for another phone (or left waiting while another connects, R5), the tray's
+   **Quit**, and lanternd starting while that phone stays absent for the whole grace.
+   SIGTERM/SIGINT keep it.
+4. **With autoconnect on and another phone live,** a newly plugged phone is not connected but
+   gets "… is plugged in", so one click switches to it.
+5. **`LANTERN_SERIAL`:** lanternd ignores every other serial (not listed, never prompted or
+   started); CLI commands naming another serial are refused with "phone <s> is not served:
+   lanternd serves only <c> because LANTERN_SERIAL=<c> is set". The bypass applies when the
+   phone comes online; an explicit Disconnect still switches it off.
+6. **Undo keeps the record:** sets `off`, clears `live`, sets `companion:false` only when the
+   phone steps succeeded (so a new setup shows "Lantern set up your phone" again).
+7. **No settings part = autoconnect on** (tests and embedders); lanternd always passes its
+   settings handle (default off).
+8. **`lantern status`** stays additive: top-level fields describe the live phone (`paused` = no
+   live phone and the phone switched off most recently is still plugged); optional `phones`
+   lists every known or plugged phone.
+9. **Refused opens are lanternd's notification** while its connect prompt runs and the
+   notification server answers: `error{"phone not connected; Lantern offered to connect it"}`
+   and the window shows nothing. Otherwise the old errors and the window's own notice (naming
+   only the `--phone` phone).
+10. **The two-minute request** opens the app once (`lantern open --phone S [--user N] -- pkg`)
+    when S's session becomes ready. The latest phone choice drops every other phone's request
+    (R5); Disconnect/Undo drop that phone's own.
+11. **The tray's one-at-a-time note** (row 15) shows while two or more phones are listed.
+
+Also settled during execution (ledger rulings):
+- **R3:** `update_record` takes an flock on `devices/.lock` around its read-modify-write, so a
+  lost `off` write can't connect a phone without his say-so.
+- **R5:** a named serial that is neither plugged in nor known is refused (no record, no tray
+  row).
+- **R6/R7:** notification titles are plain text (Plasma renders the summary as text); names are
+  escaped in bodies only. Every phone that goes offline while not live gets the same 10 s unplug
+  grace (also one released mid-grace by a switch, Disconnect or Undo, which keeps the rest of its
+  grace): back within it is a blip and never prompts; past it its notice closes.
+- **Prompt health:** lanternd offers Connect only while the notification server answered its
+  last `Notify`/`GetServerInformation` (probed every 3 s while unhealthy), so a refused open is
+  never silently lost.
+- **Remove (tray):** "Remove Lantern from a phone…" submenu, one child per known phone; the
+  kdialog answer is pinned to the clicked serial and cancelled, with a notice saying why
+  (unplugged, already being removed, or no longer listed), if that phone changed meanwhile.
+
 ## Plan 3 decisions (Sahaj may override)
-- **Menu entries for every phone** (Sahaj, 2026-11-10; spec §9a updated). One `.desktop` per
+- **Menu entries for every phone** (Sahaj, 2026-11-10; spec §9a updated; **superseded by Plan
+  4b**: one file per phone, see `docs/protocol.md` "KDE menu"). One `.desktop` per
   app_id, `X-Lantern-Serials=a;b;` lists the phones that have it (a Plan 2 file with only
   `X-Lantern-Serial=` reads as that one phone). A matching full sync from phone S only takes S off
   entries it didn't list, per Android user that sent apps; an entry and its icon go when no phone
   lists it; unplugging changes nothing; `undo-setup` takes one phone off. Name/icon from the phone
   that synced last.
-- **One session at a time.** `select_serial`: `LANTERN_SERIAL`, else the phone being served if
+- **One session at a time** (**superseded by Plan 4b's connect rules**). `select_serial`: `LANTERN_SERIAL`, else the phone being served if
   still online, else the first online one; when the live phone goes offline, the next online one
   starts. The personal fallback serial is gone. Choosing between two phones plugged in at once is
   Plan 4.
@@ -359,12 +495,26 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
 - **Cargo.lock** offline-resolution downgrades (clap, wasm-bindgen, js-sys, toml_edit, winnow)
   were accepted for `zbus`/`toml` (Ruling R7); re-resolve when online.
 
-## Next: Plan 4 (not yet written)
+## Next: Plan 4c (not yet written)
 
-Plans 3 and 4a are merged. Write Plan 4 with
-superpowers:writing-plans and run it with
-superpowers:subagent-driven-development. Candidates (Plan 3's "Out of scope" plus the field
-findings):
+After Plan 4b's device acceptance and merge, write **Plan 4c** from the same design
+(`docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md`, "Several sessions (G6–G8)")
+with superpowers:writing-plans, and run it with superpowers:subagent-driven-development:
+
+- **G6. Several phones live at once:** every checked phone gets its own session (helper, adb
+  forward, retry backoff, companion state, lock state, journal, restore); window ids unique
+  across phones; single-instance focus keyed on phone + package + user; Plan 4b's "checking one
+  phone switches the other off" rule is removed. 4b's data shapes are already per phone (records,
+  desktop files, app_id/`windows.json` keys, tray rows, `open.phone`, `View.phones`,
+  `status_report.phones`), so 4c adds sessions.
+- **G7. Clipboard with several phones:** a PC copy goes to every live phone, a phone copy to the
+  PC and on to the others, never echoed back to its source; per-phone echo suppression and
+  held copies.
+- **G8. Unlock per phone:** each phone's own lock stretch and notification; one PIN dialog at a
+  time across phones; Plan 4a's serial pinning unchanged.
+- Undo acts on the named phone without touching other live sessions.
+
+Still open from earlier lists (later plans):
 
 - Notifications from the phone in KDE, with clicks opening that app's window (§8.5).
 - Drag and drop from PC to phone: copy the file, then use Android share, falling back to Downloads.
@@ -374,9 +524,7 @@ findings):
   open, or it reconnects over and over.
 - Pausing a window's encoder while it is minimised, within protocol v1 (see `docs/protocol.md`).
 - A latency harness, and the target from spec §9a/§11: no more than 5 ms worse than scrcpy.
-- Choosing between two phones plugged in at the same time (today the first one online wins).
 - A settings window (the tray holds the few settings today).
-- ~~Field finding 1~~: fixed by Plan 4a (device-checked 2026-11-13).
 - Field finding 2: `default_input_method` changed to Gboard mid-session — find the cause; consider
   the helper re-asserting the Lantern keyboard or reporting a keyboard changed by someone else
   (and a stale Lantern entry already in the journaled `enabled_input_methods` original).
@@ -531,15 +679,15 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
       (`escape_value` drops/truncates); real adb serials are unaffected.
     - undo-setup's "removed {n} entries" also counts shared entries kept for another phone
       (`undo.rs`).
-    - `upsert` writes the menu files before the entry, so a failed entry write can leave an empty
-      Phone menu.
+    - ~~`upsert` writes the menu files before the entry~~ (fixed in Plan 4b Task 2: entry first).
     - An empty `X-Lantern-Serials=` value makes an entry nobody can remove; fall back to
       `[X-Lantern-Serial]` when it is empty.
   - Phone names and "Connect your …":
     - `read_phone_name` keeps trying after an adb error (worst case about 40 s added to the
       session start); stop on the first error (`companion.rs`).
     - Phone names go unescaped into the notify-send body (Plasma markup: `&`, `<`, `>`).
-    - The device record's name temp file isn't fsynced before the rename.
+    - ~~The device record's name temp file isn't fsynced before the rename~~ (fixed in Plan 4b
+      Task 1: `write_atomic`).
     - The window's "here" phone can be wrong if the session changes between the refusal and its
       status query.
   - Settings:
@@ -553,8 +701,8 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
     - `ImeSetup` shares one "drop logged" flag across drop reasons (one extra or missing log
       line).
   - Daemon control:
-    - The pause is one slot: disconnect A, B starts, disconnect B unpauses A; unplugging B then
-      starts A without a Connect. The final review must call this MUST-FIX or OK-TO-DEFER.
+    - ~~The pause is one slot~~ (fixed in Plan 3's final review, and replaced in Plan 4b by the
+      per-phone `off` flag in each device record).
     - The undo future runs inline in the run loop, and `remove_entries`' `block_in_place` stalls
       the loop briefly.
     - Quit during an undo stops serving clients until the undo ends.
@@ -595,6 +743,41 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
       nothing). Fix: `drive` also requires `hub.locked()` before `send_unlock`.
   - Docs (fixed in Task 4): protocol.md's "unknown counts as unlocked" wording and the
     `unlock_result` reasons.
+- **Plan 4b** (`minor (deferred)` in the Plan 4b SDD ledger, for the final review's triage; none
+  leaves the phone changed)
+  - Catalogue and migration:
+    - A corrupt or deleted `menu.json` reruns the migration, which may pick another primary and
+      give duplicate entries (prefer the serial that already owns the legacy stems).
+    - The `keep_old` comment overstates; a kept shared file is invisible in the menu
+      (`Categories=X-Lantern` only).
+    - Colliding tags: a folder file carrying another serial's marker can be deleted later in the
+      same `write_menu` run; a kept file plus a new `-p` file can give an allowed phone two
+      entries; a kept unsuffixed file occupies the primary slot; the in-place rewrite drops a
+      refused serial (each logs a warning).
+    - `X-Lantern-Serial` is truncated at 200 chars, so an overlong serial never matches its own
+      files (real adb serials are unaffected).
+  - Daemon and CLI:
+    - CLI undo-setup's check-then-act window against a lanternd that starts meanwhile
+      (pre-existing).
+    - Under `LANTERN_SERIAL` a ready phone can be both `off` and `live` (decision 5).
+    - An open naming a phone that is already connecting gets "Connect your A" and is lost if not
+      clicked; store a pending open instead.
+    - Notices are not closed when lanternd quits.
+    - A Connect click during that phone's Undo is dropped silently.
+    - Fixed in Task 7: CLI commands for other serials under `LANTERN_SERIAL` now get an explicit
+      error saying why (was a misleading "not plugged in or known", and protocol.md said
+      "ignored").
+  - Tray:
+    - A click on a phone row decides check/uncheck at click time, not from what was shown (a
+      stale menu can toggle the opposite way, same phone).
+    - The tooltip shows no removal state.
+    - Fixed in Task 7: the Remove-cancel notice now names its reason (unplugged, already being
+      removed, no longer listed), and `tests/tray.rs`'s fake kdialog writes a marker the Remove
+      tests assert.
+  - Tests:
+    - No-runtime scratch dirs left behind; `scratch_xdg` also on usage-error spawns.
+    - The ignored test `failed_open_prints_the_error_once_and_exits_1` uses the real Wayland
+      session and bus.
 - **Tests**
   - Several tests rely on fixed sleeps or timing windows (fake_adb, fake_helper, ipc, the catalogue
     debounce, CompanionLink); some assert little (`setExtrasAcceptsHandler`, the ipc mismatch step,

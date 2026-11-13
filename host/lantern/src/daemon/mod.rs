@@ -529,6 +529,7 @@ where
         names,
         cache: HashMap::new(),
     };
+    hub.set_configured(configured.clone());
     let configured = configured.as_deref();
     // Records with a stale `live` flag are cleared once the grace after start has passed.
     let mut startup = state_dir

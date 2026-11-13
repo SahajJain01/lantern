@@ -362,6 +362,8 @@ pub struct Hub {
     view: View,
     /// Where the device records are (`connected_at` for `lantern status`).
     state_dir: Option<PathBuf>,
+    /// `$LANTERN_SERIAL`: the only phone lanternd serves; commands naming another are refused.
+    configured: Option<String>,
     /// The phone's PIN lock is in the way (`locked` .. `unlocked`); false between sessions.
     locked: bool,
     /// Where `locked`/`unlocked`/`unlock_result` go (the unlock prompt), if anywhere.
@@ -403,6 +405,7 @@ impl Hub {
             commands: Vec::new(),
             view: View::default(),
             state_dir: None,
+            configured: None,
             locked: false,
             lock_events: None,
             opened: HashSet::new(),
@@ -517,6 +520,11 @@ impl Hub {
         self.state_dir = state_dir;
     }
 
+    /// `$LANTERN_SERIAL`, so a command naming another phone is refused with that reason.
+    pub fn set_configured(&mut self, configured: Option<String>) {
+        self.configured = configured;
+    }
+
     /// The menu name of `pkg` for `user` (from any phone's entry), else `pkg`.
     pub fn app_name(&self, pkg: &str, user: u32) -> String {
         match &self.catalog {
@@ -527,9 +535,17 @@ impl Hub {
 
     /// The command `daemon{cmd, serial}` asks for. Without a serial it is for the only plugged-in
     /// phone; `Err` is the reply when there is none or several. A named serial must be a phone
-    /// the view lists (plugged in or known): a typo must not create a device record.
+    /// the view lists (plugged in or known): a typo must not create a device record. Under
+    /// `$LANTERN_SERIAL` any other serial is refused, saying why.
     fn daemon_command(&self, cmd: DaemonCmd, serial: Option<String>) -> Result<Command, String> {
         let serial = match serial {
+            Some(serial) if self.configured.as_ref().is_some_and(|c| *c != serial) => {
+                let only = self.configured.as_deref().unwrap_or_default();
+                return Err(format!(
+                    "phone {serial} is not served: lanternd serves only {only} because \
+                     LANTERN_SERIAL={only} is set"
+                ));
+            }
             Some(serial) if self.view.phone(&serial).is_none() => {
                 let known: Vec<String> = self
                     .view

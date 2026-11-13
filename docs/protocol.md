@@ -111,7 +111,9 @@ added is host-only (`daemon`, `status_report` state `paused`, the window-IPC err
 `label` and `work` on `opened`, `work` on `app`, and `msg` on `companion` are omitted when absent
 (`work` when false), so an `opened` without them is still the v1 bytes. Plan 4a adds the new
 types `locked`, `unlocked`, `unlock` and `unlock_result` (all stream 0, see "Lock rules"), within
-v1.
+v1. Plan 4b adds nothing on the helper side: only the host-only optional `open.phone`,
+`daemon.serial` and `status_report.phones`, each omitted when absent, so every existing message
+keeps its bytes (the golden vectors are unchanged).
 
 ## Text, clipboard, catalogue rules
 
@@ -135,15 +137,9 @@ v1.
   (added or changed) and `app_removed` messages. A full catalogue whose `apps_end.count` matches
   the `app` messages received replaces the previous one (apps missing from it are removed); a
   partial one (the link dropped mid-list, or the count differs) removes nothing.
-- Several phones (host-only, lanternd's KDE menu): there is one `.desktop` entry per app_id
-  (`lantern.<pkg>[-u<N>]`, never a serial), listing every phone that has the app as
-  `X-Lantern-Serials=a;b;` (each serial `;`-terminated, `;` inside one escaped; a Plan 2 entry
-  with only `X-Lantern-Serial=` counts as listing that one phone). A session only adds or removes
-  its own phone's serial: a matching full catalogue from phone S takes S off the entries it did
-  not list (only for the Android users that sent at least one `app`), and an entry (and its icon)
-  is deleted when no phone lists it. `app_removed` takes S off that one entry. Name and icon come
-  from the phone that synced last. Unplugging changes no entry; `lantern undo-setup` takes that
-  phone off every entry the same way.
+- Several phones: see "KDE menu (catalogue layout)" below. A matching full catalogue from phone S
+  removes only S's own entries that it did not list (only for the Android users that sent at
+  least one `app`); `app_removed` removes S's one entry.
 - `companion{state}` is sent after the hello reply: `"ready"` when the companion linked and the
   Lantern keyboard is selected, `"ready"` with `msg:"keyboard off in Lantern settings"` when it
   linked and the hello said `keyboard:false`, `"unavailable"` (with a `msg`) otherwise:
@@ -376,8 +372,47 @@ sends it to the helper, and the helper ignores unknown keys.
 
 `open.phone` is the serial of the phone the window wants (`lantern open --phone <serial>`). It is
 window → daemon only: omitted when absent (so a v1 `open` is byte-identical), and the daemon
-strips it, like `activation_token`, before forwarding the `open` to the helper. Until lanternd
-routes opens by phone it is otherwise ignored.
+strips it, like `activation_token`, before forwarding the `open` to the helper. lanternd routes
+by it (see "Window IPC").
+
+## KDE menu (catalogue layout, host-only)
+
+lanternd keeps one `.desktop` file per (phone, app, Android user) in
+`$XDG_DATA_HOME/applications`, icons in `$XDG_DATA_HOME/lantern/icons/<app_id>.png`.
+
+- **Ownership:** a `.desktop` file is Lantern's only if it has an `X-Lantern-Serial=` line (the
+  phone it belongs to). lanternd never modifies or deletes any other file, including at a path it
+  would like to write (that entry is skipped with a warning). There is no `X-Lantern-Serials=`
+  line any more; the one-time migration below removes it.
+- **Names:** one *primary* phone keeps the pre-4b names: file `lantern.<pkg>[-u<N>].desktop`,
+  window app_id `lantern.<pkg>[-u<N>]`, `windows.json` size key `<pkg>[:<N>]`, so its pinned
+  launchers keep working. Every other phone gets `-p<tag>` on the file stem and app_id
+  (`lantern.<pkg>[-u<N>]-p<tag>`) and `@<serial>` on the size key. `<tag>` is the serial with
+  every character outside `[A-Za-z0-9_]` turned into `_`, at most 64 chars. `-` never occurs in a
+  package name, so no app_id collides. Window app_id = `.desktop` stem = `StartupWMClass`. Two
+  serials with the same tag: the second phone's entries are refused with a warning and the first
+  phone's files stay untouched.
+- **Entry:** `Name` (the app's label), `Exec=<lantern> open --phone <serial> [--user N] <pkg>`,
+  `Icon`, `Categories=X-Lantern-<tag>;`, `StartupWMClass=<app_id>`, `X-Lantern-Serial=<serial>`,
+  `X-Lantern-Package`, `X-Lantern-User`.
+- **Folders:** `$XDG_CONFIG_HOME/menus/applications-merged/lantern.menu` puts a **Phone** menu
+  (`lantern-phone.directory`) with one submenu per phone (`lantern-phone-<tag>.directory`, named
+  after the phone, carrying `X-Lantern-Serial=`), sorted by name, each holding
+  `X-Lantern-<tag>`. A phone's folder file goes with its last entry; the menu files go only when
+  no Lantern entry is left.
+- **Primary:** `$XDG_STATE_HOME/lantern/menu.json` = `{"version":2,"primary":"<serial>"|null}`,
+  written (temp + fsync + rename) before lanternd serves any session. On a fresh install the
+  first phone that starts a session becomes primary.
+- **Migration** (once, at lanternd start, while `menu.json` is absent or older than version 2):
+  each Plan 3 shared file (`X-Lantern-Serials=a;b;`, or a Plan 2 single `X-Lantern-Serial=`) is
+  split into one file per phone. The primary is the phone with the most legacy entries pinned in
+  Plasma's task manager (`launchers=` in `plasma-org.kde.plasma.desktop-appletsrc`, read only),
+  then the most entries, then the smallest serial. The file that is itself a target is rewritten
+  last, so a run cut short still lists every phone and a rerun finishes it without duplicates.
+  `menu.json` is written last; the journal logs `menu migrated: primary=… written=… removed=…`.
+- **Sync rules:** a session only writes, prunes and removes its own phone's files. Unplugging
+  changes no entry. `lantern undo-setup` (and the tray's Remove) deletes that phone's entries,
+  icons and folder; other phones' files are untouched.
 
 ## Window IPC (lanternd ↔ `lantern open`)
 
@@ -388,19 +423,39 @@ on start, a live one means another daemon is running. The daemon listens even wi
 - One client per window. Its first frame must be `open` on stream 0, carrying the client's
   `XDG_ACTIVATION_TOKEN` as `activation_token` if it has one. Anything else first gets
   `error{msg}` on stream 0 and the connection is closed.
-- No phone session: `error{msg:"phone not connected"}` on stream 0, then close. If the phone was
-  disconnected in Lantern (`status_report` state `paused`) the `msg` is
-  `"phone disconnected in Lantern"` instead.
-- App on other phones only: once this session's first full catalogue has arrived (its count
-  matched), an `open` whose app has a menu entry that does not list the session's phone gets
-  `error{msg:"app not on this phone"}` on stream 0, then close. Before that first sync, or for an
-  app with no entry, the `open` is forwarded as usual (so a newly installed app is never refused
-  by a stale list).
-- `lantern open` turns these three refusals (on stream 0, before any `opened`) into a desktop
-  notification and exits 1: "Connect your <phone name>" (the phones the entry lists, named from
-  their device records, else their serials; "Connect your phone" when none), with the body
-  naming the connected phone that lacks the app; or "Lantern is disconnected" for the paused
-  case.
+- **`open` with `phone`** (`lantern open --phone S`, which every menu entry uses):
+  - S is the live session's phone (its helper is up): the `open` is forwarded (without `phone`);
+    the "app not on this phone" check below is skipped.
+  - Otherwise, while lanternd's connect prompt runs and its notifications get through (the
+    server answered its last `Notify` or `GetServerInformation`), and S is a phone lanternd lists
+    that isn't being undone: `error{msg:"phone not connected; Lantern offered to connect it"}`
+    (`CONNECT_OFFERED`) on stream 0, then close. lanternd itself shows "Connect your <phone>"
+    with a **Connect** button; a click is `connect` for S with this app (a pending
+    connect-and-open, see "Daemon commands"). The window shows nothing of its own and exits 1.
+  - Otherwise (no prompt, an unhealthy notification server, a serial lanternd doesn't list, which
+    includes every other phone under `$LANTERN_SERIAL`): `"phone disconnected in Lantern"` when S
+    is switched off, else `"phone not connected"`.
+- **`open` without `phone`** (Plan 3 rules, unchanged):
+  - No phone session: `error{msg:"phone not connected"}` on stream 0, then close. If the phone
+    was disconnected in Lantern (`status_report` state `paused`) the `msg` is
+    `"phone disconnected in Lantern"` instead.
+  - App on other phones only: once this session's first full catalogue has arrived (its count
+    matched), an `open` whose app has menu entries, none of them the session's phone's, gets
+    `error{msg:"app not on this phone"}` on stream 0, then close. Before that first sync, or for
+    an app with no entry, the `open` is forwarded as usual (so a newly installed app is never
+    refused by a stale list).
+- `lantern open` without `--phone` picks its phone before connecting: from `lantern status`'s
+  `phones` and the menu entries for the app, the live phone that has the app (the most recently
+  connected one if several), else the live phone for an app no entry lists, else (no phone with
+  the app is live) the phone with the app that was connected last, which it then names as
+  `phone`. Only when none applies does it send `open` without `phone`.
+- `lantern open` turns `"phone not connected"`, `"phone disconnected in Lantern"` and
+  `"app not on this phone"` (on stream 0, before any `opened`) into its own desktop
+  notification and exits 1: "Connect your <phone name>" (with `--phone`, only that phone; else
+  the phones the app's entries belong to, named from their device records, else their serials;
+  "Connect your phone" when none), with the body naming the connected phone that lacks the app;
+  or "Lantern is disconnected" for the paused case. For `CONNECT_OFFERED` it shows nothing (only
+  logs `connect notice: Connect your <name>`).
 - New `pkg`/`user`: the daemon assigns window id `N` (from 1, never reused within a helper
   session) and forwards the `open` to the helper on stream `N` without `activation_token` and
   `phone`. The
@@ -431,9 +486,9 @@ Host-only; the helper never sees these, and the daemon never forwards them.
 - A client whose first frame is `{"t":"status"}` on stream 0 gets one `status_report` on stream 0
   and is closed. It works with or without a phone session.
 - `status_report`: `state` (`"idle"`: no session and none starting; `"starting"`: helper deploy
-  and handshake in flight; `"ready"`: live session; `"paused"`: the user disconnected the phone in
-  Lantern, or it is undoing its setup, and nothing starts for it until it is replugged or
-  connected again), `serial` (the device being started, served or paused, else `null`), `helper`
+  and handshake in flight; `"ready"`: live session; `"paused"`: no phone is live, and the phone
+  switched off in Lantern most recently in this run is still plugged in and off), `serial` (the
+  phone being started, served or paused, else `null`), `helper`
   (the live helper jar's SHA-256 when `ready`, else `null`) and `windows`:
   `[{id: u32, pkg: string, user: u32}]`, the open windows sorted by id.
   Optional `companion` (`"ready"` or `"unavailable"`): the companion link's state, omitted when
@@ -466,24 +521,97 @@ Host-only, like `status`.
   unchanged. Without it the command is for the only plugged-in phone; with none or several
   plugged in nothing is queued and the reply is `error{msg}` instead of the report:
   `"no phone is plugged in"`, or `"several phones are plugged in: <name> (<serial>), …; name one:
-  lantern connect|disconnect <serial>"`. A named serial must be a phone lanternd lists (plugged in,
-  or with a device record); otherwise nothing is queued and the reply is `error{"no phone <serial>
-  is plugged in or known; known phones: <name> (<serial>), …"}` (`…; no phone is known` when there
-  are none), so a typo creates no record. Under `$LANTERN_SERIAL` commands for any other serial are
-  ignored.
-- `disconnect`: sets the phone's `off` flag (and clears `live`) in its device record, then, if it
-  is the phone being served, started, retried or reconnected, ends that session with `bye` (the
-  helper restores the phone). An `off` phone is not connected by itself again, across unplugging
-  and lanternd restarts, until it gets `connect`.
-- `connect`: clears `off`. A plugged-in phone becomes the one lanternd serves (another live
-  phone's session is closed; its `off` is untouched); a backoff is skipped.
-- While no phone is live and the phone disconnected most recently is still plugged in (the
-  top-level `paused`), an `open` gets `error{msg:"phone disconnected in Lantern"}` on stream 0,
-  then close.
+  lantern connect|disconnect <serial>"` (the verb of the command sent).
+- A named serial must be a phone lanternd lists (plugged in, or with a device record); otherwise
+  nothing is queued and the reply is `error{"no phone <serial> is plugged in or known; known
+  phones: <name> (<serial>), …"}` (`…; no phone is known` when there are none), so a typo
+  creates no record and no tray row.
+- Under `$LANTERN_SERIAL=<s>` a command naming any other serial is refused, nothing queued:
+  `error{"phone <serial> is not served: lanternd serves only <s> because LANTERN_SERIAL=<s> is
+  set"}`.
 
 `lantern connect [<serial>]` and `lantern disconnect [<serial>]` print the report like
 `lantern status` and exit 0 (1 if lanternd is unreachable or answers an error; 2 for more than one
-argument).
+argument, an empty serial or one starting with `-`). The tray's phone rows and the connect
+prompt's **Connect** button send the same commands in-process, always naming a phone lanternd
+lists.
+
+### Connect rules (lanternd, per phone)
+
+lanternd serves **one phone at a time** (the *wanted* phone; Plan 4c lifts this). Each device
+record `$XDG_STATE_HOME/lantern/devices/<serial>.json` keeps the phone's own flags next to its
+`name` and setup state, written under an flock on `devices/.lock` (temp + fsync + rename):
+
+- `off: true`: the user switched the phone off in Lantern (`disconnect`, unchecking its tray row,
+  Remove/undo-setup). An off phone never connects by itself, across unplugging and lanternd
+  restarts, until it gets `connect`.
+- `live: true`: the phone was connected when lanternd last stopped (`connected_at`: unix seconds
+  of its last ready). It reconnects without asking after a lanternd restart (login,
+  `build.py install`, a crash). `live` is cleared by a real unplug (absent past the unplug
+  grace), unchecking, Undo, being switched away for another phone, being left waiting while
+  another phone connects, the tray's **Quit**, and lanternd starting while that phone stays
+  absent for the whole grace (so a stale flag can't connect a phone plugged in days later).
+  SIGTERM/SIGINT (`systemctl stop/restart`) keep it.
+- `autoconnect` (`settings.toml`, default **false**; the tray's "Connect phones when plugged in"):
+  on, a plugged-in phone that isn't off connects by itself; off, Lantern asks.
+
+When a phone comes online, the first rule that applies decides:
+
+1. `$LANTERN_SERIAL` is set: that phone connects (whatever its `off` flag or `autoconnect`);
+   every other serial is ignored: not listed in `phones`, never prompted, never started, and
+   commands for it are refused (above). An explicit `disconnect` still switches the configured
+   phone off until it comes online again.
+2. A pending connect-and-open for it: it connects (switching the wanted phone away).
+3. Its `live` flag: it connects if no other phone is wanted, else it waits (and loses `live`).
+4. `autoconnect` on and not `off`: it connects if no other phone is wanted, else lanternd shows
+   "<phone> is plugged in" (one click switches to it).
+5. `autoconnect` on and `off`: it waits, silently.
+6. `autoconnect` off: lanternd shows "<phone> is plugged in" with a **Connect** button.
+
+Commands:
+
+- `connect` (S): clears S's `off`. A plugged-in S becomes the wanted phone: another live phone's
+  session closes (`bye`; its `off` is untouched, its `live` cleared) and a backoff is skipped. An
+  S that isn't plugged in gets the notification "Plug in your <phone>".
+- `disconnect` (S): sets S's `off` and clears `live` **before** its session closes; if S is the
+  phone being served, started, retried or reconnected, that session ends with `bye` (the helper
+  restores the phone). The top-level status then reads `paused` while S stays plugged in.
+- Undo (`lantern undo-setup` or the tray's Remove): sets `off`, clears `live`, closes S's session
+  if it is wanted, then runs. Commands other than Quit are ignored while an undo runs.
+- Quit (tray): clears the wanted phone's `live`, then lanternd exits. A stop signal changes no
+  flag.
+
+**Unplug grace (10 s).** A brief adb drop or a loose cable is not an unplug:
+
+- The wanted phone going offline closes its session and enters the grace (`reconnecting`). Back
+  within it, it restarts at once with no prompt; past it, it is unplugged for real: its `live`
+  is cleared and nothing else starts.
+- Every phone that isn't live gets the same grace (waiting, off, switched away, or released
+  mid-grace by a switch, Disconnect or Undo, which keeps the rest of its grace). Back within it
+  is a blip: nothing changes and it is **not** asked again, so a blip never prompts and a loose
+  cable never re-pops a notice. Past it, its notice closes.
+- A phone's notice closes when it gets ready or when it is gone for good (the end of its grace).
+
+**Pending connect-and-open (120 s).** A **Connect** click on "Connect your <phone>" (a refused
+`open` with `phone`) stores (S, app, user) and connects S. When S becomes ready lanternd runs
+`lantern open --phone S [--user N] -- <pkg>` once; a request older than 120 s is dropped. A later
+request for S replaces it. The latest choice of phone wins: any `connect` (or a phone connecting
+on plug-in) drops every other phone's pending request, and `disconnect`/Undo drop S's own, so a
+blip of an old phone never reconnects it over the one just chosen. `connect` with an app while S
+is already ready opens it at once.
+
+Notifications (lanternd's connect prompt, its own session-bus connection, every call with a 5 s
+timeout; titles plain text, phone and app names escaped in the body only; at most one notice per
+phone, replaced by id):
+
+| Notice | When | Button |
+|---|---|---|
+| "<phone> is plugged in" | rule 4 with another phone wanted, or rule 6 | **Connect** |
+| "Connect your <phone>" | an `open` refused with `CONNECT_OFFERED` | **Connect** (also opens the app) |
+| "Plug in your <phone>" | `connect` for a phone that isn't plugged in | none |
+
+Without a session bus there is no prompt: rule 6 then only waits (use the tray or `lantern
+connect`), and refused opens get the window's own notices.
 
 ### Exit statuses (`lantern`)
 

@@ -581,9 +581,11 @@ fn dead_bus(dir: &std::path::Path) -> String {
     format!("unix:path={}", dead.display())
 }
 
-/// The environment for a Remove-submenu child: a PATH whose `kdialog` answers "Remove" (exit
-/// 0) after `$LANTERN_FAKE_KDIALOG_SLEEP` seconds and whose `notify-send` appends its
-/// arguments to `<dir>/notes`, and a dead session bus (nothing reaches the real desktop).
+/// The environment for a Remove-submenu child: a PATH whose `kdialog` appends its arguments to
+/// `<dir>/kdialog.ran` (`$LANTERN_FAKE_KDIALOG_RAN`, which the tests assert, so a bypass that
+/// reaches the real kdialog fails) and answers "Remove" (exit 0) after
+/// `$LANTERN_FAKE_KDIALOG_SLEEP` seconds, whose `notify-send` appends its arguments to
+/// `<dir>/notes`, and a dead session bus (nothing reaches the real desktop).
 fn fake_desktop(dir: &std::path::Path, kdialog_sleep: &str) -> Vec<(&'static str, String)> {
     use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
@@ -591,7 +593,10 @@ fn fake_desktop(dir: &std::path::Path, kdialog_sleep: &str) -> Vec<(&'static str
     let scripts = [
         (
             "kdialog",
-            "#!/bin/sh\nsleep \"${LANTERN_FAKE_KDIALOG_SLEEP:-0}\"\nexit 0\n".to_owned(),
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\nsleep \"${{LANTERN_FAKE_KDIALOG_SLEEP:-0}}\"\nexit 0\n",
+                dir.join("kdialog.ran").display()
+            ),
         ),
         (
             "notify-send",
@@ -615,6 +620,10 @@ fn fake_desktop(dir: &std::path::Path, kdialog_sleep: &str) -> Vec<(&'static str
         ("PATH", path),
         ("DBUS_SESSION_BUS_ADDRESS", dead_bus(dir)),
         ("LANTERN_FAKE_KDIALOG_SLEEP", kdialog_sleep.to_owned()),
+        (
+            "LANTERN_FAKE_KDIALOG_RAN",
+            dir.join("kdialog.ran").display().to_string(),
+        ),
         (
             "LANTERN_FAKE_NOTES",
             dir.join("notes").display().to_string(),
@@ -668,7 +677,17 @@ fn submenu_layout_and_click() {
                 serial: "s1".into()
             }
         );
+        assert_fake_kdialog_ran();
     });
+}
+
+/// The fake `kdialog` ran (not the real one, which would pop a dialog and hang the test), and
+/// it was asked about the phone that was clicked.
+fn assert_fake_kdialog_ran() {
+    let marker = PathBuf::from(std::env::var("LANTERN_FAKE_KDIALOG_RAN").unwrap());
+    let args = std::fs::read_to_string(&marker).expect("the fake kdialog never ran");
+    assert!(args.contains("--warningcontinuecancel"), "{args}");
+    assert!(args.contains("Remove Lantern from Test Phone?"), "{args}");
 }
 
 /// R9: the confirm is pinned to the phone it named. Unplugged while kdialog was open, the
@@ -698,6 +717,11 @@ fn remove_cancelled_when_the_phone_was_unplugged() {
         })
         .await;
         assert!(text.contains("Undo phone setup cancelled"), "{text}");
+        assert!(
+            text.contains("Test Phone was unplugged while Lantern was asking"),
+            "{text}"
+        );
+        assert_fake_kdialog_ran();
     });
 }
 
