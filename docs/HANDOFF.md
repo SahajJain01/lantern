@@ -1,4 +1,4 @@
-# Lantern — handoff (Plan 3 implemented, device acceptance pending, 2026-11-13)
+# Lantern — handoff (Plan 3 implemented and device-accepted, not yet merged, 2026-11-13)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -15,21 +15,21 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   (at `c151d37`) and its worktree removed; the SDD ledger and per-task reports went with the
   worktree. No record survives of a separate re-review of the fix wave (`f33642d..3050bf9`).
 - **Plan 3** (`docs/superpowers/plans/2026-11-10-lantern-phones-and-tray.md`) is **implemented on
-  branch `plan3-phones-and-tray`** (worktree `.worktrees/plan3`, base `main` `b926173`), **host
-  tests passing, device acceptance not yet run** (deferred by Sahaj's instruction, 2026-11-10:
-  "finish all scoped work, defer tests"). Tasks 1–6 each passed their own review (Task 6 after one
-  fix round: the tray's undo is pinned to the phone the confirmation named). No task ran a device
-  step; items 15–20 are written but have never run on a phone. Not merged; the final
-  whole-branch review is still to do (give it the SDD ledger's `minor (deferred)` lines, listed
-  below under Known minor issues, for a MUST-FIX / OK-TO-DEFER call each).
-  - Host: `cargo test --workspace --offline` 305 passed, 1 ignored (2026-11-13). Helper build:
+  branch `plan3-phones-and-tray`** (worktree `.worktrees/plan3`, base `main` `b926173`). Device
+  steps were deferred during execution by Sahaj's instruction and run together at the end (see
+  "Plan 3 device acceptance"). Tasks 1–7 each passed their own review (Tasks 6 and 7 after one fix
+  round). The final whole-branch review found 1 important issue (a single `paused` slot let a
+  disconnected phone restart) plus 1 minor; both fixed in `8c05253` and re-reviewed clean. Every
+  other `minor (deferred)` line was triaged OK-TO-DEFER (listed under Known minor issues). Not
+  merged yet.
+  - Host: `cargo test --workspace --offline` 308 passed, 1 ignored (2026-11-13). Helper build:
     170 host-JVM tests, companion build: 41, all passing.
   - The SDD ledger and per-task reports are in the worktree's gitignored
     `.superpowers/sdd/2026-11-10-lantern-phones-and-tray/`; copy that directory to the main
     checkout before removing the worktree.
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
-Lantern is **installed and running** on the PC from the **Plan 2** build (not Plan 3):
+Lantern is **installed and running** on the PC from the **Plan 3** branch build (2026-11-13):
 `~/.local/bin/lantern`, user unit `lanternd.service` (enabled). When the phone is plugged in, its
 screen turns off, the Lantern keyboard is selected, and its apps are in the KDE menu under
 **Phone**.
@@ -58,25 +58,38 @@ attached.
   `text=Tiếng Việt 👍việ` through real window focus; item 13 got the phone's copy into Klipper
   0.077 s after Ctrl+C; item 7 restored the phone 0.9 s after the kill.
 
-### Plan 3 device acceptance (deferred, not yet run)
+### Plan 3 device acceptance (2026-11-13, both phones attached, desktop unlocked)
 
-Run in the worktree, with the Xiaomi attached and the desktop **unlocked** (item 20 needs the
-real desktop and its session bus; there is no `--nested` equivalent for it). `build.py install`
-restarts lanternd from the Plan 3 build: the phone panel goes off and stay-awake reads 7.
+- `LANTERN_SERIAL=20e9318` set in the systemd user environment for the run (both phones were
+  plugged in), then `python3 tools/build.py install && python3 tools/device_test.py`: **17/18**;
+  item 20 failed on two test-script bugs (busctl took `-1` as an option; the tray's bus name was
+  taken before `baseline()` restarted lanternd), fixed in `14f4a7c`; `--only 20` then **PASS**
+  (paused 0.6 s after the tray's Disconnect, phone restored 0.4 s later, ready 1.3 s after
+  Connect). So **18/18 automatic PASS**. The tray screenshot is in the item's log dir.
+- Two-phone check (Review Focus 1), `LANTERN_SERIAL` unset again: with the Xiaomi served, the menu
+  held 15 Xiaomi-only, 3 shared (`X-Lantern-Serials=20e9318;ZD222LMDFV;`) and 52 Motorola-only
+  entries, including `Files (work)` / `Play Store (work)` / `Authenticator (work)`. `lantern
+  disconnect` paused the Xiaomi (restored: LatinIME, stay-awake 15) and lanternd went straight on
+  to the Motorola (`serve_next`); its record got `"name":"edge 50 pro"` (its `device_name`), and
+  after its full sync the counts were unchanged (no Xiaomi entry pruned). `lantern open
+  com.android.calculator2` (Xiaomi-only) then gave `app not on this phone` and `connect notice:
+  Connect your Xiaomi 11T Pro`.
+- Left as found by the run: the Motorola is served, the Xiaomi is paused (replug it or click
+  Connect in the tray).
+- Still to check by hand: open the tray menu on the Plasma panel and look at it.
+
+To re-run: in the worktree, with the desktop **unlocked** (item 20 needs the real desktop and its
+session bus; there is no `--nested` equivalent for it). `build.py install` restarts lanternd from
+the Plan 3 build: the phone panel goes off and stay-awake reads 7.
 
 ```sh
 cd .worktrees/plan3
 python3 tools/build.py install && python3 tools/device_test.py
 ```
 
-Expected: **18/18 automatic PASS** (items 1–7, 9–13 and 15–20; 8 and 14 stay `--manual`).
-Record the summary line and timings here. Then open the tray menu by hand and look at it (item 20 saves a
-screenshot to its log dir for this). Also still deferred from Plan 3:
-- Motorola two-phone check (Plan 3 Task 7 Step 3, Review Focus 1 with two real phones): plug in
-  the Motorola (`LANTERN_SERIAL=ZD222LMDFV` or alone), let its full sync finish, and check its
-  friendly name in `~/.local/state/lantern/devices/ZD222LMDFV.json`, that the Xiaomi's apps are
-  still in the Phone menu with `X-Lantern-Serials=` listing `20e9318;`, that an app both have
-  lists both serials, and that opening a Xiaomi-only app gives "Connect your Xiaomi 11T Pro".
+Expected: **18/18 automatic PASS** (items 1–7, 9–13 and 15–20; 8 and 14 stay `--manual`). With
+both phones plugged in, `systemctl --user set-environment LANTERN_SERIAL=20e9318` first (and
+`unset-environment` after). Still deferred:
 - Plan 2's remaining deferred checks 2–6 below (manual USB unplug items 8 and 14, Motorola work
   profile, a real PC input method, reboot mid-session, two windows on the real desktop).
 
@@ -141,9 +154,9 @@ the Plan 4 list below.
   cancelled`. In Task 10 it did not recur: 0 codec errors in 23 window opens across six suite
   invocations (window logs and logcat checked). `DrainLoop` treats `IllegalStateException` as fatal; worth a look with Plan 1's "failed
   resize" item.
-- All of Plan 3 on a device: device items 15–20, the tray on the real Plasma panel (and
-  re-registration after a plasmashell restart, host-tested only), Quit and the Lantern launcher,
-  start-at-login toggling, Undo phone setup from the tray, two real phones' menu entries.
+- Plan 3 on a device beyond items 15–20 and the two-phone check: the tray menu opened by hand on
+  the Plasma panel, re-registration after a plasmashell restart (host-tested only), Quit and the
+  Lantern launcher, start-at-login toggling, Undo phone setup from the tray.
 - From Plan 1: PIN keyguard (see field finding 1: the clipboard needs one unlock),
   third-party notification clicks, app-started rotation on a real
   device, long runs with 5–6 encoders, interactive play in games.
@@ -308,8 +321,7 @@ the Plan 4 list below.
 
 ## Next: Plan 4 (not yet written)
 
-First clear Plan 3's deferred device acceptance (above), then the final whole-branch review and
-the merge. Then write Plan 4 with superpowers:writing-plans and run it with
+Plan 3 is device-accepted and reviewed; merge `plan3-phones-and-tray` into `main`. Then write Plan 4 with superpowers:writing-plans and run it with
 superpowers:subagent-driven-development. Candidates (Plan 3's "Out of scope" plus the field
 findings):
 
