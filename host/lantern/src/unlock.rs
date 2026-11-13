@@ -117,9 +117,12 @@ pub enum LockEvent {
     Unlocked,
     /// The helper's `unlock_result`.
     Result { ok: bool, reason: Option<String> },
-    /// Sent right after the stretch ended in an unlock: the apps (pkg, user) whose open the
-    /// lock blocked in the last 2 minutes, each once.
-    Reopen(Vec<(String, u32)>),
+    /// Sent right after the stretch ended in an unlock: the apps (pkg, user) on phone `serial`
+    /// whose open the lock blocked in the last 2 minutes, each once.
+    Reopen {
+        serial: String,
+        apps: Vec<(String, u32)>,
+    },
 }
 
 /// A cheap, cloneable handle that asks the unlock prompt for its PIN dialog: the tray's Unlock
@@ -212,10 +215,13 @@ pub fn failed_notice(name: &str, reason: Option<&str>) -> (String, String) {
     }
 }
 
-/// The `lantern open` arguments that reopen `pkg` for `user` (`--` before the package, so it
-/// is never read as an option).
-pub fn reopen_args(pkg: &str, user: u32) -> Vec<String> {
+/// The `lantern open` arguments that reopen `pkg` for `user` on `phone` (`--` before the
+/// package, so it is never read as an option).
+pub fn reopen_args(pkg: &str, user: u32, phone: Option<&str>) -> Vec<String> {
     let mut args = vec!["open".to_owned()];
+    if let Some(phone) = phone {
+        args.extend(["--phone".to_owned(), phone.to_owned()]);
+    }
     if user != 0 {
         args.extend(["--user".to_owned(), user.to_string()]);
     }
@@ -443,7 +449,7 @@ pub async fn run(
                         ended += 1;
                         notifier.close(std::mem::take(&mut shown)).await;
                     }
-                    LockEvent::Reopen(apps) => reopen(&exe, apps),
+                    LockEvent::Reopen { serial, apps } => reopen(&exe, &serial, apps),
                 }
             }
             message = actions.next() => {
@@ -505,13 +511,14 @@ pub async fn run(
     Ok(())
 }
 
-/// Runs `exe open [--user N] pkg` for each app (not waiting for the windows).
-fn reopen(exe: &std::path::Path, apps: Vec<(String, u32)>) {
+/// Runs `exe open --phone serial [--user N] -- pkg` for each app (not waiting for the windows).
+fn reopen(exe: &std::path::Path, serial: &str, apps: Vec<(String, u32)>) {
     for (pkg, user) in apps {
         let exe = exe.to_owned();
+        let serial = serial.to_owned();
         tokio::spawn(async move {
-            let args = reopen_args(&pkg, user);
-            tracing::info!(pkg, user, "reopening after the unlock");
+            let args = reopen_args(&pkg, user, Some(&serial));
+            tracing::info!(pkg, user, serial, "reopening after the unlock");
             // desktop::spawn's systemctl lookup blocks: keep it off the async workers.
             let spawned =
                 tokio::task::spawn_blocking(move || crate::desktop::spawn(&exe, &args)).await;
@@ -643,16 +650,43 @@ mod tests {
 
     #[test]
     fn reopen_args_name_the_user_only_when_not_0() {
-        assert_eq!(reopen_args("com.foo", 0), ["open", "--", "com.foo"]);
+        assert_eq!(reopen_args("com.foo", 0, None), ["open", "--", "com.foo"]);
         assert_eq!(
-            reopen_args("com.foo", 10),
+            reopen_args("com.foo", 10, None),
             ["open", "--user", "10", "--", "com.foo"]
         );
         // `lantern open` parses them back.
-        let args = reopen_args("com.foo", 10);
+        let args = reopen_args("com.foo", 10, None);
         let args: Vec<&str> = args[1..].iter().map(String::as_str).collect();
         let id = crate::window::identity::Identity::parse_args(&args).unwrap();
         assert_eq!((id.pkg.as_str(), id.user), ("com.foo", 10));
+    }
+
+    #[test]
+    fn reopen_args_name_the_phone() {
+        assert_eq!(
+            reopen_args("com.foo", 0, Some("20e9318")),
+            ["open", "--phone", "20e9318", "--", "com.foo"]
+        );
+        let args = reopen_args("com.foo", 10, Some("ZD222LMDFV"));
+        assert_eq!(
+            args,
+            [
+                "open",
+                "--phone",
+                "ZD222LMDFV",
+                "--user",
+                "10",
+                "--",
+                "com.foo"
+            ]
+        );
+        let args: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        let id = crate::window::identity::Identity::parse_args(&args).unwrap();
+        assert_eq!(
+            (id.pkg.as_str(), id.user, id.phone.as_deref()),
+            ("com.foo", 10, Some("ZD222LMDFV"))
+        );
     }
 
     #[test]

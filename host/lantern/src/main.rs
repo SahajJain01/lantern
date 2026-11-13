@@ -1,7 +1,8 @@
 use anyhow::{bail, Result};
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str = "usage: lantern daemon | lantern open [--user <android-user>] <package> \
+const USAGE: &str =
+    "usage: lantern daemon | lantern open [--phone <serial>] [--user <android-user>] <package> \
      | lantern status | lantern connect | lantern disconnect \
      | lantern undo-setup [--serial <serial>]";
 

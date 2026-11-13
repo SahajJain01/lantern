@@ -203,6 +203,11 @@ pub enum Control {
         /// before forwarding to the helper). Absent on the wire when `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activation_token: Option<String>,
+        /// The serial of the phone the window wants (host-only: window -> lanternd; the daemon
+        /// strips it before forwarding to the helper). Absent on the wire when `None`, so a v1
+        /// `open` is byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phone: Option<String>,
     },
     Opened {
         display: i32,
@@ -259,6 +264,9 @@ pub enum Control {
     /// lanternd answers with its current `status_report` and closes. Never sent to the helper.
     Daemon {
         cmd: DaemonCmd,
+        /// The phone the command is for (`lantern connect <serial>`). Absent when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        serial: Option<String>,
     },
     /// Helper -> daemon, stream 0: one launcher app of the catalogue. `icon` is a base64 PNG
     /// (at most [`MAX_ICON`] bytes before base64) or `""`.
@@ -411,6 +419,59 @@ pub struct StatusReport {
     /// The companion link's state while `ready`; absent otherwise (so a v1 report is unchanged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companion: Option<CompanionState>,
+    /// Every known or plugged phone. Absent when empty (so a v1 report is unchanged).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phones: Vec<PhoneReport>,
+}
+
+/// One phone as lanternd sees it, in `status_report.phones`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhoneState {
+    /// Known (it has a device record) but not plugged in.
+    Unplugged,
+    /// Plugged in, not connected, waiting for the user's say-so.
+    Waiting,
+    /// Plugged in and switched off in Lantern.
+    Off,
+    /// A session start is in flight or due.
+    Starting,
+    /// Its helper session is live.
+    Ready,
+    /// Its session start failed; retrying after a backoff.
+    Retrying,
+    /// It went offline while connected; within the unplug grace.
+    Reconnecting,
+    /// Lantern is undoing its setup on it.
+    Undoing,
+}
+
+impl PhoneState {
+    /// Whether this phone is the connected one (starting, ready, retrying or reconnecting).
+    pub fn is_live(self) -> bool {
+        matches!(
+            self,
+            PhoneState::Starting
+                | PhoneState::Ready
+                | PhoneState::Retrying
+                | PhoneState::Reconnecting
+        )
+    }
+}
+
+/// `name` is the phone's recorded name, `off` whether it is switched off in Lantern (absent when
+/// false), and `connected_at` when it last became ready (unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneReport {
+    pub serial: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub state: PhoneState,
+    pub plugged: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub off: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_at: Option<u64>,
 }
 
 impl Control {
@@ -785,6 +846,7 @@ mod tests {
             h: 800,
             dpi: 160,
             activation_token: None,
+            phone: None,
         };
         assert_eq!(
             serde_json::to_string(&c).unwrap(),
@@ -805,6 +867,7 @@ mod tests {
                 user: 0,
             }],
             companion: None,
+            phones: vec![],
         });
         let json = r#"{"t":"status_report","state":"ready","serial":"20e9318","helper":"ab12","windows":[{"id":1,"pkg":"com.android.settings","user":0}]}"#;
         assert_eq!(String::from_utf8(report.encode()).unwrap(), json);
@@ -815,6 +878,7 @@ mod tests {
             helper: None,
             windows: vec![],
             companion: None,
+            phones: vec![],
         });
         assert_eq!(
             String::from_utf8(idle.encode()).unwrap(),
@@ -835,6 +899,7 @@ mod tests {
             h: 2,
             dpi: 3,
             activation_token: Some("tok".into()),
+            phone: None,
         };
         let s = serde_json::to_string(&open).unwrap();
         assert_eq!(
@@ -1152,6 +1217,7 @@ mod tests {
             helper: None,
             windows: vec![],
             companion: None,
+            phones: vec![],
         };
         let v1 =
             r#"{"t":"status_report","state":"ready","serial":null,"helper":null,"windows":[]}"#;
@@ -1187,6 +1253,7 @@ mod tests {
             helper: None,
             windows: vec![],
             companion: None,
+            phones: vec![],
         });
         let json = r#"{"t":"status_report","state":"paused","serial":"20e9318","helper":null,"windows":[]}"#;
         assert_eq!(String::from_utf8(report.encode()).unwrap(), json);
@@ -1202,12 +1269,144 @@ mod tests {
                 r#"{"t":"daemon","cmd":"disconnect"}"#,
             ),
         ] {
-            let c = Control::Daemon { cmd };
+            let c = Control::Daemon { cmd, serial: None };
             assert_eq!(String::from_utf8(c.encode()).unwrap(), json);
             assert_eq!(Control::decode(json.as_bytes()).unwrap(), c);
         }
         assert!(Control::decode(br#"{"t":"daemon","cmd":"quit"}"#).is_err());
         assert!(Control::decode(br#"{"t":"daemon"}"#).is_err());
+    }
+
+    fn open_with_phone(phone: Option<&str>) -> Control {
+        Control::Open {
+            pkg: "com.android.settings".into(),
+            user: 0,
+            w: 1280,
+            h: 800,
+            dpi: 160,
+            activation_token: None,
+            phone: phone.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn open_without_phone_is_v1_bytes() {
+        let v1 = r#"{"t":"open","pkg":"com.android.settings","user":0,"w":1280,"h":800,"dpi":160}"#;
+        assert_eq!(open_with_phone(None).encode(), v1.as_bytes());
+        assert_eq!(
+            Control::decode(v1.as_bytes()).unwrap(),
+            open_with_phone(None)
+        );
+    }
+
+    #[test]
+    fn open_phone_json_shape() {
+        let c = open_with_phone(Some("ZD222LMDFV"));
+        let s = String::from_utf8(c.encode()).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"open","pkg":"com.android.settings","user":0,"w":1280,"h":800,"dpi":160,"phone":"ZD222LMDFV"}"#
+        );
+        assert_eq!(Control::decode(s.as_bytes()).unwrap(), c);
+    }
+
+    #[test]
+    fn daemon_serial_optional() {
+        let bare = Control::Daemon {
+            cmd: DaemonCmd::Connect,
+            serial: None,
+        };
+        let json = r#"{"t":"daemon","cmd":"connect"}"#;
+        assert_eq!(String::from_utf8(bare.encode()).unwrap(), json);
+        assert_eq!(Control::decode(json.as_bytes()).unwrap(), bare);
+        let named = Control::Daemon {
+            cmd: DaemonCmd::Connect,
+            serial: Some("a".into()),
+        };
+        let json = r#"{"t":"daemon","cmd":"connect","serial":"a"}"#;
+        assert_eq!(String::from_utf8(named.encode()).unwrap(), json);
+        assert_eq!(Control::decode(json.as_bytes()).unwrap(), named);
+    }
+
+    #[test]
+    fn status_report_without_phones_is_unchanged() {
+        let r = StatusReport {
+            state: SessionState::Ready,
+            serial: Some("20e9318".into()),
+            helper: None,
+            windows: vec![],
+            companion: None,
+            phones: vec![],
+        };
+        let v1 = r#"{"t":"status_report","state":"ready","serial":"20e9318","helper":null,"windows":[]}"#;
+        assert_eq!(
+            String::from_utf8(Control::StatusReport(r.clone()).encode()).unwrap(),
+            v1
+        );
+        assert_eq!(
+            Control::decode(v1.as_bytes()).unwrap(),
+            Control::StatusReport(r.clone())
+        );
+        let with = StatusReport {
+            phones: vec![PhoneReport {
+                serial: "a".into(),
+                name: Some("Xiaomi 11T Pro".into()),
+                state: PhoneState::Ready,
+                plugged: true,
+                off: false,
+                connected_at: Some(42),
+            }],
+            ..r
+        };
+        let s = String::from_utf8(Control::StatusReport(with.clone()).encode()).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"status_report","state":"ready","serial":"20e9318","helper":null,"windows":[],"phones":[{"serial":"a","name":"Xiaomi 11T Pro","state":"ready","plugged":true,"connected_at":42}]}"#
+        );
+        assert_eq!(
+            Control::decode(s.as_bytes()).unwrap(),
+            Control::StatusReport(with)
+        );
+    }
+
+    #[test]
+    fn phone_report_json_shape() {
+        let p = PhoneReport {
+            serial: "a".into(),
+            name: None,
+            state: PhoneState::Waiting,
+            plugged: true,
+            off: false,
+            connected_at: None,
+        };
+        let json = r#"{"serial":"a","state":"waiting","plugged":true}"#;
+        assert_eq!(serde_json::to_string(&p).unwrap(), json);
+        assert_eq!(serde_json::from_str::<PhoneReport>(json).unwrap(), p);
+        let off = PhoneReport {
+            state: PhoneState::Off,
+            plugged: false,
+            off: true,
+            ..p
+        };
+        let json = r#"{"serial":"a","state":"off","plugged":false,"off":true}"#;
+        assert_eq!(serde_json::to_string(&off).unwrap(), json);
+        assert_eq!(serde_json::from_str::<PhoneReport>(json).unwrap(), off);
+        for (state, name, live) in [
+            (PhoneState::Unplugged, "unplugged", false),
+            (PhoneState::Waiting, "waiting", false),
+            (PhoneState::Off, "off", false),
+            (PhoneState::Starting, "starting", true),
+            (PhoneState::Ready, "ready", true),
+            (PhoneState::Retrying, "retrying", true),
+            (PhoneState::Reconnecting, "reconnecting", true),
+            (PhoneState::Undoing, "undoing", false),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{name}\"")
+            );
+            assert_eq!(state.is_live(), live, "{name}");
+        }
     }
 
     #[test]
@@ -1300,10 +1499,11 @@ mod tests {
             format!(
                 "{:?}",
                 Control::Daemon {
-                    cmd: DaemonCmd::Connect
+                    cmd: DaemonCmd::Connect,
+                    serial: None,
                 }
             ),
-            "Daemon { cmd: Connect }"
+            "Daemon { cmd: Connect, serial: None }"
         );
         assert_eq!(
             format!(
@@ -1314,9 +1514,10 @@ mod tests {
                     helper: None,
                     windows: vec![],
                     companion: None,
+                    phones: vec![],
                 })
             ),
-            "StatusReport(StatusReport { state: Idle, serial: None, helper: None, windows: [], companion: None })"
+            "StatusReport(StatusReport { state: Idle, serial: None, helper: None, windows: [], companion: None, phones: [] })"
         );
         assert_eq!(
             format!("{:?}", Control::error("boom")),

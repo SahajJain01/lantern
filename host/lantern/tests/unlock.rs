@@ -476,10 +476,10 @@ async fn success_closes_notice_and_reopens_pending() {
         reason: None,
     })
     .await;
-    rig.send(LockEvent::Reopen(vec![
-        ("com.foo".into(), 0),
-        ("com.bar".into(), 10),
-    ]))
+    rig.send(LockEvent::Reopen {
+        serial: "dev".into(),
+        apps: vec![("com.foo".into(), 0), ("com.bar".into(), 10)],
+    })
     .await;
     let log = rig.reopened.clone();
     let mut lines = wait_for("both reopens", Duration::from_secs(5), || {
@@ -489,7 +489,13 @@ async fn success_closes_notice_and_reopens_pending() {
     })
     .await;
     lines.sort();
-    assert_eq!(lines, ["open -- com.foo", "open --user 10 -- com.bar"]);
+    assert_eq!(
+        lines,
+        [
+            "open --phone dev -- com.foo",
+            "open --phone dev --user 10 -- com.bar"
+        ]
+    );
     assert!(rig.calls().contains(&Call::Close(id)), "{:?}", rig.calls());
 }
 

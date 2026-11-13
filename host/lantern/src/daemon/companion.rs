@@ -180,34 +180,171 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Records that Lantern set up `serial` (`devices/<serial>.json` =
-/// `{"companion":true,"since":<unix s>}`). Returns true if this is the first record for that
-/// serial; an existing record is left as it is.
-pub fn record_setup(state_dir: &Path, serial: &str, i: Install) -> Result<bool> {
+/// Writes `bytes` to `path` through a temp file in the same directory (created if needed),
+/// fsyncs it, renames it over `path` and fsyncs the directory. The temp file never outlives a
+/// failure.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().context("path has no parent")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let name = path.file_name().context("path has no file name")?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}-{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    if let Err(error) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::debug!(%error, dir = %dir.display(), "directory fsync failed");
+    }
+    Ok(())
+}
+
+/// A phone's device record (`devices/<serial>.json`), as far as Lantern reads it. The file may
+/// hold other keys; they are kept by every write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Record {
+    /// Lantern set up this phone (installed the companion) and has not undone it.
+    pub companion: bool,
+    /// When Lantern first set it up (unix seconds).
+    pub since: Option<u64>,
+    /// Its friendly name.
+    pub name: Option<String>,
+    /// The user switched it off in Lantern.
+    pub off: bool,
+    /// It was the connected phone when lanternd last stopped (or still is).
+    pub live: bool,
+    /// When it last became ready (unix seconds).
+    pub connected_at: Option<u64>,
+}
+
+/// `serial`'s device record; `None` when there is none or it is not a JSON object.
+pub fn read_record(state_dir: &Path, serial: &str) -> Option<Record> {
+    let text = std::fs::read_to_string(record_path(state_dir, serial)).ok()?;
+    let serde_json::Value::Object(map) = serde_json::from_str(&text).ok()? else {
+        return None;
+    };
+    let flag = |key: &str| map.get(key).and_then(|v| v.as_bool()) == Some(true);
+    Some(Record {
+        companion: flag("companion"),
+        since: map.get("since").and_then(|v| v.as_u64()),
+        name: map
+            .get("name")
+            .and_then(|v| v.as_str())
+            .and_then(clean_name),
+        off: flag("off"),
+        live: flag("live"),
+        connected_at: map.get("connected_at").and_then(|v| v.as_u64()),
+    })
+}
+
+/// Edits `serial`'s device record with `f`. Creates `{}` if absent; keeps unknown keys; always
+/// writes `"serial"`; temp + fsync + rename. Returns whether the file changed (nothing is
+/// written when it would not). A record that isn't a JSON object is an error and stays as it is.
+pub fn update_record(
+    state_dir: &Path,
+    serial: &str,
+    f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<bool> {
     let path = record_path(state_dir, serial);
-    if path.exists() {
+    let before = match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            match serde_json::from_str(&text)
+                .with_context(|| format!("parse {}", path.display()))?
+            {
+                serde_json::Value::Object(map) => Some(map),
+                _ => bail!("{} is not a JSON object", path.display()),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let mut map = before.clone().unwrap_or_default();
+    f(&mut map);
+    map.insert("serial".to_owned(), serial.into());
+    if before.as_ref() == Some(&map) {
         return Ok(false);
     }
-    let dir = path.parent().expect("record has a parent");
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let body = serde_json::json!({"companion": true, "since": unix_now()}).to_string();
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name().unwrap().to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-    // A hard link never replaces an existing file, so of two racing writers exactly one wins.
-    let linked = std::fs::hard_link(&tmp, &path);
-    let _ = std::fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => {
-            tracing::debug!(serial, install = ?i, path = %path.display(), "device record written");
-            Ok(true)
+    write_atomic(&path, serde_json::Value::Object(map).to_string().as_bytes())?;
+    Ok(true)
+}
+
+/// Sets `serial`'s `off` flag (creating its record if needed). Returns whether it changed.
+pub fn set_off(state_dir: &Path, serial: &str, off: bool) -> Result<bool> {
+    update_record(state_dir, serial, |map| {
+        map.insert("off".to_owned(), off.into());
+    })
+}
+
+/// Sets `serial`'s `live` flag (creating its record if needed); `true` also sets
+/// `connected_at` to now. Returns whether the record changed.
+pub fn set_live(state_dir: &Path, serial: &str, live: bool) -> Result<bool> {
+    update_record(state_dir, serial, |map| {
+        map.insert("live".to_owned(), live.into());
+        if live {
+            map.insert("connected_at".to_owned(), unix_now().into());
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("write {}", path.display())),
+    })
+}
+
+/// Every phone with a device record: its `"serial"` key, else (records from before that key)
+/// the file stem. Sorted, without duplicates; temp files are skipped.
+pub fn known_serials(state_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(state_dir.join("devices")) else {
+        return Vec::new();
+    };
+    let mut serials: Vec<String> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let file = path.file_name()?.to_str()?;
+            let stem = file.strip_suffix(".json")?;
+            if file.starts_with('.') || stem.is_empty() {
+                return None;
+            }
+            let from_key = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|json| json.get("serial")?.as_str().map(str::to_owned))
+                .filter(|serial| !serial.is_empty());
+            Some(from_key.unwrap_or_else(|| stem.to_owned()))
+        })
+        .collect();
+    serials.sort();
+    serials.dedup();
+    serials
+}
+
+/// Records that Lantern set up `serial`: sets `companion:true` and `since` (if missing) in its
+/// device record, keeping every other key. Returns true when the record lacked
+/// `companion:true` (no record, one written by the flags, or one whose setup was undone): the
+/// caller then tells the user. A record that already says so is left untouched.
+pub fn record_setup(state_dir: &Path, serial: &str, i: Install) -> Result<bool> {
+    if read_record(state_dir, serial).is_some_and(|r| r.companion) {
+        return Ok(false);
     }
+    update_record(state_dir, serial, |map| {
+        map.insert("companion".to_owned(), true.into());
+        if !map.get("since").is_some_and(|v| v.is_u64()) {
+            map.insert("since".to_owned(), unix_now().into());
+        }
+    })?;
+    tracing::debug!(serial, install = ?i, path = %record_path(state_dir, serial).display(), "device record written");
+    Ok(true)
 }
 
 /// The longest phone name kept, in chars.
@@ -261,44 +398,21 @@ pub async fn read_phone_name(adb: &Adb) -> Option<String> {
     clean_name(&both.join(" "))
 }
 
-/// Sets `"name"` in `serial`'s existing device record, keeping every other key (temp file +
-/// rename). Returns whether the record changed. Without a record it does nothing (`Ok(false)`):
-/// a record still means "Lantern set up this phone".
+/// Sets `"name"` in `serial`'s existing device record, keeping every other key (through
+/// [`update_record`]). Returns whether the record changed. Without a record it does nothing
+/// (`Ok(false)`): the name is recorded once Lantern set the phone up.
 pub fn record_name(state_dir: &Path, serial: &str, name: &str) -> Result<bool> {
-    let path = record_path(state_dir, serial);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-    };
-    let mut record: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    let Some(object) = record.as_object_mut() else {
-        bail!("{} is not a JSON object", path.display());
-    };
-    if object.get("name").and_then(|n| n.as_str()) == Some(name) {
+    if !record_path(state_dir, serial).exists() {
         return Ok(false);
     }
-    object.insert("name".to_owned(), name.into());
-    let dir = path.parent().expect("record has a parent");
-    let tmp = dir.join(format!(
-        ".{}.name-{}",
-        path.file_name().unwrap().to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&tmp, record.to_string()).with_context(|| format!("write {}", tmp.display()))?;
-    if let Err(error) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error).with_context(|| format!("replace {}", path.display()));
-    }
-    Ok(true)
+    update_record(state_dir, serial, |map| {
+        map.insert("name".to_owned(), name.into());
+    })
 }
 
 /// The recorded name of `serial`, if its device record has a non-empty one.
 pub fn device_name(state_dir: &Path, serial: &str) -> Option<String> {
-    let text = std::fs::read_to_string(record_path(state_dir, serial)).ok()?;
-    let record: serde_json::Value = serde_json::from_str(&text).ok()?;
-    clean_name(record.get("name")?.as_str()?)
+    read_record(state_dir, serial)?.name
 }
 
 /// Looks up a phone's display name by serial.
@@ -445,7 +559,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert_eq!(json["companion"], serde_json::json!(true));
         assert!(json["since"].is_u64(), "{first}");
-        assert_eq!(json.as_object().unwrap().len(), 2, "{first}");
+        assert_eq!(json["serial"], serde_json::json!("20e9318"));
+        assert_eq!(json.as_object().unwrap().len(), 3, "{first}");
         assert!(!record_setup(&state, "20e9318", Install::Current).unwrap());
         assert!(!record_setup(&state, "20e9318", Install::Updated).unwrap());
         // The existing record is kept as it was.
@@ -460,6 +575,114 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn raw(state: &Path, serial: &str) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(record_path(state, serial)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn record_flags_roundtrip_keep_unknown_keys() {
+        let state = scratch("flags");
+        let path = record_path(&state, "20e9318");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"companion":true,"since":42,"extra":[1]}"#).unwrap();
+        assert_eq!(
+            read_record(&state, "20e9318"),
+            Some(Record {
+                companion: true,
+                since: Some(42),
+                ..Record::default()
+            })
+        );
+        assert!(set_off(&state, "20e9318", true).unwrap());
+        assert!(!set_off(&state, "20e9318", true).unwrap(), "no change");
+        assert!(set_live(&state, "20e9318", true).unwrap());
+        let json = raw(&state, "20e9318");
+        assert_eq!(json["extra"], serde_json::json!([1]));
+        assert_eq!(json["since"], serde_json::json!(42));
+        assert_eq!(json["serial"], serde_json::json!("20e9318"));
+        assert_eq!(json["companion"], serde_json::json!(true));
+        assert!(json["connected_at"].is_u64(), "{json}");
+        let record = read_record(&state, "20e9318").unwrap();
+        assert!(record.companion && record.off && record.live);
+        assert_eq!(record.since, Some(42));
+        assert!(record.connected_at.is_some());
+        // live:false keeps the last connected_at.
+        assert!(set_live(&state, "20e9318", false).unwrap());
+        assert!(set_off(&state, "20e9318", false).unwrap());
+        let after = read_record(&state, "20e9318").unwrap();
+        assert!(!after.live && !after.off);
+        assert_eq!(after.connected_at, record.connected_at);
+        assert_eq!(files_in(&state.join("devices")), ["20e9318.json"]);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn set_flags_create_a_record_that_is_not_set_up() {
+        let state = scratch("create");
+        assert_eq!(read_record(&state, "a"), None);
+        assert!(set_off(&state, "a", true).unwrap());
+        let record = read_record(&state, "a").unwrap();
+        assert!(record.off && !record.companion && record.since.is_none());
+        assert_eq!(raw(&state, "a")["serial"], serde_json::json!("a"));
+        // Not set up yet: the first setup still reports (and notifies) once.
+        assert!(record_setup(&state, "a", Install::Installed).unwrap());
+        assert!(!record_setup(&state, "a", Install::Current).unwrap());
+        let record = read_record(&state, "a").unwrap();
+        assert!(record.companion && record.off && record.since.is_some());
+        assert_eq!(files_in(&state.join("devices")), ["a.json"]);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn record_setup_after_undo_notifies_again() {
+        let state = scratch("undo");
+        let path = record_path(&state, "a");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"companion":false,"since":42,"name":"N","off":true,"serial":"a"}"#,
+        )
+        .unwrap();
+        assert!(record_setup(&state, "a", Install::Installed).unwrap());
+        let json = raw(&state, "a");
+        assert_eq!(
+            json,
+            serde_json::json!({"companion": true, "since": 42, "name": "N", "off": true, "serial": "a"})
+        );
+        assert!(!record_setup(&state, "a", Install::Current).unwrap());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn known_serials_reads_serial_key_and_stems() {
+        let state = scratch("known");
+        assert!(known_serials(&state).is_empty());
+        let devices = state.join("devices");
+        std::fs::create_dir_all(&devices).unwrap();
+        std::fs::write(devices.join("_.._x.json"), r#"{"serial":"../x"}"#).unwrap();
+        std::fs::write(devices.join("20e9318.json"), r#"{"companion":true}"#).unwrap();
+        // Temp files and other files are not records.
+        std::fs::write(devices.join(".20e9318.json.tmp-1"), "{}").unwrap();
+        std::fs::write(devices.join("notes.txt"), "").unwrap();
+        assert_eq!(known_serials(&state), ["../x", "20e9318"]);
+        // A record written by set_off is known by its serial.
+        set_off(&state, "192.168.1.5:5555", true).unwrap();
+        assert_eq!(
+            known_serials(&state),
+            ["../x", "192.168.1.5:5555", "20e9318"]
+        );
         let _ = std::fs::remove_dir_all(&state);
     }
 
@@ -494,7 +717,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"companion": true, "since": 42, "extra": [1], "name": "Xiaomi 11T Pro"})
+            serde_json::json!({"companion": true, "since": 42, "extra": [1], "name": "Xiaomi 11T Pro", "serial": "20e9318"})
         );
         assert_eq!(
             device_name(&state, "20e9318"),

@@ -174,6 +174,7 @@ fn open_settings(activation_token: Option<&str>) -> Control {
         h: 800,
         dpi: 160,
         activation_token: activation_token.map(str::to_owned),
+        phone: None,
     }
 }
 

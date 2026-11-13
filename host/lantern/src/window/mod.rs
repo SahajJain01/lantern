@@ -63,7 +63,8 @@ type Slot = Arc<Mutex<Option<Nv12Frame>>>;
 
 // ---------------------------------------------------------------------------------------------
 // Remembered window sizes: ~/.local/state/lantern/windows.json = {"<key>": {"w":..,"h":..}}
-// where <key> is `Identity::size_key` (`<pkg>` for user 0, `<pkg>:<user>` otherwise).
+// where <key> is `Identity::size_key` (`<pkg>` for user 0, `<pkg>:<user>` otherwise), or with
+// `--phone S`, `Naming::size_key` (the same for the primary phone, else `…@<serial>`).
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Size {
@@ -276,6 +277,8 @@ fn parse_debug_steps(s: &str) -> Vec<DebugStep> {
 
 struct App {
     id: identity::Identity,
+    /// Our Wayland app_id ([`window_names`]).
+    app_id: String,
     tx: mpsc::Sender<Frame>,
     slot: Slot,
     /// Our own launch token: sent in `open`, then used to activate our new window.
@@ -443,7 +446,7 @@ impl App {
         let (lw, lh) = self.logical;
         let mut attrs = Window::default_attributes()
             .with_title(title)
-            .with_name(self.id.app_id(), "")
+            .with_name(self.app_id.clone(), "")
             .with_inner_size(LogicalSize::new(lw, lh))
             .with_min_inner_size(LogicalSize::new(200, 150));
         if let Some(token) = self.launch_token.take() {
@@ -730,6 +733,7 @@ impl ApplicationHandler<UserEvent> for App {
             h,
             dpi,
             activation_token: self.launch_token.clone(),
+            phone: self.id.phone.clone(),
         };
         self.send_control(0, open);
     }
@@ -919,7 +923,25 @@ fn notify_connect_phone(id: &identity::Identity, notice: Notice) {
     crate::notify::send(&summary, &body, icon.as_deref());
 }
 
-/// Runs `lantern open [--user N] <pkg>`; returns the process exit code.
+/// The window's app_id and `windows.json` key. With `--phone S` they come from the
+/// [`Naming`](crate::naming::Naming) in `state_dir` (no state dir: no primary); without it they
+/// are today's [`identity::app_id`] / [`identity::Identity::size_key`].
+fn window_names(id: &identity::Identity, state_dir: Option<&Path>) -> (String, String) {
+    match &id.phone {
+        Some(serial) => {
+            let naming = state_dir
+                .map(crate::naming::Naming::load)
+                .unwrap_or_default();
+            (
+                naming.app_id(&id.pkg, id.user, serial),
+                naming.size_key(&id.pkg, id.user, serial),
+            )
+        }
+        None => (id.app_id(), id.size_key()),
+    }
+}
+
+/// Runs `lantern open [--phone S] [--user N] <pkg>`; returns the process exit code.
 pub fn run(id: &identity::Identity) -> Result<i32> {
     // Our launch token goes to the daemon (for an already-open window) and to our own window;
     // children must not inherit it.
@@ -964,12 +986,14 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
     let debug_steps = std::env::var("LANTERN_DEBUG_INPUT")
         .map(|s| parse_debug_steps(&s))
         .unwrap_or_default();
+    let (app_id, size_key) = window_names(id, crate::daemon::companion::state_dir().as_deref());
     let mut app = App {
         id: id.clone(),
+        app_id,
         tx,
         slot,
         launch_token,
-        logical: remembered_size(&id.size_key()),
+        logical: remembered_size(&size_key),
         open_sent: false,
         state: OpenState::default(),
         window: None,
@@ -994,7 +1018,7 @@ pub fn run(id: &identity::Identity) -> Result<i32> {
     event_loop.run_app(&mut app).context("event loop")?;
 
     if let Some(size) = app.final_size {
-        remember_size(&id.size_key(), size);
+        remember_size(&size_key, size);
     }
     // Let the writer flush (e.g. our `close`), but never hang on a stuck daemon.
     let code = app.exit_code;
@@ -1066,6 +1090,7 @@ mod tests {
         let user = |n| identity::Identity {
             pkg: "com.a".into(),
             user: n,
+            phone: None,
         };
         remember_size_in(&path, &user(0).size_key(), (900, 700)).unwrap();
         remember_size_in(&path, &user(10).size_key(), (500, 400)).unwrap();
@@ -1074,5 +1099,55 @@ mod tests {
         assert_eq!(sizes.len(), 2);
         assert_eq!((sizes["com.a"].w, sizes["com.a"].h), (900, 700));
         assert_eq!((sizes["com.a:10"].w, sizes["com.a:10"].h), (500, 400));
+    }
+
+    #[test]
+    fn remembered_size_per_phone() {
+        let dir = std::env::temp_dir().join(format!("lantern-sizes-phone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::naming::Naming {
+            primary: Some("ZD222LMDFV".into()),
+        }
+        .save(&dir)
+        .unwrap();
+        let on = |phone: Option<&str>| identity::Identity {
+            pkg: "com.a".into(),
+            user: 10,
+            phone: phone.map(str::to_owned),
+        };
+        let primary = window_names(&on(Some("ZD222LMDFV")), Some(&dir));
+        let other = window_names(&on(Some("20e9318")), Some(&dir));
+        assert_eq!(
+            primary,
+            ("lantern.com.a-u10".to_owned(), "com.a:10".to_owned())
+        );
+        assert_eq!(
+            other,
+            (
+                "lantern.com.a-u10-p20e9318".to_owned(),
+                "com.a:10@20e9318".to_owned()
+            )
+        );
+        // Without --phone (until Task 5) the names are today's.
+        assert_eq!(
+            window_names(&on(None), Some(&dir)),
+            ("lantern.com.a-u10".to_owned(), "com.a:10".to_owned())
+        );
+        // Without a state dir there is no primary: the phone's names are suffixed.
+        assert_eq!(
+            window_names(&on(Some("ZD222LMDFV")), None).0,
+            "lantern.com.a-u10-pZD222LMDFV"
+        );
+        let path = dir.join("windows.json");
+        remember_size_in(&path, &primary.1, (900, 700)).unwrap();
+        remember_size_in(&path, &other.1, (500, 400)).unwrap();
+        let sizes = load_sizes(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sizes.len(), 2);
+        assert_eq!((sizes["com.a:10"].w, sizes["com.a:10"].h), (900, 700));
+        assert_eq!(
+            (sizes["com.a:10@20e9318"].w, sizes["com.a:10@20e9318"].h),
+            (500, 400)
+        );
     }
 }

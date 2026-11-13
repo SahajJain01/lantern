@@ -1,14 +1,41 @@
 //! Which phone app a window shows: package + Android user (profile), and the per-window names
 //! derived from it (Wayland app_id, title, remembered-size key, CLI arguments).
 
-/// `lantern open [--user N] <pkg>`. Android user ids are `0..=i32::MAX` (the phone's `int`).
+/// `lantern open [--phone S] [--user N] <pkg>`. Android user ids are `0..=i32::MAX` (the
+/// phone's `int`). `phone` is the serial of the phone to open it on (`None`: lanternd's).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub pkg: String,
     pub user: u32,
+    pub phone: Option<String>,
 }
 
 pub const MAX_USER: u32 = i32::MAX as u32;
+
+/// Longest `--phone` serial, in chars.
+pub const MAX_PHONE: usize = 200;
+
+/// Checks a `--phone` value: non-empty, not starting with `-`, no whitespace or control
+/// characters, at most [`MAX_PHONE`] chars.
+fn check_phone(v: &str) -> Result<(), String> {
+    if v.is_empty() {
+        return Err("--phone needs a serial".into());
+    }
+    if v.starts_with('-') {
+        return Err(format!("--phone {v:?}: a serial never starts with '-'"));
+    }
+    if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "--phone {v:?}: a serial has no spaces or control characters"
+        ));
+    }
+    if v.chars().count() > MAX_PHONE {
+        return Err(format!(
+            "--phone: a serial is at most {MAX_PHONE} characters"
+        ));
+    }
+    Ok(())
+}
 
 /// Wayland app_id (and `.desktop` file stem / `StartupWMClass`) of `pkg` in Android user `user`.
 /// User 0 keeps `lantern.<pkg>`; another user gets `lantern.<pkg>-u<N>`. `-` never occurs in an
@@ -33,16 +60,32 @@ pub fn profile_suffix(user: u32, work: bool) -> String {
 }
 
 impl Identity {
-    /// Parses the arguments after `open`: `[--user N | --user=N] [--] <pkg>`. After `--` every
-    /// argument is the package. `Err` is a usage error.
+    /// Parses the arguments after `open`: `[--phone S | --phone=S] [--user N | --user=N] [--]
+    /// <pkg>`. After `--` every argument is the package. `Err` is a usage error.
     pub fn parse_args(args: &[&str]) -> Result<Self, String> {
         let mut user: Option<u32> = None;
+        let mut phone: Option<String> = None;
         let mut pkg: Option<&str> = None;
         let mut it = args.iter().copied();
         let mut options = true;
         while let Some(arg) = it.next() {
             if options && arg == "--" {
                 options = false;
+                continue;
+            }
+            let phone_value = if !options {
+                None
+            } else if arg == "--phone" {
+                Some(it.next().ok_or("--phone needs a serial")?)
+            } else {
+                arg.strip_prefix("--phone=")
+            };
+            if let Some(v) = phone_value {
+                if phone.is_some() {
+                    return Err("--phone given twice".into());
+                }
+                check_phone(v)?;
+                phone = Some(v.to_owned());
                 continue;
             }
             let value = if !options {
@@ -85,6 +128,7 @@ impl Identity {
         Ok(Self {
             pkg: pkg.ok_or("missing package")?.to_owned(),
             user: user.unwrap_or(0),
+            phone,
         })
     }
 
@@ -134,6 +178,7 @@ mod tests {
         Identity {
             pkg: pkg.into(),
             user,
+            phone: None,
         }
     }
 
@@ -194,6 +239,55 @@ mod tests {
             Identity::parse_args(&["--user", "2147483647", "com.a"]),
             Ok(id("com.a", MAX_USER))
         );
+    }
+
+    #[test]
+    fn parses_phone_forms() {
+        let on = |pkg: &str, user, phone: &str| Identity {
+            pkg: pkg.into(),
+            user,
+            phone: Some(phone.into()),
+        };
+        assert_eq!(
+            Identity::parse_args(&["--phone", "ZD222LMDFV", "com.a"]),
+            Ok(on("com.a", 0, "ZD222LMDFV"))
+        );
+        assert_eq!(
+            Identity::parse_args(&["--phone=20e9318", "--user", "10", "--", "com.a"]),
+            Ok(on("com.a", 10, "20e9318"))
+        );
+        assert_eq!(
+            Identity::parse_args(&["com.a", "--phone", "192.168.1.5:5555"]),
+            Ok(on("com.a", 0, "192.168.1.5:5555"))
+        );
+        // Without --phone there is none.
+        assert_eq!(Identity::parse_args(&["com.a"]).unwrap().phone, None);
+        // After `--` it is the package position, not an option.
+        assert!(Identity::parse_args(&["--", "--phone", "x"]).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_phone() {
+        let long = "x".repeat(201);
+        for bad in [
+            &["--phone"][..],
+            &["--phone", ""],
+            &["--phone=", "com.a"],
+            &["--phone", "-x", "com.a"],
+            &["--phone", "a b", "com.a"],
+            &["--phone", "a\tb", "com.a"],
+            &["--phone", "a\u{7}", "com.a"],
+            &["--phone", &long, "com.a"],
+            &["--phone", "a", "--phone", "a", "com.a"],
+            &["--phone=a", "--phone=b", "com.a"],
+            &["com.a", "--phone"],
+        ] {
+            assert!(
+                Identity::parse_args(bad).is_err(),
+                "{bad:?} must be a usage error"
+            );
+        }
+        assert!(Identity::parse_args(&["--phone", &"x".repeat(200), "com.a"]).is_ok());
     }
 
     #[test]

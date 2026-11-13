@@ -36,7 +36,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `t` | fields |
 |---|---|
 | `hello` | `version: u32`, `token: string`, optional `keyboard: bool` (absent = true; lanternd → helper only) |
-| `open` | `pkg: string`, `user: u32` (Android user/profile id, `0..=i32::MAX`), `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string` |
+| `open` | `pkg: string`, `user: u32` (Android user/profile id, `0..=i32::MAX`), `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string`, optional `phone: string` (window → daemon only) |
 | `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32`, optional `moved: bool` (absent = false), optional `label: string` (the app's launcher label), optional `work: bool` (absent = false; the app runs in a work profile) |
 | `resize` | `w: u32`, `h: u32`, `dpi: u32` |
 | `resized` | `w: u32`, `h: u32` |
@@ -374,6 +374,11 @@ Catalogue on the link:
 It is omitted from the JSON when absent (so `{"t":"focus"}` is the plain focus), the daemon never
 sends it to the helper, and the helper ignores unknown keys.
 
+`open.phone` is the serial of the phone the window wants (`lantern open --phone <serial>`). It is
+window → daemon only: omitted when absent (so a v1 `open` is byte-identical), and the daemon
+strips it, like `activation_token`, before forwarding the `open` to the helper. Until lanternd
+routes opens by phone it is otherwise ignored.
+
 ## Window IPC (lanternd ↔ `lantern open`)
 
 The same frames, over the Unix socket `$XDG_RUNTIME_DIR/lantern/daemon.sock`. Its directory is
@@ -397,7 +402,8 @@ on start, a live one means another daemon is running. The daemon listens even wi
   naming the connected phone that lacks the app; or "Lantern is disconnected" for the paused
   case.
 - New `pkg`/`user`: the daemon assigns window id `N` (from 1, never reused within a helper
-  session) and forwards the `open` to the helper on stream `N` without `activation_token`. The
+  session) and forwards the `open` to the helper on stream `N` without `activation_token` and
+  `phone`. The
   helper's `opened`, `video`, `resized`, `error` and `closed` on `N` reach the client unchanged.
 - Already open as window `M`: the existing window's client gets `focus{activation_token}` on
   stream `M` (it activates its window with that token); the new client gets `focus` with stream
@@ -432,6 +438,16 @@ Host-only; the helper never sees these, and the daemon never forwards them.
   `[{id: u32, pkg: string, user: u32}]`, the open windows sorted by id.
   Optional `companion` (`"ready"` or `"unavailable"`): the companion link's state, omitted when
   unknown (so a report without it is unchanged).
+  Optional `phones`: every known (it has a device record) or plugged-in phone, omitted when
+  empty (so a report without it is unchanged). Each is
+  `{serial: string, name?: string, state, plugged: bool, off?: bool, connected_at?: u64}`:
+  `name` is its recorded name, `off: true` (omitted when false) that the user switched it off in
+  Lantern, `connected_at` when it last became ready (unix seconds). `state` is one of
+  `"unplugged"` (known, not plugged in), `"waiting"` (plugged in, not connected), `"off"`
+  (plugged in and switched off), `"starting"` (a session start in flight or due), `"ready"`
+  (live session), `"retrying"` (a start failed; retrying after a backoff), `"reconnecting"` (went
+  offline while connected; within the unplug grace) or `"undoing"` (Lantern is undoing its
+  setup). `"starting"`, `"ready"`, `"retrying"` and `"reconnecting"` count as the live phone.
 - `status` after a window's `open` (on any stream) is a protocol error for that client, like any
   other unexpected control type.
 
@@ -445,6 +461,9 @@ Host-only, like `status`.
 - A client whose first frame is `{"t":"daemon","cmd":"connect"|"disconnect"}` on stream 0 gets
   one `status_report` (the state before the command applies) on stream 0 and is closed. The
   daemon queues the command. As anything but the first frame it is a protocol error.
+- Optional `serial: string` names the phone the command is for
+  (`{"t":"daemon","cmd":"connect","serial":"20e9318"}`); omitted when absent, so the plain form is
+  unchanged.
 - `disconnect`: the phone being served, started or retried is paused: the session ends with
   `bye` (the helper restores the phone) and nothing restarts it until the phone is replugged or
   gets `connect`. With nothing live it does nothing.

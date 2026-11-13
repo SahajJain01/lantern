@@ -60,6 +60,7 @@ fn open(pkg: &str, user: u32, token: Option<&str>) -> Frame {
             h: 800,
             dpi: 160,
             activation_token: token.map(str::to_owned),
+            phone: None,
         },
     )
 }
@@ -350,7 +351,8 @@ async fn open_window(
             w: 1280,
             h: 800,
             dpi: 160,
-            activation_token: None
+            activation_token: None,
+            phone: None,
         },
         "helper must get the Open minus the activation token"
     );
@@ -825,6 +827,50 @@ async fn client_focus_token_is_not_forwarded_to_helper() {
     daemon.shutdown().await;
 }
 
+/// `open.phone` is window -> lanternd only: the helper's `open` never carries the key.
+#[tokio::test]
+async fn open_phone_is_stripped_before_helper() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let daemon = start_daemon(Some(port));
+    let with_phone = control(
+        0,
+        Control::Open {
+            pkg: "com.example".into(),
+            user: 10,
+            w: 1280,
+            h: 800,
+            dpi: 160,
+            activation_token: Some("tok".into()),
+            phone: Some("dev".into()),
+        },
+    );
+    let deadline = Instant::now() + STEP;
+    let _client = loop {
+        let mut client = UnixStream::connect(&daemon.sock).await.unwrap();
+        send(&mut client, &with_phone).await;
+        match timeout(Duration::from_millis(200), read_frame_async(&mut client)).await {
+            Err(_) => break client, // forwarded; waiting on the helper
+            Ok(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "phone session never became active"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let fwd = helper.next().await;
+    assert!(fwd.stream > 0);
+    let raw: serde_json::Value = serde_json::from_slice(&fwd.payload).unwrap();
+    assert!(raw.get("phone").is_none(), "{raw}");
+    assert!(raw.get("activation_token").is_none(), "{raw}");
+    assert_eq!(
+        fwd.payload,
+        br#"{"t":"open","pkg":"com.example","user":10,"w":1280,"h":800,"dpi":160}"#
+    );
+    daemon.shutdown().await;
+}
+
 #[tokio::test]
 async fn reopen_when_owner_is_dead_opens_a_new_window() {
     let (mut helper, port) = FakeHelper::spawn().await;
@@ -905,6 +951,7 @@ fn open_with(user: u32, w: u32, h: u32, dpi: u32) -> Frame {
             h,
             dpi,
             activation_token: None,
+            phone: None,
         },
     )
 }
@@ -1102,6 +1149,7 @@ async fn status_without_phone_is_idle() {
             helper: None,
             windows: vec![],
             companion: None,
+            phones: vec![],
         }
     );
     daemon.shutdown().await;
@@ -1984,7 +2032,11 @@ async fn open_while_paused_gets_paused_error() {
 /// `lantern connect|disconnect` over the socket.
 async fn daemon_cmd(sock: &Path, cmd: DaemonCmd) -> StatusReport {
     let mut client = UnixStream::connect(sock).await.unwrap();
-    send(&mut client, &control(0, Control::Daemon { cmd })).await;
+    send(
+        &mut client,
+        &control(0, Control::Daemon { cmd, serial: None }),
+    )
+    .await;
     let reply = recv(&mut client).await.expect("a status report");
     let Control::StatusReport(report) = decode(&reply) else {
         panic!("expected status_report, got {:?}", decode(&reply));
@@ -2027,6 +2079,7 @@ async fn daemon_cmd_over_socket() {
             win,
             Control::Daemon {
                 cmd: DaemonCmd::Disconnect,
+                serial: None,
             },
         ),
     )
@@ -2503,7 +2556,10 @@ async fn open_failed_while_locked_gets_phone_locked() {
     assert_eq!(locky.event().await, LockEvent::Unlocked);
     assert_eq!(
         locky.event().await,
-        LockEvent::Reopen(vec![("com.foo".into(), 0), ("com.bar".into(), 10)])
+        LockEvent::Reopen {
+            serial: "dev".into(),
+            apps: vec![("com.foo".into(), 0), ("com.bar".into(), 10)]
+        }
     );
 
     // Unlocked now: a failed open keeps the phone's own error and is not reopened.

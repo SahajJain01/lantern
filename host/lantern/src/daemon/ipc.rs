@@ -2,8 +2,8 @@
 //!
 //! Each `lantern open` process is one client. Its first frame is `Control::Open` on stream 0;
 //! the daemon claims `pkg:user` in the [`Registry`]:
-//! - New window `N`: the Open (minus `activation_token`) goes to the helper on stream `N`, and
-//!   from then on frames on stream `N` pass through unchanged in both directions.
+//! - New window `N`: the Open (minus `activation_token` and `phone`) goes to the helper on
+//!   stream `N`, and from then on frames on stream `N` pass through unchanged in both directions.
 //! - Already open: the existing window's client gets `focus{activation_token}` on its stream,
 //!   the new client gets `focus` (stream = existing id) and is closed.
 //!
@@ -159,7 +159,11 @@ pub fn query_status(sock: &Path) -> Result<StatusReport> {
 /// `lantern connect|disconnect`: queues `cmd` in the daemon listening on `sock` and returns its
 /// [`StatusReport`] from before the command applies. Blocking.
 pub fn send_daemon_cmd(sock: &Path, cmd: DaemonCmd) -> Result<StatusReport> {
-    request_report(sock, Control::Daemon { cmd }, "daemon command")
+    request_report(
+        sock,
+        Control::Daemon { cmd, serial: None },
+        "daemon command",
+    )
 }
 
 /// Sends `request` as the first frame and reads the `status_report` it gets.
@@ -420,8 +424,11 @@ impl Hub {
             .into_iter()
             .map(|(_, pkg, user, _)| (pkg, user))
             .collect();
-        if !reopens.is_empty() {
-            self.lock_event(LockEvent::Reopen(reopens));
+        if let (Some(serial), false) = (serial, reopens.is_empty()) {
+            self.lock_event(LockEvent::Reopen {
+                serial,
+                apps: reopens,
+            });
         }
     }
 
@@ -613,6 +620,7 @@ impl Hub {
             helper,
             windows,
             companion,
+            phones: Vec::new(),
         }
     }
 
@@ -801,7 +809,7 @@ impl Hub {
             self.reply_and_finish(cid, control(0, report));
             return Ok(());
         }
-        if let Some(Control::Daemon { cmd }) = open {
+        if let Some(Control::Daemon { cmd, .. }) = open {
             tracing::info!(cid, ?cmd, "daemon command");
             self.commands.push(cmd);
             let report = Control::StatusReport(self.status());
@@ -815,6 +823,8 @@ impl Hub {
             h,
             dpi,
             activation_token,
+            // Which phone the window wants: lanternd's own until it routes by phone.
+            phone: _,
         }) = open
         else {
             tracing::warn!(cid, "first client frame was not open on stream 0");
@@ -887,6 +897,7 @@ impl Hub {
                     h,
                     dpi,
                     activation_token: None,
+                    phone: None,
                 };
                 to_helper(helper, control(win, open)).await
             }
@@ -1111,7 +1122,10 @@ mod tests {
         hub.unlocked();
         assert_eq!(
             rx.try_recv(),
-            Ok(LockEvent::Reopen(vec![("com.b".into(), 10)])),
+            Ok(LockEvent::Reopen {
+                serial: "b".into(),
+                apps: vec![("com.b".into(), 10)]
+            }),
             "a's open waits for a"
         );
         // a's entry survived a's own session end, but b's session end drops it.
@@ -1131,7 +1145,10 @@ mod tests {
         hub.unlocked();
         assert_eq!(
             rx.try_recv(),
-            Ok(LockEvent::Reopen(vec![("com.a".into(), 0)]))
+            Ok(LockEvent::Reopen {
+                serial: "a".into(),
+                apps: vec![("com.a".into(), 0)]
+            })
         );
     }
 
