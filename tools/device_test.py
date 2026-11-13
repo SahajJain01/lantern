@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-19
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20
     python3 tools/device_test.py --manual                            # also 8 and 14 (prompts)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
@@ -14,7 +14,8 @@ companion's test screen (enabled only during items 10, 12, 13 and 17), each for 
 and touches no other window. Items 13 and 17 save the PC clipboard's text and put it back
 afterwards; items 17 and 18 also save ~/.config/lantern/settings.toml and restore it (or remove it
 if it was absent); item 18 restarts lanternd with the keyboard off and back on; item 19
-disconnects the phone in Lantern for ~15 s and connects it again.
+disconnects the phone in Lantern for ~15 s and connects it again; item 20 does the same through
+the tray menu over the session bus (and saves a screenshot of the screen to the log dir).
 Prints one PASS/FAIL line per item; exits 1 if any item failed.
 
 The window items (2-6, 11-13, 17) need frames from the compositor, which a locked Plasma session
@@ -1227,6 +1228,73 @@ class Suite:
                         ("lanternd ready", lambda: wait_ready(15)))
 
 
+    def tray_menu(self):
+        """The tray (real session bus, desktop unlocked): lanternd's StatusNotifierItem is
+        registered with the watcher, its menu shows `Connected to <device_name>` and `Quit
+        Lantern`, clicking row 3 (Disconnect) pauses and restores the phone within 5 s, and
+        clicking it again (Connect) makes it ready within 15 s. Opening the menu by hand stays a
+        manual check; a screenshot is saved for it."""
+        pid = systemctl("show", "-p", "MainPID", "--value", UNIT).strip()
+        check(pid not in ("", "0"), f"{UNIT} is not running")
+        name = f"org.kde.StatusNotifierItem-{pid}-1"
+
+        def registered():
+            out = sh("busctl", "--user", "--json=short", "get-property",
+                     "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                     "org.kde.StatusNotifierWatcher", "RegisteredStatusNotifierItems")
+            return [i for i in json.loads(out)["data"] if i.startswith(name)]
+        items, secs = wait_until("lantern's tray item registered", 10, registered)
+        note(f"registered {items} ({secs:.1f} s)")
+
+        def labels():
+            out = sh("busctl", "--user", "--json=short", "call", name, "/MenuBar",
+                     "com.canonical.dbusmenu", "GetLayout", "iias", "0", "-1", "0")
+            _, (_, _, children) = json.loads(out)["data"]
+            rows = {}
+            for child in children:
+                cid, props, _ = child["data"]
+                rows[cid] = props.get("label", {}).get("data", "")
+            return rows
+
+        def click(cid):
+            sh("busctl", "--user", "call", name, "/MenuBar", "com.canonical.dbusmenu", "Event",
+               "isvu", str(cid), "clicked", "i", "0", "0")
+
+        device = adb("shell", "settings get global device_name").strip()
+        want = f"Connected to {device}".replace("_", "__")  # dbusmenu escapes mnemonics
+        rows, _ = wait_until(f"menu shows {want!r}", 15,
+                             lambda: (r := labels()).get(1) == want and r)
+        note(f"menu: {rows}")
+        check(rows.get(11) == "Quit Lantern", f"no Quit Lantern row: {rows}")
+        check(rows.get(3) == "Disconnect", f"row 3 is not Disconnect: {rows}")
+        base = baseline()
+        note(f"originals: stay_on={base['stay_on']} ime={base['ime']} imes={base['imes']}")
+        connected = False
+        try:
+            click(3)
+            st, secs = wait_until("paused after the tray's Disconnect", 5,
+                                  lambda: status()["state"] == "paused" and status())
+            note(f"paused {secs:.1f} s after the click: {json.dumps(st)}")
+            st, secs = wait_until("phone restored", 5,
+                                  lambda: restored(s := phone_state()) and s, interval=0.2)
+            note(f"restored {secs:.1f} s later")
+            rows, _ = wait_until("row 3 is Connect", 5,
+                                 lambda: (r := labels()).get(3) == "Connect" and r)
+            click(3)
+            _, secs = wait_ready(15)
+            connected = True
+            note(f"ready {secs:.1f} s after the tray's Connect")
+        finally:
+            if not connected:
+                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect")),
+                        ("lanternd ready", lambda: wait_ready(15)))
+        shot = LOG_DIR / "tray.png"
+        r = subprocess.run(["spectacle", "-b", "-n", "-o", str(shot)], capture_output=True,
+                           text=True, timeout=30)
+        note(f"screenshot for the report: {shot}" if r.returncode == 0 and shot.exists()
+             else f"no screenshot (spectacle -> {r.returncode}: {r.stderr.strip()})")
+
+
 ITEMS = [
     "session_starts_on_plug",
     "open_settings_creates_one_display",
@@ -1247,6 +1315,7 @@ ITEMS = [
     "clipboard_setting_off",
     "keyboard_setting_off",
     "disconnect_and_connect",
+    "tray_menu",
 ]
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard"}  # need a person to pull the cable
 

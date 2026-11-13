@@ -29,6 +29,7 @@ raw-window-handle = "0.6"
 wayland-client = "0.31"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

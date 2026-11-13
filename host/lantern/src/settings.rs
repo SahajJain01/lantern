@@ -11,6 +11,7 @@
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -219,8 +220,12 @@ fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
 pub struct SettingsHandle {
     path: Option<PathBuf>,
     tx: watch::Sender<Settings>,
+    /// The file's read or parse error while it has one ([`load`]).
+    error: watch::Sender<Option<String>>,
     /// The file's stamp when [`Self::new`] loaded it.
     loaded: Option<(SystemTime, u64)>,
+    /// Held across [`Self::set`]: concurrent writes would share one temp file name.
+    writing: Arc<Mutex<()>>,
 }
 
 impl SettingsHandle {
@@ -228,11 +233,13 @@ impl SettingsHandle {
     /// refused.
     pub fn new(path: Option<PathBuf>) -> Self {
         let loaded = path.as_deref().and_then(stamp);
-        let settings = path.as_deref().map(|p| load(p).0).unwrap_or_default();
+        let (settings, error) = path.as_deref().map(load).unwrap_or_default();
         Self {
             path,
             tx: watch::Sender::new(settings),
+            error: watch::Sender::new(error),
             loaded,
+            writing: Arc::default(),
         }
     }
 
@@ -244,25 +251,44 @@ impl SettingsHandle {
         self.tx.borrow().clone()
     }
 
+    /// The file's read or parse error, while the defaults stand in for it.
+    pub fn error(&self) -> Option<String> {
+        self.error.borrow().clone()
+    }
+
+    /// Woken whenever [`Self::error`] changes.
+    pub fn subscribe_error(&self) -> watch::Receiver<Option<String>> {
+        self.error.subscribe()
+    }
+
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
-    /// Writes `key` to the file ([`set`]) and publishes the result at once.
+    /// Writes `key` to the file ([`set`]) and publishes the result at once. Blocks on file IO
+    /// (and on another thread's `set`).
     pub fn set(&self, key: Key, value: bool) -> Result<()> {
         let Some(path) = &self.path else {
             bail!("no settings file (no config directory)");
         };
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
         let settings = set(path, key, value)?;
         tracing::info!(key = key.name(), value, "setting changed");
         self.tx.send_replace(settings);
+        // The file parsed, so any earlier error is gone.
+        self.error.send_if_modified(|error| error.take().is_some());
         Ok(())
     }
 
     /// Reloads the file whenever its mtime or length changes, checking every [`POLL`].
-    /// Subscribers are woken only when a value actually changed.
+    /// Subscribers are woken only when a value (or the error) actually changed.
     pub fn spawn_poll(&self) -> tokio::task::JoinHandle<()> {
-        let (path, tx, mut last) = (self.path.clone(), self.tx.clone(), self.loaded);
+        let (path, tx, errors, mut last) = (
+            self.path.clone(),
+            self.tx.clone(),
+            self.error.clone(),
+            self.loaded,
+        );
         tokio::spawn(async move {
             let Some(path) = path else {
                 return;
@@ -277,7 +303,7 @@ impl SettingsHandle {
                     continue;
                 }
                 last = now;
-                let (settings, _) = load(&path);
+                let (settings, error) = load(&path);
                 tx.send_if_modified(|current| {
                     if *current == settings {
                         return false;
@@ -285,6 +311,12 @@ impl SettingsHandle {
                     tracing::info!(?settings, "settings file changed");
                     *current = settings;
                     true
+                });
+                // After the values, so an error watcher sees the values it came with.
+                errors.send_if_modified(|current| {
+                    let changed = *current != error;
+                    *current = error;
+                    changed
                 });
             }
         })
@@ -471,5 +503,62 @@ mod tests {
         assert!(!rx.borrow().clipboard_sync);
         assert!(!handle.get().clipboard_sync);
         poll.abort();
+    }
+
+    #[tokio::test]
+    async fn error_is_published_and_cleared() {
+        let dir = scratch();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, "clipboard_sync = \n").unwrap();
+        let handle = SettingsHandle::new(Some(path.clone()));
+        assert!(handle.error().unwrap().contains("line 1"));
+        let mut errors = handle.subscribe_error();
+        assert!(errors.borrow_and_update().is_some());
+        // The tray's set is refused and the error stays.
+        assert!(handle.set(Key::ClipboardSync, false).is_err());
+        assert!(handle.error().is_some());
+        let poll = handle.spawn_poll();
+        std::fs::write(&path, "clipboard_sync = false\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), errors.changed())
+            .await
+            .expect("the fixed file was not picked up within 3 s")
+            .unwrap();
+        assert_eq!(*errors.borrow(), None);
+        assert_eq!(handle.error(), None);
+        assert!(!handle.get().clipboard_sync);
+        // Broken again by hand: the error comes back.
+        std::fs::write(&path, "clipboard_sync = = =\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), errors.changed())
+            .await
+            .expect("the broken file was not picked up within 3 s")
+            .unwrap();
+        assert!(handle.error().is_some());
+        poll.abort();
+    }
+
+    #[test]
+    fn concurrent_sets_all_land() {
+        let path = scratch().join("lantern").join("settings.toml");
+        let handle = SettingsHandle::new(Some(path.clone()));
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let key = if n % 2 == 0 {
+                            Key::ClipboardSync
+                        } else {
+                            Key::LanternKeyboard
+                        };
+                        handle.set(key, n % 4 < 2).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(load(&path).1.is_none());
     }
 }

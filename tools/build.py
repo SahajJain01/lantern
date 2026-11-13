@@ -5,8 +5,9 @@
     python3 tools/build.py companion  # host-JVM tests, then build/companion/lantern-companion.apk
     python3 tools/build.py all        # helper, companion, then cargo build --release (host/)
     python3 tools/build.py install  # all, then ~/.local/bin/lantern + lanternd.service (enabled)
+                                    # + the Lantern launcher (dev.lantern.Lantern.desktop)
     python3 tools/build.py uninstall  # disable --now lanternd, `lantern undo-setup` (best
-                                      # effort), remove the unit and the binary
+                                      # effort), remove the unit, the binary and the launcher
 
 install/uninstall are idempotent. install restarts a running lanternd only when the binary or
 the unit changed.
@@ -58,6 +59,20 @@ UNIT_SRC = ROOT / "host/lantern/packaging/lanternd.service"
 UNIT = "lanternd.service"
 BIN_DIR = Path.home() / ".local/bin"
 UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd/user"
+_DATA = os.environ.get("XDG_DATA_HOME", "")
+# The "Lantern" launcher: starts lanternd (and so the tray). It has no X-Lantern-Serial, so
+# lanternd's menu-entry code never treats it as a phone app's entry.
+LAUNCHER = ((Path(_DATA) if _DATA.startswith("/") else Path.home() / ".local/share")
+            / "applications/dev.lantern.Lantern.desktop")
+LAUNCHER_TEXT = """\
+[Desktop Entry]
+Type=Application
+Name=Lantern
+Comment=Phone apps as PC windows
+Exec=systemctl --user start lanternd.service
+Icon=smartphone
+Categories=Utility;
+"""
 
 # AIDL interfaces the vendored scrcpy wrappers need (paths relative to vendor/aidl).
 AIDL = ["android/view/IDisplayWindowListener.aidl"]
@@ -250,6 +265,20 @@ def place(src, dst, mode):
     return True
 
 
+def place_text(text, dst, mode):
+    """Writes `text` to `dst` atomically unless it already holds it."""
+    data = text.encode()
+    if dst.exists() and dst.read_bytes() == data and (dst.stat().st_mode & 0o777) == mode:
+        print(f"unchanged {dst}")
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
+    tmp.write_bytes(data)
+    tmp.chmod(mode)
+    os.replace(tmp, dst)
+    print(f"installed {dst}")
+
+
 def systemctl(*args, check=True, quiet=False):
     out = subprocess.DEVNULL if quiet else None
     return subprocess.run(["systemctl", "--user", *args], check=check, stdout=out, stderr=out)
@@ -258,6 +287,7 @@ def systemctl(*args, check=True, quiet=False):
 def install():
     changed = place(RELEASE_BIN, BIN_DIR / "lantern", 0o755)
     changed |= place(UNIT_SRC, UNIT_DIR / UNIT, 0o644)
+    place_text(LAUNCHER_TEXT, LAUNCHER, 0o644)
     run("systemctl", "--user", "daemon-reload")
     active = systemctl("is-active", "--quiet", UNIT, check=False, quiet=True).returncode == 0
     run("systemctl", "--user", "enable", "--now", UNIT)
@@ -292,7 +322,7 @@ def uninstall():
         systemctl("disable", "--now", UNIT, check=False)
     # undo-setup refuses while lanternd serves the phone, so only after the stop.
     undo_setup()
-    for path in (unit, BIN_DIR / "lantern"):
+    for path in (unit, BIN_DIR / "lantern", LAUNCHER):
         if path.exists():
             path.unlink()
             print(f"removed {path}")

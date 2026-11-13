@@ -50,6 +50,11 @@ fn missing_subcommand_prints_usage() {
     assert!(stderr.contains("usage: lantern daemon"), "stderr: {stderr}");
 }
 
+/// A session bus address nobody listens on, inside the test's scratch `dir`.
+fn no_bus(dir: &std::path::Path) -> String {
+    format!("unix:path={}", dir.join("no-bus").display())
+}
+
 fn scratch(tag: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -146,6 +151,8 @@ fn status_prints_the_running_daemons_state_as_json() {
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env("XDG_RUNTIME_DIR", &dir)
+        // No tray on the real session bus from a test: the daemon logs "no tray" and runs on.
+        .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
         .env("PATH", &path)
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -399,6 +406,8 @@ fn undo_setup_refuses_live_session() {
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env("XDG_RUNTIME_DIR", &dir)
+        // No tray on the real session bus from a test: the daemon logs "no tray" and runs on.
+        .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
         .env("XDG_STATE_HOME", dir.join("state"))
         .env("PATH", &path)
         .env_remove("LANTERN_SERIAL")
@@ -473,6 +482,8 @@ fn undo_setup_refuses_idle_daemon() {
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_lantern"))
         .arg("daemon")
         .env("XDG_RUNTIME_DIR", &dir)
+        // No tray on the real session bus from a test: the daemon logs "no tray" and runs on.
+        .env("DBUS_SESSION_BUS_ADDRESS", no_bus(&dir))
         .env("XDG_STATE_HOME", dir.join("state"))
         .env("PATH", &path)
         .env_remove("LANTERN_SERIAL")

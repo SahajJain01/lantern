@@ -737,6 +737,14 @@ pub async fn run() -> Result<()> {
     // Runs for the daemon's lifetime; the runtime ends it.
     settings.spawn_poll();
     let session_settings = settings.clone();
+    // The tray: it reads the view and sends commands, never waiting on the run loop. Without
+    // a session bus the sender is dropped here and the loop simply gets no tray commands.
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (view_tx, view_rx) = watch::channel(View {
+        phone: Phone::None,
+        name: None,
+    });
+    crate::tray::spawn(view_rx, settings.clone(), cmd_tx).await;
     serve_with(
         listener,
         Parts {
@@ -748,8 +756,8 @@ pub async fn run() -> Result<()> {
             notify: Some(Arc::new(|summary: &str, body: &str| {
                 crate::notify::send(summary, body, None)
             })),
-            // The tray (its command channel and view) is wired in by the tray task.
-            ..Default::default()
+            commands: Some(cmd_rx),
+            view: Some(view_tx),
         },
         configured,
         track_devices(),

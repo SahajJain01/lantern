@@ -4,5 +4,6 @@ pub mod daemon;
 pub mod desktop;
 pub mod notify;
 pub mod settings;
+pub mod tray;
 pub mod undo;
 pub mod window;
