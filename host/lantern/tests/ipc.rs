@@ -2408,7 +2408,10 @@ async fn autoconnect_switched_on_connects_nothing_now() {
         .unwrap();
     assert_no_session(&mut helper).await;
     assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Waiting);
+    // Unplugged past the grace (a blip within it isn't a plug-in, R7).
     ctl.offline("dev");
+    assert_eq!(ctl.prompt().await, plugged_in("dev", "Pixel"));
+    assert_eq!(ctl.event().await, gone("dev"));
     ctl.online("dev");
     assert_eq!(helper.next_session().await, 0);
     ctl.ready("dev").await;
@@ -2525,6 +2528,184 @@ async fn waiting_phone_blip_keeps_its_notice() {
     assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
     tokio::time::sleep(2 * fast_timing().unplug_grace).await;
     assert_eq!(ctl.events_for_a_while().await, []);
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
+
+/// A port nothing listens on: every session start fails.
+fn dead_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn gone(serial: &str) -> ConnectEvent {
+    ConnectEvent::Gone {
+        serial: serial.into(),
+    }
+}
+
+/// R7: phone a is wanted and offline in its grace (its starts keep failing) when its `wanted`
+/// is released; the grace carries over, so a's notice still closes when it ends.
+async fn wanted_in_grace(ctl: &mut Ctl) {
+    ctl.command(connect("a")).await;
+    ctl.state_until("a", PhoneState::Retrying).await;
+    ctl.offline("a");
+    ctl.state_until("a", PhoneState::Reconnecting).await;
+}
+
+/// R7 (a), switch-in on plug-in: b's pending connect-and-open switches to b while a is in its
+/// grace.
+#[tokio::test]
+async fn released_in_grace_by_switch_in_closes_its_notice() {
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(dead_port(), &["a"], rules(&state, false), |_| {});
+    assert_eq!(ctl.prompt().await, plugged_in("a", "a"));
+    wanted_in_grace(&mut ctl).await;
+    ctl.command(connect_and_open("b", "com.x", 0)).await;
+    assert!(matches!(ctl.event().await, ConnectEvent::PlugIn { .. }));
+    ctl.online("b");
+    ctl.state_until("a", PhoneState::Unplugged).await;
+    tokio::time::sleep(2 * fast_timing().unplug_grace).await;
+    assert_eq!(ctl.events_for_a_while().await, [gone("a")]);
+    ctl.shutdown().await;
+}
+
+/// R7 (a), Connect on another plugged phone while a is in its grace.
+#[tokio::test]
+async fn released_in_grace_by_connect_other_closes_its_notice() {
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(dead_port(), &["a", "b"], rules(&state, false), |_| {});
+    let mut asked = vec![ctl.prompt().await, ctl.prompt().await];
+    asked.sort_by_key(|e| format!("{e:?}"));
+    assert_eq!(asked, [plugged_in("a", "a"), plugged_in("b", "b")]);
+    wanted_in_grace(&mut ctl).await;
+    ctl.command(connect("b")).await;
+    ctl.state_until("a", PhoneState::Unplugged).await;
+    tokio::time::sleep(2 * fast_timing().unplug_grace).await;
+    assert_eq!(ctl.events_for_a_while().await, [gone("a")]);
+    ctl.shutdown().await;
+}
+
+/// R7 (a), Disconnect of a during its grace; back within the grace it isn't asked.
+#[tokio::test]
+async fn released_in_grace_by_disconnect_closes_its_notice() {
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(dead_port(), &["a"], rules(&state, false), |_| {});
+    assert_eq!(ctl.prompt().await, plugged_in("a", "a"));
+    wanted_in_grace(&mut ctl).await;
+    ctl.command(disconnect("a")).await;
+    ctl.state_until("a", PhoneState::Unplugged).await;
+    tokio::time::sleep(2 * fast_timing().unplug_grace).await;
+    assert_eq!(ctl.events_for_a_while().await, [gone("a")]);
+    // Again, and back within the grace: no prompt, and its notice isn't closed.
+    ctl.online("a");
+    assert_eq!(ctl.prompt().await, plugged_in("a", "a"));
+    ctl.command(connect("a")).await;
+    ctl.state_until("a", PhoneState::Retrying).await;
+    ctl.offline("a");
+    ctl.state_until("a", PhoneState::Reconnecting).await;
+    ctl.command(disconnect("a")).await;
+    ctl.state_until("a", PhoneState::Unplugged).await;
+    ctl.online("a");
+    ctl.state_until("a", PhoneState::Off).await;
+    tokio::time::sleep(2 * fast_timing().unplug_grace).await;
+    assert_eq!(ctl.events_for_a_while().await, []);
+    ctl.shutdown().await;
+}
+
+/// R7 (b): a disconnected phone (autoconnect off, so its rule is Prompt) on a loose cable isn't
+/// asked; away past the grace, the next plug-in asks.
+#[tokio::test]
+async fn disconnected_phone_blip_never_prompts() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["dev"], rules(&state, false), |_| {});
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    ctl.command(connect("dev")).await;
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    assert_eq!(ctl.event().await, gone("dev"));
+    ctl.command(disconnect("dev")).await;
+    expect_bye(&mut helper).await;
+    ctl.state_until("dev", PhoneState::Off).await;
+    for _ in 0..3 {
+        ctl.offline("dev");
+        ctl.state_until("dev", PhoneState::Unplugged).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ctl.online("dev");
+        ctl.state_until("dev", PhoneState::Off).await;
+    }
+    assert_eq!(ctl.events_for_a_while().await, []);
+    assert_eq!(flags(&state, "dev"), (true, false));
+    ctl.offline("dev");
+    assert_eq!(ctl.event().await, gone("dev"));
+    ctl.online("dev");
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
+
+/// R7 (b): a phone switched away from (its `live` cleared) on a loose cable isn't asked.
+#[tokio::test]
+async fn switched_away_phone_blip_never_prompts() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["a", "b"], rules(&state, false), |_| {});
+    let mut asked = vec![ctl.prompt().await, ctl.prompt().await];
+    asked.sort_by_key(|e| format!("{e:?}"));
+    assert_eq!(asked, [plugged_in("a", "a"), plugged_in("b", "b")]);
+    ctl.command(connect("a")).await;
+    helper.next_session().await;
+    ctl.ready("a").await;
+    ctl.command(connect("b")).await;
+    expect_bye(&mut helper).await;
+    helper.next_session().await;
+    ctl.ready("b").await;
+    assert_eq!(flags(&state, "a"), (false, false));
+    ctl.events_for_a_while().await;
+    ctl.offline("a");
+    ctl.state_until("a", PhoneState::Unplugged).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ctl.online("a");
+    ctl.state_until("a", PhoneState::Waiting).await;
+    assert_eq!(ctl.events_for_a_while().await, []);
+    assert_eq!(ctl.phone("b").unwrap().state, PhoneState::Ready);
+    ctl.shutdown().await;
+}
+
+/// R7: with a zero grace (`LANTERN_UNPLUG_GRACE_MS=0`, the device items) every replug is a
+/// plug-in, even when the replug is handled before the grace's expiry.
+#[tokio::test]
+async fn zero_grace_replug_prompts() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut opts = rules(&state, false);
+    opts.timing = Some(Timing {
+        unplug_grace: Duration::ZERO,
+        pending_for: Duration::from_secs(2),
+    });
+    let mut ctl = start_ctl_opts(port, &["dev"], opts, |_| {});
+    assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
+    for _ in 0..5 {
+        ctl.offline("dev");
+        ctl.online("dev");
+        assert_eq!(ctl.prompt().await, plugged_in("dev", "Pixel"));
+    }
+    assert_no_session(&mut helper).await;
+    ctl.shutdown().await;
+}
+
+/// R7: one phone away in its grace doesn't hush another phone's first plug-in.
+#[tokio::test]
+async fn first_plug_in_still_prompts() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    let mut ctl = start_ctl_opts(port, &["a"], rules(&state, false), |_| {});
+    assert_eq!(ctl.event().await, plugged_in("a", "a"));
+    ctl.offline("a");
+    ctl.state_until("a", PhoneState::Unplugged).await;
+    ctl.online("new");
+    assert_eq!(ctl.event().await, plugged_in("new", "new"));
     assert_no_session(&mut helper).await;
     ctl.shutdown().await;
 }
@@ -2748,26 +2929,31 @@ async fn plug_connect_drops_other_pending() {
 }
 
 /// A phone that was live when lanternd stopped but is left waiting (another is wanted) loses
-/// its `live` flag, so a later blip only asks.
+/// its `live` flag, so a later plug-in only asks (and a blip, R7, changes nothing).
 #[tokio::test]
 async fn waiting_phone_loses_live() {
     let (mut helper, port) = FakeHelper::spawn().await;
     let state = scratch_state();
     companion::set_live(&state, "a", true).unwrap();
     companion::set_live(&state, "x", true).unwrap();
-    // The default 10 s grace: the start-up rule must not be what clears x's flag.
-    let mut opts = rules(&state, false);
-    opts.timing = None;
-    let mut ctl = start_ctl_opts(port, &["a", "x"], opts, |_| {});
+    // x stays plugged past the start-up rule's deadline, so that rule never clears its flag.
+    let mut ctl = start_ctl_opts(port, &["a", "x"], rules(&state, false), |_| {});
     assert_eq!(helper.next_session().await, 0);
     ctl.ready("a").await;
     ctl.state_until("x", PhoneState::Waiting).await;
     record_until(&state, "x", |(_, live)| !live).await;
-    // a switched off: nothing is wanted. x blips: it is asked about, not connected.
+    // a switched off: nothing is wanted. x blips: it stays waiting, unasked.
     ctl.command(disconnect("a")).await;
     expect_bye(&mut helper).await;
     ctl.state_until("a", PhoneState::Off).await;
+    ctl.events_for_a_while().await;
     ctl.offline("x");
+    ctl.online("x");
+    ctl.state_until("x", PhoneState::Waiting).await;
+    ctl.assert_no_prompt().await;
+    // Away past the grace: plugging it in asks; it isn't connected.
+    ctl.offline("x");
+    assert_eq!(ctl.event().await, gone("x"));
     ctl.online("x");
     assert_eq!(ctl.prompt().await, plugged_in("x", "x"));
     assert_no_session(&mut helper).await;

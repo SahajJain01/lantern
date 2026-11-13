@@ -6,7 +6,7 @@ pub mod phones;
 pub mod registry;
 pub mod session;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -454,11 +454,9 @@ impl Table {
     }
 }
 
-/// The connect prompt's side in the run loop: the events channel, and which phones have a
-/// notice up (one was sent and no `Gone` since).
+/// The connect prompt's side in the run loop: its events channel.
 struct Prompts {
     events: Option<mpsc::Sender<ConnectEvent>>,
-    shown: HashSet<String>,
 }
 
 impl Prompts {
@@ -467,24 +465,9 @@ impl Prompts {
         let Some(events) = &self.events else {
             return;
         };
-        match &event {
-            ConnectEvent::Gone { serial } => {
-                self.shown.remove(serial);
-            }
-            ConnectEvent::PluggedIn { serial, .. }
-            | ConnectEvent::OpenRefused { serial, .. }
-            | ConnectEvent::PlugIn { serial, .. } => {
-                self.shown.insert(serial.clone());
-            }
-        }
         if let Err(error) = events.try_send(event) {
             tracing::warn!(%error, "connect prompt not listening; event dropped");
         }
-    }
-
-    /// Whether `serial` has a notice up.
-    fn shown(&self, serial: &str) -> bool {
-        self.shown.contains(serial)
     }
 }
 
@@ -503,9 +486,12 @@ impl Prompts {
 /// - The latest choice of phone wins: a Connect, or a phone connecting on plug-in, drops every
 ///   other phone's connect-and-open request. A phone left waiting loses its `live` flag.
 /// - Nothing starts while an undo runs, and commands other than Quit are ignored meanwhile.
-/// - A phone's connect notice closes (`Gone`) when it gets ready or is gone for good: the wanted
-///   phone at the end of its grace, a waiting phone once it stayed away for the grace (back
-///   within it, its notice stays and it isn't asked again, so a loose cable doesn't re-pop it).
+/// - Every phone that isn't live gets the same unplug grace: a plugged phone that isn't wanted
+///   going offline, or the wanted phone released while offline in its grace (keeping the rest
+///   of it). Back within the grace is a blip: it isn't asked and nothing changes, so a loose
+///   cable never re-pops a notice. Past it, `Gone`.
+/// - A phone's connect notice closes (`Gone`) when it gets ready or is gone for good (the end
+///   of its grace, wanted or not).
 // `release!` resets `retry_at` before a switch schedules the new phone's start.
 #[allow(clippy::too_many_arguments, unused_assignments)]
 async fn drive<E, S, F, D>(
@@ -551,14 +537,14 @@ where
     let mut table = Table::new(state_dir);
     let mut prompts = Prompts {
         events: connect_events,
-        shown: HashSet::new(),
     };
     // The one phone to serve.
     let mut wanted: Option<String> = None;
     // The wanted phone is offline: the end of its unplug grace.
     let mut grace: Option<Instant> = None;
-    // Unwanted phones gone offline with a notice up: when each notice closes unless the phone
-    // comes back.
+    // Plugged phones that aren't wanted and went offline (or were released in their grace): the
+    // end of each one's unplug grace. Back within it is a blip: nothing is asked or changed.
+    // Past it, `Gone` (the prompt ignores it for a phone with no notice).
     let mut leaving: HashMap<String, Instant> = HashMap::new();
     let mut active: Option<(SessionConn, Instant)> = None;
     let mut starting: Starting<F> = None;
@@ -567,15 +553,18 @@ where
     let mut undoing: Undoing = None;
 
     // Ends whatever runs for the wanted phone and forgets it; evaluates to its serial. Its
-    // flags are the caller's.
+    // flags are the caller's. A phone offline in its grace keeps the rest of it in `leaving`.
     macro_rules! release {
         ($why:expr) => {{
             cancel_start(&mut starting, $why);
             close_session(&mut active, &mut hub).await;
             retry_at = None;
             failures = 0;
-            grace = None;
-            wanted.take()
+            let old = wanted.take();
+            if let (Some(until), Some(old)) = (grace.take(), old.as_ref()) {
+                leaving.insert(old.clone(), until);
+            }
+            old
         }};
     }
 
@@ -722,8 +711,16 @@ where
                         }
                         names.refresh(&serial);
                         let flags = table.read(&serial);
-                        // Back within the grace: its notice is still on screen.
-                        let blip = leaving.remove(&serial).is_some();
+                        // Back within the grace: a blip. A grace already over (its expiry not
+                        // handled yet, e.g. a zero grace) is a real plug-in.
+                        let blip = match leaving.remove(&serial) {
+                            Some(until) if until > Instant::now() => true,
+                            Some(_) => {
+                                prompts.send(ConnectEvent::Gone { serial: serial.clone() });
+                                false
+                            }
+                            None => false,
+                        };
                         if wanted.as_deref() == Some(serial.as_str()) {
                             if grace.take().is_some() {
                                 tracing::info!(serial, "back within the unplug grace; reconnecting");
@@ -732,6 +729,9 @@ where
                             }
                         } else if undoing.as_ref().is_some_and(|(s, _)| *s == serial) {
                             tracing::info!(serial, "phone is being undone; not starting");
+                        } else if blip {
+                            // A loose cable never asks and changes nothing.
+                            tracing::info!(serial, "back within the unplug grace; not asking again");
                         } else {
                             let autoconnect = settings
                                 .as_ref()
@@ -754,9 +754,6 @@ where
                                     table.keep_pending_for(&serial);
                                     wanted = Some(serial);
                                     retry_at = Some(Instant::now());
-                                }
-                                OnPlug::Prompt if blip => {
-                                    tracing::info!(serial, "back within the unplug grace; not asking again");
                                 }
                                 OnPlug::Prompt => {
                                     let name = names.get(&serial).unwrap_or_else(|| serial.clone());
@@ -785,10 +782,8 @@ where
                             grace = Some(Instant::now() + timing.unplug_grace);
                         } else if was_plugged {
                             tracing::info!(serial, "device offline");
-                            // Its notice closes only if it stays away for the grace.
-                            if prompts.shown(&serial) {
-                                leaving.insert(serial, Instant::now() + timing.unplug_grace);
-                            }
+                            // Back within the grace is a blip; its notice closes only past it.
+                            leaving.insert(serial, Instant::now() + timing.unplug_grace);
                         }
                     }
                 }
@@ -819,7 +814,7 @@ where
                     .collect();
                 for serial in gone {
                     leaving.remove(&serial);
-                    tracing::debug!(serial, "away past the grace; closing its notice");
+                    tracing::debug!(serial, "away past the grace; closing any notice");
                     prompts.send(ConnectEvent::Gone { serial });
                 }
             }
