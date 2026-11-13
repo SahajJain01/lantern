@@ -167,8 +167,8 @@ struct Rig {
     server: Option<Connection>,
     calls: Arc<Mutex<Vec<Call>>>,
     events: Option<mpsc::Sender<LockEvent>>,
-    _view: watch::Sender<View>,
-    pins: mpsc::Receiver<Pin>,
+    view: watch::Sender<View>,
+    pins: mpsc::Receiver<(String, Pin)>,
     /// Where the fake `exe` appends one line per run.
     reopened: PathBuf,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -236,7 +236,7 @@ impl Rig {
             server,
             calls,
             events: Some(events),
-            _view: view,
+            view,
             pins,
             reopened,
             task,
@@ -274,7 +274,14 @@ impl Rig {
         emit_action(self.server.as_ref().unwrap(), id, action).await;
     }
 
+    /// The next PIN handed on, for the phone `s1` (the view's).
     async fn next_pin(&mut self) -> Pin {
+        let (serial, pin) = self.next_tagged_pin().await;
+        assert_eq!(serial, "s1");
+        pin
+    }
+
+    async fn next_tagged_pin(&mut self) -> (String, Pin) {
         tokio::time::timeout(Duration::from_secs(5), self.pins.recv())
             .await
             .expect("no PIN within 5 s")
@@ -282,7 +289,11 @@ impl Rig {
     }
 
     async fn assert_no_pin(&mut self) {
-        if let Ok(pin) = tokio::time::timeout(Duration::from_millis(500), self.pins.recv()).await {
+        self.assert_no_pin_within(Duration::from_millis(500)).await;
+    }
+
+    async fn assert_no_pin_within(&mut self, within: Duration) {
+        if let Ok(pin) = tokio::time::timeout(within, self.pins.recv()).await {
             panic!("unexpected PIN handed on: {pin:?}");
         }
     }
@@ -472,7 +483,7 @@ async fn success_closes_notice_and_reopens_pending() {
     })
     .await;
     lines.sort();
-    assert_eq!(lines, ["open --user 10 com.bar", "open com.foo"]);
+    assert_eq!(lines, ["open -- com.foo", "open --user 10 -- com.bar"]);
     assert!(rig.calls().contains(&Call::Close(id)), "{:?}", rig.calls());
 }
 
@@ -498,4 +509,48 @@ async fn no_notification_server_is_harmless() {
         .expect("run did not end")
         .unwrap()
         .unwrap();
+}
+
+/// A PIN dialog that answers `text` after `secs` seconds.
+fn slow_prompt(secs: &str, text: &str) -> Prompt {
+    Prompt {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), format!("sleep {secs}; echo {text}")],
+    }
+}
+
+/// R6: the PIN carries the serial of the phone whose notification was clicked, even when the
+/// session moved to another phone while the dialog was open (the run loop then wipes it).
+#[tokio::test]
+async fn pin_is_tagged_with_the_phone_clicked() {
+    let mut rig = Rig::start(true, slow_prompt("0.5", "1234")).await;
+    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    let id = rig.notify_id(1).await;
+    rig.click(id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.view.send_modify(|view| {
+        view.phone = Phone::Ready {
+            serial: "s2".into(),
+            companion: None,
+        };
+        view.name = Some("Other".into());
+    });
+    let (serial, got) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "s1");
+    assert_eq!(got, pin("1234"));
+}
+
+/// R6: an answer whose locked stretch ended since the click (unlocked on the phone, or the
+/// session ended) is wiped, not handed on.
+#[tokio::test]
+async fn answer_after_the_stretch_ended_is_dropped() {
+    let mut rig = Rig::start(true, slow_prompt("0.5", "1234")).await;
+    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    let id = rig.notify_id(1).await;
+    rig.click(id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.send(LockEvent::Unlocked).await;
+    // A new stretch before the answer does not revive it.
+    rig.send(LockEvent::Locked(LockReason::Open)).await;
+    rig.assert_no_pin_within(Duration::from_millis(1500)).await;
 }

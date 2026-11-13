@@ -349,8 +349,9 @@ pub struct Hub {
     lock_events: Option<mpsc::Sender<LockEvent>>,
     /// Windows that got `opened` (an `error` before it is a failed open).
     opened: HashSet<u32>,
-    /// Opens the lock blocked, oldest first, one per app: reopened after the unlock.
-    reopens: Vec<(String, u32, Instant)>,
+    /// Opens the lock blocked, oldest first, one per app and phone (serial, pkg, user, when):
+    /// reopened after an unlock of that phone.
+    reopens: Vec<(String, String, u32, Instant)>,
 }
 
 impl Hub {
@@ -400,25 +401,40 @@ impl Hub {
         }
     }
 
-    /// The stretch ended in an unlock: the opens it blocked within [`REOPEN_WITHIN`] go to
-    /// the prompt to be reopened.
+    /// The served phone's serial.
+    fn serial(&self) -> Option<&str> {
+        self.session.1.as_deref()
+    }
+
+    /// The stretch ended in an unlock: the opens it blocked on this phone within
+    /// [`REOPEN_WITHIN`] go to the prompt to be reopened.
     fn unlocked(&mut self) {
         self.locked = false;
-        let reopens: Vec<(String, u32)> = std::mem::take(&mut self.reopens)
+        let serial = self.serial().map(str::to_owned);
+        let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.reopens)
             .into_iter()
-            .filter(|(_, _, at)| at.elapsed() < REOPEN_WITHIN)
-            .map(|(pkg, user, _)| (pkg, user))
+            .filter(|(.., at)| at.elapsed() < REOPEN_WITHIN)
+            .partition(|(s, ..)| Some(s) == serial.as_ref());
+        self.reopens = others;
+        let reopens: Vec<(String, u32)> = mine
+            .into_iter()
+            .map(|(_, pkg, user, _)| (pkg, user))
             .collect();
         if !reopens.is_empty() {
             self.lock_event(LockEvent::Reopen(reopens));
         }
     }
 
-    /// Remembers `pkg`/`user` for a reopen after the unlock (once per app; stale ones go).
+    /// Remembers `pkg`/`user` on the served phone for a reopen after its unlock (once per app;
+    /// stale ones go).
     fn blocked_open(&mut self, pkg: String, user: u32) {
-        self.reopens
-            .retain(|(p, u, at)| at.elapsed() < REOPEN_WITHIN && !(*p == pkg && *u == user));
-        self.reopens.push((pkg, user, Instant::now()));
+        let Some(serial) = self.serial().map(str::to_owned) else {
+            return;
+        };
+        self.reopens.retain(|(s, p, u, at)| {
+            at.elapsed() < REOPEN_WITHIN && !(*s == serial && *p == pkg && *u == user)
+        });
+        self.reopens.push((serial, pkg, user, Instant::now()));
     }
 
     /// Sends `pin` to the helper as one `unlock` frame on stream 0. Neither the frame nor
@@ -952,10 +968,13 @@ impl Hub {
                     self.on_catalogue(c);
                 }
                 Ok(Control::Clip { text }) => self.on_phone_clip(text),
+                // Only the start of a stretch goes on: a burst of `locked` must not fill the
+                // prompt's queue and crowd out the `unlocked`/`unlock_result` behind it.
                 Ok(Control::Locked { reason }) => {
-                    tracing::info!(?reason, "phone locked");
-                    self.locked = true;
-                    self.lock_event(LockEvent::Locked(reason));
+                    if !std::mem::replace(&mut self.locked, true) {
+                        tracing::info!(?reason, "phone locked");
+                        self.lock_event(LockEvent::Locked(reason));
+                    }
                 }
                 Ok(Control::Unlocked) => {
                     tracing::info!("phone unlocked");
@@ -1000,7 +1019,10 @@ impl Hub {
             }
             // The open failed while the lock was in the way (the helper sends `locked{open}`
             // before this error): the client is told so and the app reopened after the unlock.
-            Some(Control::Error { .. }) if self.locked && !self.opened.contains(&win) => {
+            // Without the unlock prompt nobody asks for the PIN: the phone's error stands.
+            Some(Control::Error { .. })
+                if self.locked && self.lock_events.is_some() && !self.opened.contains(&win) =>
+            {
                 if let Some(info) = self.info.get(&win) {
                     tracing::info!(
                         cid,
@@ -1042,7 +1064,10 @@ impl Hub {
         self.companion = None;
         self.clip_sync = ClipSync::default();
         self.opened.clear();
-        // The stretch ends with the session; the blocked opens wait for the next unlock.
+        // The blocked opens of this phone wait for its next unlock; any other phone's go.
+        let serial = self.serial().map(str::to_owned);
+        self.reopens.retain(|(s, ..)| Some(s) == serial.as_ref());
+        // The stretch ends with the session.
         if std::mem::take(&mut self.locked) {
             self.lock_event(LockEvent::Unlocked);
         }
@@ -1063,6 +1088,51 @@ mod tests {
             }
             .encode(),
         }
+    }
+
+    /// R7: a blocked open is reopened only after an unlock of the phone it was blocked on;
+    /// a session end keeps only the ending phone's entries.
+    #[tokio::test]
+    async fn reopens_wait_for_their_own_phone() {
+        let mut hub = Hub::new(None);
+        let (tx, mut rx) = mpsc::channel(16);
+        hub.set_lock_events(tx);
+        let serve = |hub: &mut Hub, serial: &str| {
+            hub.set_session(SessionState::Ready, Some(serial.to_owned()), None);
+            hub.locked = true;
+        };
+        serve(&mut hub, "a");
+        hub.blocked_open("com.a".into(), 0);
+        hub.reset();
+        // Unlocked on the end of a's session.
+        assert_eq!(rx.try_recv(), Ok(LockEvent::Unlocked));
+        serve(&mut hub, "b");
+        hub.blocked_open("com.b".into(), 10);
+        hub.unlocked();
+        assert_eq!(
+            rx.try_recv(),
+            Ok(LockEvent::Reopen(vec![("com.b".into(), 10)])),
+            "a's open waits for a"
+        );
+        // a's entry survived a's own session end, but b's session end drops it.
+        serve(&mut hub, "b");
+        hub.reset();
+        assert_eq!(rx.try_recv(), Ok(LockEvent::Unlocked));
+        serve(&mut hub, "a");
+        hub.unlocked();
+        assert!(rx.try_recv().is_err(), "nothing left to reopen");
+
+        // Same phone back within the window: its open is reopened.
+        serve(&mut hub, "a");
+        hub.blocked_open("com.a".into(), 0);
+        hub.reset();
+        assert_eq!(rx.try_recv(), Ok(LockEvent::Unlocked));
+        serve(&mut hub, "a");
+        hub.unlocked();
+        assert_eq!(
+            rx.try_recv(),
+            Ok(LockEvent::Reopen(vec![("com.a".into(), 0)]))
+        );
     }
 
     #[tokio::test]

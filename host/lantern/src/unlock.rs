@@ -183,13 +183,14 @@ pub fn failed_notice(name: &str, reason: Option<&str>) -> (String, String) {
     }
 }
 
-/// The `lantern open` arguments that reopen `pkg` for `user`.
+/// The `lantern open` arguments that reopen `pkg` for `user` (`--` before the package, so it
+/// is never read as an option).
 pub fn reopen_args(pkg: &str, user: u32) -> Vec<String> {
     let mut args = vec!["open".to_owned()];
     if user != 0 {
         args.extend(["--user".to_owned(), user.to_string()]);
     }
-    args.push(pkg.to_owned());
+    args.extend(["--".to_owned(), pkg.to_owned()]);
     args
 }
 
@@ -312,16 +313,23 @@ fn ask(prompt: &Prompt, name: &str) -> Result<Option<Pin>, String> {
 }
 
 /// A PIN dialog in flight.
-type Asking = JoinHandle<Result<Option<Pin>, String>>;
+struct Asking {
+    task: JoinHandle<Result<Option<Pin>, String>>,
+    /// The serial of the phone whose notification was clicked: the PIN goes only to it.
+    serial: String,
+    /// [`run`]'s stretch count at the click: an answer after the stretch ended is wiped.
+    stretch: u64,
+}
 
-/// Shows the unlock notification and the PIN dialog, hands valid PINs to `pins` (the run loop
-/// sends each as one `unlock` frame) and reopens blocked apps after an unlock, until `events`
-/// closes. Without a notification server it logs one warning and carries on.
+/// Shows the unlock notification and the PIN dialog, hands valid PINs to `pins` with the serial
+/// of the phone they were asked for (the run loop sends each as one `unlock` frame, only to that
+/// phone) and reopens blocked apps after an unlock, until `events` closes. Without a
+/// notification server it logs one warning and carries on.
 pub async fn run(
     conn: Connection,
     mut events: mpsc::Receiver<LockEvent>,
     view: watch::Receiver<View>,
-    pins: mpsc::Sender<Pin>,
+    pins: mpsc::Sender<(String, Pin)>,
     exe: PathBuf,
     prompt: Prompt,
 ) -> Result<()> {
@@ -339,6 +347,8 @@ pub async fn run(
     };
     // The locked stretch: open from the first `Locked` until it ends.
     let mut stretch = false;
+    // Stretches ended so far: a dialog answer is only good for the stretch it was asked in.
+    let mut ended: u64 = 0;
     // The notification on screen (0: none).
     let mut shown: u32 = 0;
     let mut asking: Option<Asking> = None;
@@ -367,6 +377,7 @@ pub async fn run(
                             tracing::info!("phone unlocked");
                         }
                         stretch = false;
+                        ended += 1;
                         notifier.close(std::mem::take(&mut shown)).await;
                     }
                     LockEvent::Reopen(apps) => reopen(&exe, apps),
@@ -389,15 +400,28 @@ pub async fn run(
                     tracing::debug!("PIN dialog already open");
                     continue;
                 }
+                // The PIN is pinned to the phone shown now.
+                let Some(serial) = view.borrow().phone.serial().map(str::to_owned) else {
+                    tracing::info!("unlock clicked with no phone; no PIN dialog");
+                    continue;
+                };
                 let name = phone_name(&view);
                 let prompt = prompt.clone();
-                tracing::info!("asking for the PIN");
-                asking = Some(tokio::task::spawn_blocking(move || ask(&prompt, &name)));
+                tracing::info!(serial, "asking for the PIN");
+                asking = Some(Asking {
+                    task: tokio::task::spawn_blocking(move || ask(&prompt, &name)),
+                    serial,
+                    stretch: ended,
+                });
             }
-            answer = async { asking.as_mut().expect("guarded").await }, if asking.is_some() => {
-                asking = None;
+            answer = async { (&mut asking.as_mut().expect("guarded").task).await }, if asking.is_some() => {
+                let Asking { serial, stretch: asked_in, .. } = asking.take().expect("guarded");
                 match answer {
-                    Ok(Ok(Some(pin))) => match pins.try_send(pin) {
+                    Ok(Ok(Some(pin))) if asked_in != ended => {
+                        drop(pin);
+                        tracing::info!(serial, "the lock stretch ended during the PIN dialog; PIN dropped");
+                    }
+                    Ok(Ok(Some(pin))) => match pins.try_send((serial, pin)) {
                         Ok(()) => tracing::info!("PIN handed to the session"),
                         // The Pin inside the error is dropped (wiped) here.
                         Err(_) => tracing::warn!("PIN not sent: an unlock is already pending"),
@@ -443,7 +467,7 @@ fn reopen(exe: &std::path::Path, apps: Vec<(String, u32)>) {
 pub async fn spawn(
     events: mpsc::Receiver<LockEvent>,
     view: watch::Receiver<View>,
-    pins: mpsc::Sender<Pin>,
+    pins: mpsc::Sender<(String, Pin)>,
 ) -> Option<JoinHandle<()>> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let conn = match tokio::time::timeout(TIMEOUT, Connection::session()).await {
@@ -552,11 +576,16 @@ mod tests {
 
     #[test]
     fn reopen_args_name_the_user_only_when_not_0() {
-        assert_eq!(reopen_args("com.foo", 0), ["open", "com.foo"]);
+        assert_eq!(reopen_args("com.foo", 0), ["open", "--", "com.foo"]);
         assert_eq!(
             reopen_args("com.foo", 10),
-            ["open", "--user", "10", "com.foo"]
+            ["open", "--user", "10", "--", "com.foo"]
         );
+        // `lantern open` parses them back.
+        let args = reopen_args("com.foo", 10);
+        let args: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        let id = crate::window::identity::Identity::parse_args(&args).unwrap();
+        assert_eq!((id.pkg.as_str(), id.user), ("com.foo", 10));
     }
 
     #[test]

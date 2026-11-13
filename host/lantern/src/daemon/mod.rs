@@ -118,9 +118,10 @@ pub struct Parts {
     pub undo: Option<UndoRunner>,
     /// Desktop notifications (the undo result).
     pub notify: Option<Notifier>,
-    /// PINs from the unlock prompt: each goes to the live session's helper as one `unlock`
-    /// frame (with no session it is dropped).
-    pub unlock: Option<mpsc::Receiver<unlock::Pin>>,
+    /// PINs from the unlock prompt, each with the serial of the phone it was asked for: it goes
+    /// to the helper as one `unlock` frame only while that phone's session is live (otherwise it
+    /// is dropped, i.e. wiped, with a notice).
+    pub unlock: Option<mpsc::Receiver<(String, unlock::Pin)>>,
     /// Gets the helper's `locked`/`unlocked`/`unlock_result` and the opens to redo.
     pub lock_events: Option<mpsc::Sender<LockEvent>>,
 }
@@ -133,7 +134,7 @@ struct Controls {
     names: Option<Names>,
     undo: Option<UndoRunner>,
     notify: Option<Notifier>,
-    unlock: Option<mpsc::Receiver<unlock::Pin>>,
+    unlock: Option<mpsc::Receiver<(String, unlock::Pin)>>,
 }
 
 /// [`serve`] with the daemon's optional [`Parts`].
@@ -529,26 +530,20 @@ where
             }
             pin = async { unlock.as_mut().expect("guarded").recv().await }, if unlock.is_some() => {
                 match pin {
-                    Some(pin) => match active.as_ref() {
-                        Some((session, _)) => {
+                    Some((serial, pin)) => match active.as_ref() {
+                        // Only the phone the PIN was asked for gets it.
+                        Some((session, _)) if session.serial() == serial => {
                             let helper = session.tx.clone();
                             if hub.send_unlock(pin, &helper).await.is_err() {
                                 ended = Some("helper stopped reading");
                             }
                         }
-                        None => {
+                        live => {
                             drop(pin);
-                            let serial = starting
-                                .as_ref()
-                                .map(|(serial, _)| serial.clone())
-                                .or_else(|| paused.last().cloned())
-                                .or_else(|| connected.first().cloned());
-                            let name = serial.as_deref().map(|serial| {
-                                names.get(serial).unwrap_or_else(|| serial.to_owned())
-                            });
-                            tracing::info!(serial, "unlock: no live session; PIN dropped");
+                            let live = live.map(|(session, _)| session.serial().to_owned());
+                            tracing::info!(serial, ?live, "unlock: that phone is not live; PIN dropped");
                             if let Some(notify) = &notify {
-                                let name = name.unwrap_or_else(|| "Your phone".to_owned());
+                                let name = names.get(&serial).unwrap_or(serial);
                                 notify(
                                     &format!("{name} isn't connected"),
                                     "Lantern didn't send the PIN. Connect the phone and try again.",
@@ -836,7 +831,7 @@ pub async fn run() -> Result<()> {
     });
     // The unlock prompt on its own bus connection: PINs come back on `pin_rx` (one at a time),
     // lock events go to it. Without a session bus there is neither.
-    let (pin_tx, pin_rx) = mpsc::channel(1);
+    let (pin_tx, pin_rx) = mpsc::channel::<(String, unlock::Pin)>(1);
     let (lock_tx, lock_rx) = mpsc::channel(16);
     let prompt = crate::unlock::spawn(lock_rx, view_rx.clone(), pin_tx).await;
     let (unlock, lock_events) = match prompt {

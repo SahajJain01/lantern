@@ -1630,6 +1630,16 @@ struct Ctl {
 /// Every session goes to the fake helper on `port`, whichever serial it is for. The phone
 /// named "Pixel" is `dev`; other serials have no name.
 fn start_ctl(port: u16, online: &[&str], undo: Option<UndoRunner>) -> Ctl {
+    start_ctl_with(port, online, undo, |_| {})
+}
+
+/// [`start_ctl`], with `more` filling in further parts.
+fn start_ctl_with(
+    port: u16,
+    online: &[&str],
+    undo: Option<UndoRunner>,
+    more: impl FnOnce(&mut Parts),
+) -> Ctl {
     let rt = runtime_dir();
     let listener = ipc::bind(&rt).unwrap();
     let sock = ipc::socket_path_in(&rt);
@@ -1650,7 +1660,7 @@ fn start_ctl(port: u16, online: &[&str], undo: Option<UndoRunner>) -> Ctl {
     let counted = lookups.clone();
     let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let noted = notes.clone();
-    let parts = Parts {
+    let mut parts = Parts {
         commands: Some(cmds_rx),
         view: Some(view_tx),
         names: Some(Arc::new(move |serial: &str| {
@@ -1666,6 +1676,7 @@ fn start_ctl(port: u16, online: &[&str], undo: Option<UndoRunner>) -> Ctl {
         })),
         ..Default::default()
     };
+    more(&mut parts);
     let starter = move |serial: String| async move {
         let stream = TcpStream::connect(("127.0.0.1", port)).await?;
         let stream = handshake(stream, TOKEN, true).await?;
@@ -2158,7 +2169,8 @@ use lantern_proto::LockReason;
 struct Locky {
     daemon: Daemon,
     view: watch::Receiver<View>,
-    pins: mpsc::Sender<Pin>,
+    /// PINs, each with the serial of the phone it was asked for (the fake helper's is `dev`).
+    pins: mpsc::Sender<(String, Pin)>,
     events: mpsc::Receiver<LockEvent>,
 }
 
@@ -2216,7 +2228,7 @@ async fn unlock_frame_reaches_helper_once() {
     let locky = start_locky(port).await;
     locky
         .pins
-        .send(Pin::parse("24680\n".into()).unwrap())
+        .send(("dev".into(), Pin::parse("24680\n".into()).unwrap()))
         .await
         .unwrap();
     let frame = helper.next().await;
@@ -2259,7 +2271,9 @@ async fn unlock_without_session_is_dropped_with_a_notice() {
         },
         fast_policy(),
     ));
-    pins.send(Pin::parse("1357".into()).unwrap()).await.unwrap();
+    pins.send(("dev".into(), Pin::parse("1357".into()).unwrap()))
+        .await
+        .unwrap();
     let deadline = Instant::now() + STEP;
     while notes.lock().unwrap().is_empty() {
         assert!(Instant::now() < deadline, "no notice");
@@ -2267,7 +2281,7 @@ async fn unlock_without_session_is_dropped_with_a_notice() {
     }
     let notes = notes.lock().unwrap().clone();
     assert_eq!(notes.len(), 1);
-    assert_eq!(notes[0].0, "Your phone isn't connected");
+    assert_eq!(notes[0].0, "dev isn't connected");
     assert!(!notes[0].0.contains("1357") && !notes[0].1.contains("1357"));
     let _ = stop.send(());
     timeout(Duration::from_secs(5), task)
@@ -2315,7 +2329,7 @@ async fn unlock_frame_not_logged() {
     locky.locked_until(true).await;
     locky
         .pins
-        .send(Pin::parse(format!("{DIGITS}\n")).unwrap())
+        .send(("dev".into(), Pin::parse(format!("{DIGITS}\n")).unwrap()))
         .await
         .unwrap();
     let frame = helper.next().await;
@@ -2507,4 +2521,119 @@ async fn open_failed_while_locked_gets_phone_locked() {
         "nothing to reopen"
     );
     locky.daemon.shutdown().await;
+}
+
+/// R6: a PIN goes only to the phone it was asked for. The session moved from `dev` to `b`
+/// while the dialog was open: `dev`'s PIN is wiped with a notice, never sent to `b`.
+#[tokio::test]
+async fn pin_for_a_phone_no_longer_served_is_not_sent() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (pins, pins_rx) = mpsc::channel::<(String, Pin)>(1);
+    let mut ctl = start_ctl_with(port, &["dev", "b"], None, |parts| {
+        parts.unlock = Some(pins_rx)
+    });
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    ctl.offline("dev");
+    expect_bye(&mut helper).await;
+    assert_eq!(helper.next_session().await, 1);
+    ctl.ready("b").await;
+    pins.send(("dev".into(), Pin::parse("1357".into()).unwrap()))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + STEP;
+    while ctl.notes.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no notice");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    helper.assert_quiet().await;
+    let notes = ctl.notes.lock().unwrap().clone();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].0, "Pixel isn't connected");
+    // b's own PIN goes through.
+    pins.send(("b".into(), Pin::parse("2468".into()).unwrap()))
+        .await
+        .unwrap();
+    match decode(&helper.next().await) {
+        Control::Unlock { pin } => assert_eq!(pin.expose(), "2468"),
+        other => panic!("expected unlock, got {other:?}"),
+    }
+    ctl.shutdown().await;
+}
+
+/// R7: only the start of a locked stretch is forwarded, so a burst of `locked` cannot fill the
+/// prompt's queue and push out the `unlocked`/`unlock_result` behind it.
+#[tokio::test]
+async fn locked_burst_is_one_event() {
+    let (helper, port) = FakeHelper::spawn().await;
+    let mut locky = start_locky(port).await;
+    for _ in 0..50 {
+        helper.send(control(
+            0,
+            Control::Locked {
+                reason: LockReason::Clipboard,
+            },
+        ));
+    }
+    helper.send(control(0, Control::Unlocked));
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Locked(LockReason::Clipboard)
+    );
+    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    // A new stretch is forwarded again.
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Open,
+        },
+    ));
+    assert_eq!(locky.event().await, LockEvent::Locked(LockReason::Open));
+    locky.daemon.shutdown().await;
+}
+
+/// R7: without the unlock prompt (no session bus) nothing tells the user to enter a PIN, so a
+/// blocked open keeps the phone's own error and is not reopened.
+#[tokio::test]
+async fn without_unlock_prompt_open_errors_are_kept() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (view_tx, mut view) = watch::channel(View {
+        phone: Phone::None,
+        name: None,
+        locked: false,
+    });
+    let daemon = start_daemon_parts(
+        Some(port),
+        Parts {
+            view: Some(view_tx),
+            ..Default::default()
+        },
+    );
+    timeout(
+        STEP,
+        view.wait_for(|v| matches!(v.phone, Phone::Ready { .. })),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Open,
+        },
+    ));
+    timeout(STEP, view.wait_for(|v| v.locked))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut client = UnixStream::connect(&daemon.sock).await.unwrap();
+    send(&mut client, &open("com.foo", 0, None)).await;
+    let win = helper.next().await.stream;
+    let error = control(
+        win,
+        Control::error("open com.foo failed: SecurityException"),
+    );
+    helper.send(error.clone());
+    assert_eq!(recv(&mut client).await, Some(error));
+    daemon.shutdown().await;
 }

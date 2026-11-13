@@ -33,13 +33,21 @@ pub fn profile_suffix(user: u32, work: bool) -> String {
 }
 
 impl Identity {
-    /// Parses the arguments after `open`: `[--user N | --user=N] <pkg>`. `Err` is a usage error.
+    /// Parses the arguments after `open`: `[--user N | --user=N] [--] <pkg>`. After `--` every
+    /// argument is the package. `Err` is a usage error.
     pub fn parse_args(args: &[&str]) -> Result<Self, String> {
         let mut user: Option<u32> = None;
         let mut pkg: Option<&str> = None;
         let mut it = args.iter().copied();
+        let mut options = true;
         while let Some(arg) = it.next() {
-            let value = if arg == "--user" {
+            if options && arg == "--" {
+                options = false;
+                continue;
+            }
+            let value = if !options {
+                None
+            } else if arg == "--user" {
                 Some(it.next().ok_or("--user needs a number")?)
             } else {
                 arg.strip_prefix("--user=")
@@ -186,6 +194,27 @@ mod tests {
             Identity::parse_args(&["--user", "2147483647", "com.a"]),
             Ok(id("com.a", MAX_USER))
         );
+    }
+
+    #[test]
+    fn double_dash_ends_the_options() {
+        assert_eq!(Identity::parse_args(&["--", "com.a"]), Ok(id("com.a", 0)));
+        assert_eq!(
+            Identity::parse_args(&["--user", "10", "--", "com.a"]),
+            Ok(id("com.a", 10))
+        );
+        for bad in [
+            &["--"][..],
+            &["--", "--user", "10"],
+            &["--", "-x"],
+            &["--", "com.a", "com.b"],
+            &["--", "com.a", "--"],
+        ] {
+            assert!(
+                Identity::parse_args(bad).is_err(),
+                "{bad:?} must be a usage error"
+            );
+        }
     }
 
     #[test]
