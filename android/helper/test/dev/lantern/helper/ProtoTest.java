@@ -121,7 +121,33 @@ public final class ProtoTest {
         eq(Boolean.FALSE, m.fields().get("keyboard"), "keyboard");
     }
 
+    /** locked{reason:"clipboard"} as the helper builds it is the Rust bytes. */
+    static void goldenLockedMatchesRust() throws Exception {
+        Proto.Frame f = readOnly("control_locked");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(0, f.stream, "stream");
+        eq("{\"t\":\"locked\",\"reason\":\"clipboard\"}", new String(f.payload, StandardCharsets.UTF_8), "json");
+        eq(new String(f.payload, StandardCharsets.UTF_8), new String(new TestCodec().encode(
+            Msg.of("locked").put("reason", "clipboard")), StandardCharsets.UTF_8), "helper encoding");
+    }
+
+    /** unlock_result{ok:false, reason} as the helper builds it is the Rust bytes. */
+    static void goldenUnlockResultMatchesRust() throws Exception {
+        Proto.Frame f = readOnly("control_unlock_result");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(0, f.stream, "stream");
+        eq("{\"t\":\"unlock_result\",\"ok\":false,\"reason\":\"lock screen not reached\"}",
+            new String(f.payload, StandardCharsets.UTF_8), "json");
+        eq(new String(f.payload, StandardCharsets.UTF_8), new String(new TestCodec().encode(
+            Msg.of("unlock_result").put("ok", Boolean.FALSE).put("reason", "lock screen not reached")),
+            StandardCharsets.UTF_8), "helper encoding");
+        check(!Files.exists(golden("control_unlock")), "never a golden for unlock (it carries the PIN)");
+    }
+
     static void newTypesAndLimits() {
+        for (String t : new String[] {"locked", "unlocked", "unlock", "unlock_result"}) {
+            check(Msg.TYPES.contains(t), t + " in Msg.TYPES");
+        }
         for (String t : new String[] {"app", "apps_end", "app_removed", "companion", "clip", "ime"}) {
             check(Msg.TYPES.contains(t), t + " in Msg.TYPES");
         }
@@ -299,6 +325,8 @@ public final class ProtoTest {
             {"goldenImeMatchesRust", (Case) ProtoTest::goldenImeMatchesRust},
             {"goldenAppMatchesRust", (Case) ProtoTest::goldenAppMatchesRust},
             {"goldenHelloKeyboardOff", (Case) ProtoTest::goldenHelloKeyboardOff},
+            {"goldenLockedMatchesRust", (Case) ProtoTest::goldenLockedMatchesRust},
+            {"goldenUnlockResultMatchesRust", (Case) ProtoTest::goldenUnlockResultMatchesRust},
             {"newTypesAndLimits", (Case) ProtoTest::newTypesAndLimits},
             {"goldenInputPointerMatchesRust", (Case) ProtoTest::goldenInputPointerMatchesRust},
             {"goldenInputKeyMatchesRust", (Case) ProtoTest::goldenInputKeyMatchesRust},

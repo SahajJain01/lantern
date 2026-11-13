@@ -3,6 +3,7 @@
 //! All integers are big-endian. A frame is `u32 len` (bytes after this field), `u8 kind`,
 //! `u32 stream`, then `payload[len-5]`.
 
+use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -180,7 +181,7 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Control {
     Hello {
@@ -295,6 +296,158 @@ pub enum Control {
         op: ImeOp,
         text: String,
     },
+    /// Helper -> daemon, stream 0: the phone's PIN lock is in the way (sent once per locked
+    /// stretch, which ends with [`Control::Unlocked`]).
+    Locked {
+        reason: LockReason,
+    },
+    /// Helper -> daemon, stream 0: the locked stretch is over.
+    Unlocked,
+    /// Daemon -> helper, stream 0: one unlock attempt with this PIN (4-16 ASCII digits). Never
+    /// logged by either side; its `Debug` prints `pin: "<redacted>"`.
+    Unlock {
+        pin: String,
+    },
+    /// Helper -> daemon, stream 0: the outcome of one [`Control::Unlock`]. `reason` is absent when
+    /// `None`.
+    UnlockResult {
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+/// Hand-written so [`Control::Unlock`]'s PIN never reaches a log. Every other variant prints
+/// exactly as `#[derive(Debug)]` would.
+impl fmt::Debug for Control {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Control::Hello {
+                version,
+                token,
+                keyboard,
+            } => f
+                .debug_struct("Hello")
+                .field("version", version)
+                .field("token", token)
+                .field("keyboard", keyboard)
+                .finish(),
+            Control::Open {
+                pkg,
+                user,
+                w,
+                h,
+                dpi,
+                activation_token,
+            } => f
+                .debug_struct("Open")
+                .field("pkg", pkg)
+                .field("user", user)
+                .field("w", w)
+                .field("h", h)
+                .field("dpi", dpi)
+                .field("activation_token", activation_token)
+                .finish(),
+            Control::Opened {
+                display,
+                task,
+                codec,
+                w,
+                h,
+                moved,
+                label,
+                work,
+            } => f
+                .debug_struct("Opened")
+                .field("display", display)
+                .field("task", task)
+                .field("codec", codec)
+                .field("w", w)
+                .field("h", h)
+                .field("moved", moved)
+                .field("label", label)
+                .field("work", work)
+                .finish(),
+            Control::Resize { w, h, dpi } => f
+                .debug_struct("Resize")
+                .field("w", w)
+                .field("h", h)
+                .field("dpi", dpi)
+                .finish(),
+            Control::Resized { w, h } => f
+                .debug_struct("Resized")
+                .field("w", w)
+                .field("h", h)
+                .finish(),
+            Control::Focus { activation_token } => f
+                .debug_struct("Focus")
+                .field("activation_token", activation_token)
+                .finish(),
+            Control::Close => f.write_str("Close"),
+            Control::Closed { reason } => f.debug_struct("Closed").field("reason", reason).finish(),
+            Control::Error { msg, code, version } => f
+                .debug_struct("Error")
+                .field("msg", msg)
+                .field("code", code)
+                .field("version", version)
+                .finish(),
+            Control::Bye => f.write_str("Bye"),
+            Control::Status => f.write_str("Status"),
+            Control::StatusReport(r) => f.debug_tuple("StatusReport").field(r).finish(),
+            Control::Daemon { cmd } => f.debug_struct("Daemon").field("cmd", cmd).finish(),
+            Control::App {
+                pkg,
+                user,
+                label,
+                work,
+                icon,
+            } => f
+                .debug_struct("App")
+                .field("pkg", pkg)
+                .field("user", user)
+                .field("label", label)
+                .field("work", work)
+                .field("icon", icon)
+                .finish(),
+            Control::AppsEnd { count } => f.debug_struct("AppsEnd").field("count", count).finish(),
+            Control::AppRemoved { pkg, user } => f
+                .debug_struct("AppRemoved")
+                .field("pkg", pkg)
+                .field("user", user)
+                .finish(),
+            Control::Companion { state, msg } => f
+                .debug_struct("Companion")
+                .field("state", state)
+                .field("msg", msg)
+                .finish(),
+            Control::Clip { text } => f.debug_struct("Clip").field("text", text).finish(),
+            Control::Ime { op, text } => f
+                .debug_struct("Ime")
+                .field("op", op)
+                .field("text", text)
+                .finish(),
+            Control::Locked { reason } => f.debug_struct("Locked").field("reason", reason).finish(),
+            Control::Unlocked => f.write_str("Unlocked"),
+            Control::Unlock { pin: _ } => f
+                .debug_struct("Unlock")
+                .field("pin", &"<redacted>")
+                .finish(),
+            Control::UnlockResult { ok, reason } => f
+                .debug_struct("UnlockResult")
+                .field("ok", ok)
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+/// Why the helper reported [`Control::Locked`]: a PC copy couldn't land / a phone copy read back
+/// empty (`clipboard`), or an app failed to open (`open`) while the phone was locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockReason {
+    Clipboard,
+    Open,
 }
 
 /// What `lantern connect|disconnect` asks lanternd to do.
@@ -1155,6 +1308,117 @@ mod tests {
         }
         assert!(Control::decode(br#"{"t":"daemon","cmd":"quit"}"#).is_err());
         assert!(Control::decode(br#"{"t":"daemon"}"#).is_err());
+    }
+
+    #[test]
+    fn locked_json_shape() {
+        for (reason, json) in [
+            (
+                LockReason::Clipboard,
+                r#"{"t":"locked","reason":"clipboard"}"#,
+            ),
+            (LockReason::Open, r#"{"t":"locked","reason":"open"}"#),
+        ] {
+            let c = Control::Locked { reason };
+            assert_eq!(String::from_utf8(c.encode()).unwrap(), json);
+            assert_eq!(Control::decode(json.as_bytes()).unwrap(), c);
+        }
+        assert!(Control::decode(br#"{"t":"locked","reason":"pattern"}"#).is_err());
+        assert_eq!(Control::Unlocked.encode(), br#"{"t":"unlocked"}"#);
+        assert_eq!(
+            Control::decode(br#"{"t":"unlocked"}"#).unwrap(),
+            Control::Unlocked
+        );
+        let unlock = Control::Unlock { pin: "1234".into() };
+        let s = String::from_utf8(unlock.encode()).unwrap();
+        assert_eq!(s, r#"{"t":"unlock","pin":"1234"}"#);
+        assert_eq!(Control::decode(s.as_bytes()).unwrap(), unlock);
+    }
+
+    #[test]
+    fn unlock_result_json_shape() {
+        let ok = Control::UnlockResult {
+            ok: true,
+            reason: None,
+        };
+        let json = r#"{"t":"unlock_result","ok":true}"#;
+        assert_eq!(String::from_utf8(ok.encode()).unwrap(), json);
+        assert_eq!(Control::decode(json.as_bytes()).unwrap(), ok);
+        let failed = Control::UnlockResult {
+            ok: false,
+            reason: Some("lock screen not reached".into()),
+        };
+        let json = r#"{"t":"unlock_result","ok":false,"reason":"lock screen not reached"}"#;
+        assert_eq!(String::from_utf8(failed.encode()).unwrap(), json);
+        assert_eq!(Control::decode(json.as_bytes()).unwrap(), failed);
+    }
+
+    /// The PIN must never reach a log through `{:?}` (tracing's `?field`, assert messages).
+    #[test]
+    fn unlock_debug_is_redacted() {
+        let c = Control::Unlock {
+            pin: "975310".into(),
+        };
+        let d = format!("{c:?}");
+        assert_eq!(d, r#"Unlock { pin: "<redacted>" }"#);
+        assert!(!format!("{c:#?}").contains("975310"));
+        assert!(!format!("{:?}", Some(&c)).contains("975310"));
+        // Every other variant keeps the derived format.
+        assert_eq!(
+            format!("{:?}", Control::Clip { text: "x".into() }),
+            r#"Clip { text: "x" }"#
+        );
+        assert_eq!(format!("{:?}", Control::Bye), "Bye");
+        assert_eq!(
+            format!(
+                "{:?}",
+                Control::Locked {
+                    reason: LockReason::Open
+                }
+            ),
+            "Locked { reason: Open }"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                Control::UnlockResult {
+                    ok: false,
+                    reason: None
+                }
+            ),
+            "UnlockResult { ok: false, reason: None }"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                Control::Daemon {
+                    cmd: DaemonCmd::Connect
+                }
+            ),
+            "Daemon { cmd: Connect }"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                Control::StatusReport(StatusReport {
+                    state: SessionState::Idle,
+                    serial: None,
+                    helper: None,
+                    windows: vec![],
+                    companion: None,
+                })
+            ),
+            "StatusReport(StatusReport { state: Idle, serial: None, helper: None, windows: [], companion: None })"
+        );
+        assert_eq!(
+            format!("{:?}", Control::error("boom")),
+            r#"Error { msg: "boom", code: None, version: None }"#
+        );
+        assert_eq!(format!("{:?}", Control::Close), "Close");
+        assert_eq!(
+            format!("{:#?}", Control::Resized { w: 1, h: 2 }),
+            "Resized {\n    w: 1,\n    h: 2,\n}"
+        );
     }
 
     #[test]

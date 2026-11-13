@@ -94,6 +94,22 @@ public final class Router {
         void ime(int display, String op, String text);
 
         void clip(String text);
+
+        /**
+         * {@code unlock{pin}} from lanternd: one unlock attempt. {@code pin} is 4 to 16 ASCII digits;
+         * the callee owns the array and must zero it when done (also on failure). Never log it.
+         * The default only zeroes it.
+         */
+        default void unlock(char[] pin) {
+            java.util.Arrays.fill(pin, '\0');
+        }
+
+        /**
+         * Window {@code win}'s open just failed; called before its {@code error}/{@code closed}
+         * frames, so a {@code locked{reason:"open"}} sent from here precedes them.
+         */
+        default void openFailed(int win) {
+        }
     }
 
     /** The launcher label of {@code pkg} in {@code user} for {@code opened.label}, or null if unknown. */
@@ -339,6 +355,9 @@ public final class Router {
                 case "clip":
                     clip(m);
                     return true;
+                case "unlock":
+                    unlock(m);
+                    return true;
                 default:
                     throw new ProtocolError(m.t + " is not valid on stream 0");
             }
@@ -381,6 +400,11 @@ public final class Router {
             d = factory.open(win, pkg, user, w, h, dpi, wn);
         } catch (Exception e) {
             log.accept("router: open win=" + win + " " + pkg + " failed: " + describe(e));
+            try {
+                extras.openFailed(win);
+            } catch (RuntimeException x) {
+                log.accept("router: openFailed hook for win=" + win + " failed: " + x);
+            }
             send(win, Msg.of("error").put("msg", "open " + pkg + " failed: " + describe(e)));
             send(win, Msg.of("closed").put("reason", "error"));
             return;
@@ -520,6 +544,41 @@ public final class Router {
             extras.clip(t);
         } catch (RuntimeException e) {
             log.accept("router: clip of " + bytes + " bytes failed: " + e);
+        }
+    }
+
+    /** Shortest and longest PIN {@code unlock} accepts. */
+    static final int MIN_PIN = 4;
+    static final int MAX_PIN = 16;
+
+    /**
+     * {@code unlock{pin}} on stream 0 goes to {@link Extras#unlock} as a char[]. A pin that is not
+     * a string of {@value #MIN_PIN}..{@value #MAX_PIN} ASCII digits is the protocol error
+     * {@code "bad unlock"}, which never names the value. Logs only {@code router: unlock requested}.
+     */
+    private void unlock(Msg m) throws ProtocolError {
+        Object v = m.fields().get("pin");
+        if (!(v instanceof String)) {
+            throw new ProtocolError("bad unlock");
+        }
+        String s = (String) v;
+        if (s.length() < MIN_PIN || s.length() > MAX_PIN) {
+            throw new ProtocolError("bad unlock");
+        }
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                throw new ProtocolError("bad unlock");
+            }
+        }
+        log.accept("router: unlock requested");
+        char[] pin = s.toCharArray();
+        try {
+            extras.unlock(pin);
+        } catch (RuntimeException e) {
+            // The class only: a careless message could quote the PIN.
+            log.accept("router: unlock handler failed: " + e.getClass().getName());
+            java.util.Arrays.fill(pin, '\0');
         }
     }
 

@@ -20,7 +20,8 @@ public final class Msg {
      */
     public static final Set<String> TYPES = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
         "hello", "open", "opened", "resize", "resized", "focus", "close", "closed", "error", "bye",
-        "app", "apps_end", "app_removed", "companion", "clip", "ime")));
+        "app", "apps_end", "app_removed", "companion", "clip", "ime",
+        "locked", "unlocked", "unlock", "unlock_result")));
 
     public final String t;
     private final Map<String, Object> fields = new LinkedHashMap<>();

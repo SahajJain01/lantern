@@ -28,6 +28,12 @@
 //!                     Control::Hello { version: 1, token: "t", keyboard: false }
 //!                     payload = {"t":"hello","version":1,"token":"t","keyboard":false}
 //!                     (keyboard: true is omitted, so every other hello keeps its v1 bytes)
+//! control_locked.bin : kind=Control(1), stream=0, Control::Locked { reason: Clipboard }
+//!                     payload = {"t":"locked","reason":"clipboard"}
+//! control_unlock_result.bin : kind=Control(1), stream=0,
+//!                     Control::UnlockResult { ok: false, reason: Some("lock screen not reached") }
+//!                     payload = {"t":"unlock_result","ok":false,"reason":"lock screen not reached"}
+//!                     (There is never a golden for `unlock`: it carries the PIN.)
 //! input_pointer.bin : kind=Input(3), stream=1,
 //!                     InputEvent::Pointer { action: Move(2), id: 7, x: 0.25, y: 0.75, buttons: 1, pressure: 0.5 }
 //! input_key.bin     : kind=Input(3), stream=1,
@@ -111,7 +117,28 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             "control_hello_keyboard_off",
             frame_bytes(Kind::Control, 0, hello_keyboard_off().encode()),
         ),
+        (
+            "control_locked",
+            frame_bytes(Kind::Control, 0, locked().encode()),
+        ),
+        (
+            "control_unlock_result",
+            frame_bytes(Kind::Control, 0, unlock_result().encode()),
+        ),
     ]
+}
+
+fn locked() -> Control {
+    Control::Locked {
+        reason: LockReason::Clipboard,
+    }
+}
+
+fn unlock_result() -> Control {
+    Control::UnlockResult {
+        ok: false,
+        reason: Some("lock screen not reached".into()),
+    }
 }
 
 fn ime() -> Control {
@@ -242,6 +269,17 @@ fn golden_files_decode() {
                     br#"{"t":"hello","version":1,"token":"t","keyboard":false}"#
                 );
                 assert_eq!(Control::decode(&f.payload).unwrap(), hello_keyboard_off());
+            }
+            "control_locked" => {
+                assert_eq!(f.payload, br#"{"t":"locked","reason":"clipboard"}"#);
+                assert_eq!(Control::decode(&f.payload).unwrap(), locked());
+            }
+            "control_unlock_result" => {
+                assert_eq!(
+                    f.payload,
+                    br#"{"t":"unlock_result","ok":false,"reason":"lock screen not reached"}"#
+                );
+                assert_eq!(Control::decode(&f.payload).unwrap(), unlock_result());
             }
             _ => unreachable!(),
         }

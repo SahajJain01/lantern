@@ -101,6 +101,64 @@ public final class ClipSyncTest {
         eq(new ArrayList<String>(), r.toHost, "null/empty clips are not sent");
     }
 
+    /** A ClipSync whose phone reads as locked while {@link #locked} is true. */
+    static final class LockRig {
+        volatile boolean locked = true;
+        final List<String> toHost = new ArrayList<>();
+        final List<String> toPhone = new ArrayList<>();
+        final List<String> heldWrites = new ArrayList<>();
+        final List<String> onLocked = new ArrayList<>();
+        final LockState lock = new LockState(() -> " User \"Owner\" (id=0) (current): deviceLocked="
+            + (locked ? 1 : 0) + "\n", s -> { });
+        final ClipSync sync = new ClipSync(toHost::add, toPhone::add, heldWrites::add, lock, onLocked::add);
+    }
+
+    static void lockedHoldsLatestAndWritesOnUnlock() {
+        LockRig r = new LockRig();
+        r.sync.fromHost("first");
+        r.sync.fromHost("second");
+        eq(new ArrayList<String>(), r.toPhone, "nothing written while locked");
+        eq(new ArrayList<String>(), r.heldWrites, "nothing held-written while locked");
+        eq(Arrays.asList("clipboard", "clipboard"), r.onLocked, "onLocked once per call");
+        r.locked = false;
+        r.sync.unlocked();
+        eq(Arrays.asList("second"), r.heldWrites, "only the latest PC copy is written on unlock");
+        eq(new ArrayList<String>(), r.toPhone, "via the held writer");
+        // Its write fires the phone listener: that echo is not sent back to the PC.
+        r.sync.phoneChanged("second", false, 7);
+        eq(new ArrayList<String>(), r.toHost, "held copy not echoed");
+        r.sync.unlocked();
+        eq(Arrays.asList("second"), r.heldWrites, "held copy cleared after the write");
+        r.sync.fromHost("third");
+        eq(Arrays.asList("third"), r.toPhone, "unlocked: written at once");
+        eq(2, r.onLocked.size(), "no onLocked while unlocked");
+    }
+
+    /** A phone copy read after a held PC copy is newer: unlock must not overwrite it. */
+    static void phoneCopyAfterHoldDropsTheHeldCopy() {
+        LockRig r = new LockRig();
+        r.sync.fromHost("old-pc");
+        r.locked = false; // unlocked by hand, before the poll notices
+        r.sync.phoneChanged("new-phone", false, 3);
+        eq(Arrays.asList("new-phone"), r.toHost, "phone copy sent");
+        r.sync.unlocked();
+        eq(new ArrayList<String>(), r.heldWrites, "the older PC copy is not written over it");
+    }
+
+    static void lockedNullPhoneReadReportsLocked() {
+        LockRig r = new LockRig();
+        r.sync.phoneChanged(null, false, 0);
+        eq(Arrays.asList("clipboard"), r.onLocked, "null read while locked reports the lock");
+        eq(new ArrayList<String>(), r.toHost, "nothing sent");
+        r.sync.phoneChanged("text", false, 1);
+        eq(Arrays.asList("clipboard"), r.onLocked, "a real read does not report");
+        r.locked = false;
+        r.sync.phoneChanged(null, false, 0);
+        eq(Arrays.asList("clipboard"), r.onLocked, "null read while unlocked does not report");
+        r.sync.unlocked();
+        eq(new ArrayList<String>(), r.heldWrites, "nothing held, nothing written");
+    }
+
     static void eq(Object want, Object got, String what) {
         if (want == null ? got != null : !want.equals(got)) {
             throw new AssertionError(what + ": want " + want + ", got " + got);
@@ -121,6 +179,9 @@ public final class ClipSyncTest {
             {"skipsSensitive", (Case) ClipSyncTest::skipsSensitive},
             {"skipsOversize", (Case) ClipSyncTest::skipsOversize},
             {"skipsEmpty", (Case) ClipSyncTest::skipsEmpty},
+            {"lockedHoldsLatestAndWritesOnUnlock", (Case) ClipSyncTest::lockedHoldsLatestAndWritesOnUnlock},
+            {"lockedNullPhoneReadReportsLocked", (Case) ClipSyncTest::lockedNullPhoneReadReportsLocked},
+            {"phoneCopyAfterHoldDropsTheHeldCopy", (Case) ClipSyncTest::phoneCopyAfterHoldDropsTheHeldCopy},
         };
         int failed = 0;
         for (Object[] c : cases) {

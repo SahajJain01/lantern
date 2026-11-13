@@ -75,6 +75,8 @@ final class PhoneClipboard implements AutoCloseable {
         try {
             ClipData clip = manager.getPrimaryClip();
             if (clip == null || clip.getItemCount() == 0) {
+                // Also what a PIN-locked phone returns for every read: ClipSync checks the lock.
+                sync.phoneChanged(null, false, 0);
                 return;
             }
             CharSequence cs = clip.getItemAt(0).getText();
@@ -95,7 +97,16 @@ final class PhoneClipboard implements AutoCloseable {
     }
 
     /** Puts {@code text} on the phone's clipboard, from lantern-clip. */
-    synchronized void write(String text) {
+    void write(String text) {
+        write(text, "PC clipboard");
+    }
+
+    /** Puts a PC copy held while the phone was locked on the phone's clipboard, from lantern-clip. */
+    void writeHeld(String text) {
+        write(text, "held PC copy");
+    }
+
+    private synchronized void write(String text, String what) {
         if (handler == null) {
             return;
         }
@@ -105,9 +116,31 @@ final class PhoneClipboard implements AutoCloseable {
             }
             try {
                 manager.setPrimaryClip(ClipData.newPlainText("lantern", text));
-                log.accept("clip: PC clipboard (" + text.length() + " chars) set on the phone");
+                log.accept("clip: " + what + " (" + text.length() + " chars) set on the phone");
             } catch (RuntimeException e) {
                 log.accept("clip: setting the phone clipboard failed: " + e);
+            }
+        });
+    }
+
+    /**
+     * Runs {@code r} on lantern-clip (in order with listener callbacks and writes), or right here
+     * if the thread isn't started. Keeps {@code dumpsys trust} reads off the router's control thread.
+     */
+    void post(Runnable r) {
+        Handler h;
+        synchronized (this) {
+            h = handler;
+        }
+        if (h == null) {
+            r.run();
+            return;
+        }
+        h.post(() -> {
+            try {
+                r.run();
+            } catch (RuntimeException e) {
+                log.accept("clip: task failed: " + e);
             }
         });
     }

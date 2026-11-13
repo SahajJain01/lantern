@@ -185,10 +185,15 @@ public final class Main {
             // Clipboard sync (Task 9): phone copies go to lanternd as clip{text} on stream 0, the
             // PC's clip{text} lands on the phone, each without echoing the other's text back.
             PhoneClipboard phoneClip = new PhoneClipboard(Droid::log);
+            // The PIN lock (Plan 4a): while the phone is locked a PC copy is held until unlock, and
+            // locked{reason} tells lanternd once per stretch (LockWatch).
+            LockState lockState = LockState.device(Droid::log);
+            LockWatch lockWatch = new LockWatch(lockState, router);
             ClipSync clipSync = new ClipSync(text -> {
                 Droid.log("clip: phone copy (" + text.length() + " chars) sent to the PC");
                 router.sendSession(Msg.of("clip").put("text", text));
-            }, phoneClip::write);
+            }, phoneClip::write, phoneClip::writeHeld, lockState, lockWatch::onLocked);
+            lockWatch.onUnlocked = () -> phoneClip.post(clipSync::unlocked);
             router.setExtras(new Router.Extras() {
                 @Override
                 public void ime(int display, String op, String text) {
@@ -197,7 +202,23 @@ public final class Main {
 
                 @Override
                 public void clip(String text) {
-                    clipSync.fromHost(text);
+                    // On lantern-clip: the lock check runs dumpsys, which must not stall input.
+                    phoneClip.post(() -> clipSync.fromHost(text));
+                }
+
+                @Override
+                public void unlock(char[] pin) {
+                    // Task 2 types it into the lock screen; until then, refuse without a try.
+                    java.util.Arrays.fill(pin, '\0');
+                    router.sendSession(Msg.of("unlock_result").put("ok", Boolean.FALSE)
+                        .put("reason", "not implemented"));
+                }
+
+                @Override
+                public void openFailed(int win) {
+                    if (lockState.locked()) {
+                        lockWatch.onLocked("open");
+                    }
                 }
             });
             router.setLabels((pkg, user) -> {
@@ -219,6 +240,7 @@ public final class Main {
             try {
                 router.run();
             } finally {
+                lockWatch.close();
                 imeSender.shutdownNow();
                 phoneClip.close();
             }
@@ -234,6 +256,86 @@ public final class Main {
         }
         Droid.log("serve: exit");
         return 0;
+    }
+
+    /**
+     * One locked stretch at a time: the first {@link #onLocked} sends {@code locked{reason}} and
+     * starts a {@code lantern-lock} thread that reads {@link LockState#locked} every
+     * {@link #POLL_MS}; when it reads false it sends {@code unlocked}, runs {@link #onUnlocked}
+     * (writes the held PC copy) and ends the stretch. Later calls inside the stretch do nothing.
+     */
+    static final class LockWatch implements AutoCloseable {
+        static final long POLL_MS = 2000;
+
+        private final LockState lock;
+        private final Router router;
+        /** Set before the session is up. */
+        volatile Runnable onUnlocked = () -> { };
+        private boolean stretch;
+        private boolean closed;
+        private Thread poller;
+
+        LockWatch(LockState lock, Router router) {
+            this.lock = lock;
+            this.router = router;
+        }
+
+        void onLocked(String reason) {
+            Thread t;
+            synchronized (this) {
+                if (stretch || closed) {
+                    return;
+                }
+                stretch = true;
+                t = new Thread(this::poll, "lantern-lock");
+                t.setDaemon(true);
+                poller = t;
+            }
+            Droid.log("lock: phone locked (" + reason + ")");
+            router.sendSession(Msg.of("locked").put("reason", reason));
+            t.start();
+        }
+
+        private void poll() {
+            while (true) {
+                try {
+                    Thread.sleep(POLL_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                synchronized (this) {
+                    if (closed) {
+                        return;
+                    }
+                }
+                if (!lock.locked()) {
+                    break;
+                }
+            }
+            Droid.log("lock: phone unlocked");
+            router.sendSession(Msg.of("unlocked"));
+            try {
+                onUnlocked.run();
+            } catch (RuntimeException e) {
+                Droid.log("lock: unlock follow-up failed: " + e);
+            }
+            synchronized (this) {
+                stretch = false; // after unlocked went out, so a new stretch's locked follows it
+                poller = null;
+            }
+        }
+
+        @Override
+        public void close() {
+            Thread t;
+            synchronized (this) {
+                closed = true;
+                t = poller;
+            }
+            if (t != null) {
+                t.interrupt();
+            }
+        }
     }
 
     /** How long a session start waits for the companion to link. */

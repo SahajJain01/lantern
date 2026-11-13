@@ -555,6 +555,148 @@ public final class RouterTest {
         }
     }
 
+    /** Extras that record each unlock's PIN as a String (test-only) and openFailed calls. */
+    static Router.Extras unlockRecording(List<String> got) {
+        return new Router.Extras() {
+            @Override
+            public void ime(int display, String op, String text) {
+            }
+
+            @Override
+            public void clip(String text) {
+            }
+
+            @Override
+            public void unlock(char[] pin) {
+                got.add("unlock " + new String(pin));
+                java.util.Arrays.fill(pin, '\0');
+            }
+
+            @Override
+            public void openFailed(int win) {
+                got.add("openFailed " + win);
+            }
+        };
+    }
+
+    /**
+     * {@code unlock{pin}} reaches Extras as a char[]; the PIN appears in no log line, and a bad
+     * unlock frame is a protocol error {@code "bad unlock"} without any digit.
+     */
+    static void unlockPayloadNeverLogged() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        try (Rig r = new Rig(rt -> rt.setExtras(unlockRecording(got)))) {
+            r.hello();
+            r.send(0, "{\"t\":\"unlock\",\"pin\":\"9731\"}");
+            r.send(0, "{\"t\":\"unlock\",\"pin\":\"8642086420864208\"}"); // 16 digits: the maximum
+            Rig.await("2 unlocks", 2000, () -> got.size() == 2);
+            eq("unlock 9731", got.get(0), "4-digit pin");
+            eq("unlock 8642086420864208", got.get(1), "16-digit pin");
+            r.open(1); // the session goes on
+            r.send(0, "{\"t\":\"bye\"}");
+            r.awaitExit(2000);
+            synchronized (r.logs) {
+                check(r.logs.contains("router: unlock requested"), "logs the request: " + r.logs);
+                for (String l : r.logs) {
+                    check(!l.contains("9731") && !l.contains("86420"), "log carries the pin: " + l);
+                }
+            }
+        }
+        String[] bad = {"\"975\"", "\"97531975319753197\"", "\"97a1\"", "\"\"", "9731", "\" 9731\"", "\"\u0669\u0667\u0663\u0661\""};
+        for (String pin : bad) {
+            List<String> none = Collections.synchronizedList(new ArrayList<>());
+            try (Rig r = new Rig(rt -> rt.setExtras(unlockRecording(none)))) {
+                r.hello();
+                r.send(0, "{\"t\":\"unlock\",\"pin\":" + pin + "}");
+                Msg e = r.control(0);
+                eq("error", e.t, "error for pin " + pin.length());
+                eq("bad unlock", e.str("msg"), "msg");
+                check(!e.str("msg").matches(".*[0-9].*"), "no digits in the error");
+                r.awaitExit(2000);
+                check(none.isEmpty(), "nothing reached extras");
+                synchronized (r.logs) {
+                    for (String l : r.logs) {
+                        check(!l.contains("975") && !l.contains("9731"), "log carries the pin: " + l);
+                    }
+                }
+            }
+        }
+        try (Rig r = new Rig(rt -> rt.setExtras(unlockRecording(got)))) {
+            r.hello();
+            r.send(0, "{\"t\":\"unlock\"}"); // no pin at all
+            eq("bad unlock", r.control(0).str("msg"), "missing pin");
+            r.awaitExit(2000);
+        }
+    }
+
+    /** unlock is stream-0 only; locked/unlocked/unlock_result only go helper -> daemon. */
+    static void lockMessagesFromHostAreErrors() throws Exception {
+        String[][] cases = {
+            {"1", "{\"t\":\"unlock\",\"pin\":\"9731\"}"},
+            {"0", "{\"t\":\"locked\",\"reason\":\"clipboard\"}"},
+            {"0", "{\"t\":\"unlocked\"}"},
+            {"0", "{\"t\":\"unlock_result\",\"ok\":true}"},
+        };
+        for (String[] c : cases) {
+            List<String> got = Collections.synchronizedList(new ArrayList<>());
+            try (Rig r = new Rig(rt -> rt.setExtras(unlockRecording(got)))) {
+                r.hello();
+                if (c[0].equals("1")) {
+                    r.open(1);
+                }
+                r.send(Integer.parseInt(c[0]), c[1]);
+                Msg e = r.control(0);
+                eq("error", e.t, "error for " + c[1].replace("9731", "PIN"));
+                check(!e.str("msg").contains("9731"), "no pin in the error: " + e.str("msg"));
+                r.awaitExit(2000);
+                check(got.isEmpty(), "nothing reached extras: " + got.size());
+                synchronized (r.logs) {
+                    for (String l : r.logs) {
+                        check(!l.contains("9731"), "log carries the pin: " + l);
+                    }
+                }
+            }
+        }
+    }
+
+    /** A failed open calls Extras.openFailed before its error/closed frames. */
+    static void openFailureCallsOpenFailedFirst() throws Exception {
+        List<String> got = Collections.synchronizedList(new ArrayList<>());
+        Router[] router = {null};
+        try (Rig r = new Rig(rt -> {
+            router[0] = rt;
+            rt.setExtras(new Router.Extras() {
+                @Override
+                public void ime(int display, String op, String text) {
+                }
+
+                @Override
+                public void clip(String text) {
+                }
+
+                @Override
+                public void openFailed(int win) {
+                    got.add("openFailed " + win);
+                    // Main sends locked{reason:"open"} from here: it must precede the window's error.
+                    router[0].sendSession(Msg.of("locked").put("reason", "open"));
+                }
+            });
+        })) {
+            r.hello();
+            r.send(4, "{\"t\":\"open\",\"pkg\":\"bad.pkg\",\"user\":0,\"w\":1280,\"h\":800,\"dpi\":160}");
+            Msg l = r.control(0);
+            eq("locked", l.t, "locked first");
+            eq("open", l.str("reason"), "reason");
+            Msg e = r.control(4);
+            eq("error", e.t, "then the window's error");
+            check(e.str("msg").contains("bad.pkg"), "the helper's message: " + e.str("msg"));
+            eq("closed", r.control(4).t, "closed");
+            eq(java.util.Arrays.asList("openFailed 4"), new ArrayList<>(got), "openFailed once");
+            r.open(5);
+            eq(1, got.size(), "a good open does not call openFailed");
+        }
+    }
+
     static void openThenCloseCallsFactoryAndClose() throws Exception {
         try (Rig r = new Rig()) {
             r.hello();
@@ -865,6 +1007,9 @@ public final class RouterTest {
             {"clipOnStream0ReachesExtras", (Case) RouterTest::clipOnStream0ReachesExtras},
             {"clipOverLimitIsAnError", (Case) RouterTest::clipOverLimitIsAnError},
             {"clipOnWindowStreamIsAnError", (Case) RouterTest::clipOnWindowStreamIsAnError},
+            {"unlockPayloadNeverLogged", (Case) RouterTest::unlockPayloadNeverLogged},
+            {"lockMessagesFromHostAreErrors", (Case) RouterTest::lockMessagesFromHostAreErrors},
+            {"openFailureCallsOpenFailedFirst", (Case) RouterTest::openFailureCallsOpenFailedFirst},
             {"openThenCloseCallsFactoryAndClose", (Case) RouterTest::openThenCloseCallsFactoryAndClose},
             {"openedSaysMovedForAnExistingTask", (Case) RouterTest::openedSaysMovedForAnExistingTask},
             {"openedCarriesLabelAndWork", (Case) RouterTest::openedCarriesLabelAndWork},

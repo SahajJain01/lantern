@@ -51,6 +51,10 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `companion` | `state`: one of `"ready"`, `"unavailable"`; optional `msg: string`. Helper → daemon, stream 0 |
 | `clip` | `text: string`. Stream 0, both directions |
 | `ime` | `op`: one of `"commit"`, `"compose"`, `"finish"`; `text: string` (`""` for `finish`). Window stream `N`, window → daemon → helper |
+| `locked` | `reason`: one of `"clipboard"`, `"open"`. Helper → daemon, stream 0 |
+| `unlocked` | none. Helper → daemon, stream 0 |
+| `unlock` | `pin: string` (4–16 ASCII digits). Daemon → helper, stream 0. Never logged, no golden vector |
+| `unlock_result` | `ok: bool`, optional `reason: string`. Helper → daemon, stream 0 |
 
 ## Session rules (phone helper)
 
@@ -105,7 +109,9 @@ together. Plan 3 added only `hello.keyboard` (optional) on the helper side; ever
 added is host-only (`daemon`, `status_report` state `paused`, the window-IPC errors below).
 
 `label` and `work` on `opened`, `work` on `app`, and `msg` on `companion` are omitted when absent
-(`work` when false), so an `opened` without them is still the v1 bytes.
+(`work` when false), so an `opened` without them is still the v1 bytes. Plan 4a adds the new
+types `locked`, `unlocked`, `unlock` and `unlock_result` (all stream 0, see "Lock rules"), within
+v1.
 
 ## Text, clipboard, catalogue rules
 
@@ -168,6 +174,31 @@ added is host-only (`daemon`, `status_report` state `paused`, the window-IPC err
   when it sets the selection. Each read has a 1 s timeout and a `MAX_CLIP + 1` byte cap. The
   helper listens for phone clipboard changes on its own `lantern-clip` Looper thread, from the
   session-up hook until teardown. Neither side ever logs clipboard text, only its length.
+
+## Lock rules (PIN keyguard)
+
+While the phone's secure keyguard is locked (`dumpsys trust`: `deviceLocked=1` on the
+`(current)` user's line), Android returns null for every clipboard read and apps may fail to
+start. The helper reads that state with `dumpsys trust` (3 s timeout); an unknown state (no
+current-user line, a failing or slow `dumpsys`) counts as unlocked, so Lantern only reports a
+lock it is sure of. A work profile's own `deviceLocked` line is ignored.
+
+- `locked{reason}` is sent once per locked stretch, when the lock first gets in the way:
+  `"clipboard"` when a PC `clip` arrives or a phone clipboard change reads back null while
+  locked, `"open"` when a window's open fails while locked (sent before that window's
+  `error`/`closed`, which keep the helper's message; `locked` itself is stream 0 only).
+- During a stretch the helper re-reads the lock every 2 s; when it reads unlocked it sends
+  `unlocked`, which ends the stretch (the next obstacle starts a new one).
+- A PC `clip` that arrives while locked is not written: the helper holds the latest one and
+  writes it right after the unlock (its echo is suppressed as usual). A phone copy read after
+  it drops the held copy, being newer.
+- `unlock{pin}` (stream 0 only) asks the helper for one unlock attempt; it answers
+  `unlock_result{ok}` (`reason` set on failure, omitted when absent). The helper accepts only a
+  string of 4–16 ASCII digits; anything else is the protocol error `bad unlock`, which never
+  quotes the value. Neither side ever logs the PIN (the helper logs only `router: unlock
+  requested`; the Rust `Control::Unlock` prints `pin: "<redacted>"` in `Debug`), and no golden
+  vector holds an `unlock`. `locked`, `unlocked` and `unlock_result` from lanternd, and
+  `unlock` on a window stream, are protocol errors.
 
 ## Companion link (helper ↔ companion)
 
