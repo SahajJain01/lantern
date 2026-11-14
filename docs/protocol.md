@@ -400,11 +400,15 @@ lanternd keeps one `.desktop` file per (phone, app, Android user) in
 - **Entry:** `Name` (the app's label), `Exec=<lantern> open --phone <serial> [--user N] <pkg>`,
   `Icon`, `Categories=X-Lantern-<tag>;`, `StartupWMClass=<app_id>`, `X-Lantern-Serial=<serial>`,
   `X-Lantern-Package`, `X-Lantern-User`.
-- **Folders:** `$XDG_CONFIG_HOME/menus/applications-merged/lantern.menu` puts a **Phone** menu
-  (`lantern-phone.directory`) with one submenu per phone (`lantern-phone-<tag>.directory`, named
-  after the phone, carrying `X-Lantern-Serial=`), sorted by name, each holding
-  `X-Lantern-<tag>`. A phone's folder file goes with its last entry; the menu files go only when
-  no Lantern entry is left.
+- **Folders:** `$XDG_CONFIG_HOME/menus/applications-merged/lantern.menu` makes each phone a
+  **top-level** submenu of Applications (`<Name>lantern-<tag></Name>`, folder file
+  `lantern-phone-<tag>.directory` named after the phone and carrying `X-Lantern-Serial=`),
+  sorted by name, each holding `X-Lantern-<tag>`. There is no "Phone" parent: Plasma 6 Kickoff
+  shows only top-level categories and flattens nested submenus into one list. A phone's folder
+  file goes with its last entry; `lantern.menu` goes only when no Lantern entry is left.
+  lanternd rewrites the menu at every start and session start, so an older nested menu becomes
+  top-level once; the old parent's `lantern-phone.directory` is deleted only while it holds
+  exactly what Lantern wrote (`Name=Phone`, `Icon=smartphone`, no `X-Lantern-Serial`).
 - **Primary:** `$XDG_STATE_HOME/lantern/menu.json` = `{"version":2,"primary":"<serial>"|null}`,
   written (temp + fsync + rename) before lanternd serves any session. On a fresh install the
   first phone that starts a session becomes primary.

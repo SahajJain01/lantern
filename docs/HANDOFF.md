@@ -89,9 +89,12 @@ first if `lantern status` shows windows he is using.
        python3 tools/device_test.py --only 1 2 3 4 5 6 7 9 10 11 12 13 15 16 17 18 19 20 22 23
      ```
      Expected: `20/20 PASS`.
-   - Pass 2, **only the Xiaomi attached** (ask Sahaj to unplug the Motorola):
+   - Pass 2, **only the Xiaomi attached** (ask Sahaj to unplug the Motorola). Items 24 and 25
+     need real replugs (24: two, 25: one), so they are `--manual`; relay each `>>>` step to
+     Sahaj (each waits up to 900 s). Never `adb reconnect`: it left the Xiaomi in a non-adb USB
+     mode (18d1:4e11) until a physical replug.
      ```sh
-     python3 tools/device_test.py --only 24 25
+     python3 tools/device_test.py --manual --only 24 25
      ```
      Expected: `2/2 PASS`. Then, still with only the Xiaomi, after telling Sahaj the step
      ("click Connect on the 'Connect your Xiaomi 11T Pro' notification"):
@@ -108,7 +111,8 @@ first if `lantern status` shows windows he is using.
    cmp ~/.local/share/applications/dev.lantern.Lantern.desktop ~/.hermes/cache/scratch/plan4b-menu-before/dev.lantern.Lantern.desktop
    cat ~/.local/state/lantern/menu.json                        # {"version":2,"primary":"ZD222LMDFV"}
    ```
-   Ask Sahaj to look at Kickoff: Phone → "Xiaomi 11T Pro" and Phone → "edge 50 pro"; take a
+   Ask Sahaj to look at Kickoff: top-level categories "Xiaomi 11T Pro" and "edge 50 pro" (no
+   "Phone" category; `kbuildsycoca6 --menutest | grep -c '^Xiaomi 11T Pro/'`); take a
    screenshot. List the Xiaomi pins that need re-pinning (none were pinned on 2026-11-14).
 4. **Two-phone hand check (Step 4):** plug the Motorola back in (both phones plugged in),
    `LANTERN_SERIAL` unset (`systemctl --user show-environment | grep LANTERN` empty),
@@ -300,7 +304,7 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
 | `docs/protocol.md` | The wire spec, including the companion link. Keep it in step with both sides. |
 | `docs/spikes/RESULTS.md` | Risk-spike measurements, plus the Plan 2 IME display policy finding. |
 | `tools/build.py` | Targets: `helper`, `companion`, `all`, `install` (also the Lantern launcher `dev.lantern.Lantern.desktop`), `uninstall` (runs `lantern undo-setup` best effort, removes the launcher). |
-| `tools/device_test.py` | On-device acceptance suite, items 1–26 (22 automatic): `--manual` adds 8, 14, 21 and 26, `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; items 20 and 26 still need the real session bus), `--state`. The preflight pins `LANTERN_SERIAL` (restored afterwards), so other phones may stay plugged in, except for items 24–26: they lift it and refuse to run while another phone is attached (run them as their own pass). |
+| `tools/device_test.py` | On-device acceptance suite, items 1–26 (20 automatic): `--manual` adds 8, 14, 21, 24, 25 and 26 (replugs, PIN, Connect click; each wait for Sahaj prints `>>>` and lasts up to 900 s; the suite never uses `adb reconnect`), `--only N…` (numbers or names), `--nested` (headless KWin for a locked desktop; items 20 and 26 still need the real session bus), `--state`. The preflight pins `LANTERN_SERIAL` (restored afterwards), so other phones may stay plugged in, except for items 24–26: they lift it and refuse to run while another phone is attached (run them as their own pass). |
 
 ## Environment facts
 - Phone: Xiaomi 11T Pro, serial `20e9318`, Android 17 / SDK 37, LineageOS 24, swipe keyguard, USB
@@ -409,7 +413,11 @@ the builder; the plan's numbering:
    a session is primary. Recorded in `~/.local/state/lantern/menu.json`.
 2. **Names.** `tag(serial)` = `[A-Za-z0-9_]` kept, anything else `_`, at most 64 chars. app_id
    `lantern.<pkg>[-u<N>]` (primary) or `…-p<tag>`; `windows.json` key `<pkg>[:<N>]` or
-   `…@<serial>`; category `X-Lantern-<tag>`; folder `lantern-phone-<tag>.directory`. A second
+   `…@<serial>`; category `X-Lantern-<tag>`; folder `lantern-phone-<tag>.directory`, a
+   **top-level** category of the application menu named after the phone (Ruling R9: Plasma 6
+   Kickoff flattens nested submenus, so the planned "Phone" parent showed one mixed list; the
+   parent and Lantern's own `lantern-phone.directory` are gone, removed at lanternd's next
+   start only if that file is byte-for-byte Lantern's). A second
    serial with the same tag is refused with a warning; the first phone's files stay untouched
    (and a refused phone's legacy files are kept, Ruling R4).
 3. **`live` is cleared by** a real unplug (absent past the grace), unchecking, Undo, being

@@ -1206,15 +1206,19 @@ fn opener() -> Option<Opener> {
 /// The catalogue lanternd serves from: the one-time menu migration ([`catalog::migrate`]) runs
 /// first, so `menu.json` records the primary phone before any session is served or any window
 /// reopened (else every `lantern open --phone` window would get a suffixed app_id that matches
-/// no legacy entry). `pins` is Plasma's applets config, for picking the primary. `rebuild` runs
-/// once if the migration changed files. A failed migration gives no catalogue for this run:
-/// writing per-phone entries over unmigrated ones would mark it done; the next start retries.
+/// no legacy entry). Then the menu files are brought up to date ([`catalog::refresh_menu`]), so
+/// a layout change (each phone a top-level category) reaches the menu at the next start even
+/// with no phone live. `pins` is Plasma's applets config, for picking the primary. `rebuild`
+/// runs once if the migration or the menu changed files. A failed migration gives no catalogue
+/// for this run: writing per-phone entries over unmigrated ones would mark it done; the next
+/// start retries.
 pub fn open_catalog(
     dirs: catalog::Dirs,
     pins: Option<&str>,
     rebuild: catalog::Rebuild,
 ) -> Option<catalog::Catalog> {
     let pending = !crate::naming::Naming::migrated(&dirs.state);
+    let mut changed = false;
     match catalog::migrate(&dirs, pins) {
         Ok(m) if pending => {
             tracing::info!(
@@ -1223,9 +1227,7 @@ pub fn open_catalog(
                 m.written,
                 m.removed
             );
-            if m.written + m.removed > 0 {
-                rebuild();
-            }
+            changed = m.written + m.removed > 0;
         }
         Ok(_) => {}
         Err(error) => {
@@ -1235,6 +1237,16 @@ pub fn open_catalog(
             );
             return None;
         }
+    }
+    match catalog::refresh_menu(&dirs) {
+        Ok(menu) => changed |= menu,
+        Err(error) => tracing::warn!(
+            error = format!("{error:#}"),
+            "could not bring the phones' menu up to date"
+        ),
+    }
+    if changed {
+        rebuild();
     }
     Some(catalog::Catalog::with_rebuild(dirs, rebuild))
 }
@@ -1465,6 +1477,50 @@ mod tests {
         let (runs, rebuild) = counter();
         assert!(open_catalog(dirs.clone(), None, rebuild).is_some());
         assert_eq!(Naming::load(&dirs.state).primary.as_deref(), Some("B"));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An earlier build's "Phone" parent menu: the next start makes each phone a top-level
+    /// category and drops Lantern's own `lantern-phone.directory`, once.
+    #[test]
+    fn startup_moves_a_nested_menu_to_the_top_level_once() {
+        let (root, dirs) = scratch_dirs("toplevel");
+        plant_legacy(&dirs, "com.a", "A;");
+        let (_, rebuild) = counter();
+        drop(open_catalog(dirs.clone(), None, rebuild));
+        let menu = dirs.menus.join("lantern.menu");
+        let parent = dirs.directories.join("lantern-phone.directory");
+        let sub = "<Menu><Name>lantern-A</Name><Directory>lantern-phone-A.directory</Directory>\
+                   <Include><Category>X-Lantern-A</Category></Include></Menu>";
+        let head = "<!DOCTYPE Menu PUBLIC \"-//freedesktop//DTD Menu 1.0//EN\" \
+                    \"http://www.freedesktop.org/standards/menu-spec/menu-1.0.dtd\">\n\
+                    <Menu><Name>Applications</Name>";
+        std::fs::write(
+            &menu,
+            format!(
+                "{head}<Menu><Name>Phone</Name>\
+                 <Directory>lantern-phone.directory</Directory>\n{sub}\n</Menu></Menu>\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &parent,
+            "[Desktop Entry]\nType=Directory\nName=Phone\nIcon=smartphone\n",
+        )
+        .unwrap();
+        let (runs, rebuild) = counter();
+        assert!(open_catalog(dirs.clone(), None, rebuild).is_some());
+        assert_eq!(
+            std::fs::read_to_string(&menu).unwrap(),
+            format!("{head}\n{sub}\n</Menu>\n")
+        );
+        assert!(!parent.exists());
+        assert!(dirs.directories.join("lantern-phone-A.directory").exists());
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A later start changes nothing.
+        let (runs, rebuild) = counter();
+        assert!(open_catalog(dirs.clone(), None, rebuild).is_some());
         assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root);
     }

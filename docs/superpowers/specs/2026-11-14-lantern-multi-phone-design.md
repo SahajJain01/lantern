@@ -29,7 +29,9 @@ He wants three things:
 ## Goals
 
 - **G1. Per-phone launcher folders.** One submenu per phone, named after it ("Xiaomi 11T Pro",
-  "edge 50 pro"), under the existing "Phone" folder. Each folder holds that phone's apps, work
+  "edge 50 pro"), each a top-level category of the application menu (amended at acceptance,
+  Ruling R9: Plasma 6 Kickoff flattens nested submenus, so a "Phone" parent showed one mixed
+  list). Each folder holds that phone's apps, work
   profile apps included, with the existing "(work)" suffix.
   - An app on both phones gets one entry in each folder.
   - Each entry opens on its own phone.
@@ -135,7 +137,8 @@ Plan 4b is useful by itself, and it tests the new tray and menu before the core 
 
 ### Launcher (G1, G2)
 
-- Today's single "Phone" folder becomes a parent, with one submenu per phone named by its
+- Today's single "Phone" folder is replaced by one top-level submenu per phone (R9; first
+  designed as a parent of them) named by its
   recorded name (`companion::Names`, from `settings get global device_name`), else the serial.
   It is built with a per-phone `.directory` file and a per-phone category in Lantern's merged
   menu file. *(Builder: choose the category naming, e.g. a sanitized form of the serial.)*

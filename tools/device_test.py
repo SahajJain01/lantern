@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-25
-    python3 tools/device_test.py --manual                            # also 8, 14, 21, 26 (prompts)
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-23
+    python3 tools/device_test.py --manual                            # also 8, 14, 21, 24-26 (a person)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
     python3 tools/device_test.py --manual --only 26                  # Plan 4b: Connect from a notice
 
-Items (26; 22 automatic, 8, 14, 21 and 26 only with --manual):
+Items (26; 20 automatic, 8, 14, 21, 24, 25 and 26 only with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -22,16 +22,19 @@ Items (26; 22 automatic, 8, 14, 21 and 26 only with --manual):
                                            21 unlock_prompt (manual, PIN phone, Sahaj types)
                                            22 swipe_phone_never_prompts (Xiaomi, no PIN)
                                            23 per_phone_folders (restarts lanternd)
-                                           24 autoconnect_on_remembers_off (adb reconnect)
-                                           25 autoconnect_off_asks_on_plug (adb reconnect, tray)
+                                           24 autoconnect_on_remembers_off (manual, 2 replugs)
+                                           25 autoconnect_off_asks_on_plug (manual, replug, tray)
                                            26 connect_from_entry_opens_app (manual, Sahaj clicks)
-A full automatic run prints `22/22 PASS` when everything passes.
+A full automatic run prints `20/20 PASS` when everything passes. Every wait for Sahaj (a replug,
+a click, a PIN) prints its `>>>` step first and waits up to MANUAL_WAIT (900 s): he answers
+through chat, often minutes later. A replug is always his: `adb reconnect` once left the
+Xiaomi in a non-adb USB mode (18d1:4e11) until a physical replug, so the suite never uses it.
 
 Plan 4b (phone switchboard) items: 2 checks the window's app_id from the phone's names (the
 primary phone keeps `lantern.<pkg>`, any other gets `-p<tag>`), 10/15/16 the per-phone entries
 (`Exec=... open --phone <serial>`), 11 the per-phone `windows.json` size key, 19 `lantern
 disconnect|connect <serial>` and the record's `off`, 20 the tray's phone checkmark row, 22 the
-per-phone Unlock row, 23 the per-phone menu folders, 24 the `live`/`off` flags with autoconnect on,
+per-phone Unlock row, 23 the per-phone menu folders (each phone a top-level category), 24 the `live`/`off` flags with autoconnect on,
 25 the "<phone> is plugged in" notice with autoconnect off, 26 "Connect your <phone>" opening the
 app after Connect. Other phones may stay plugged in for every item but 24, 25 and 26: the
 preflight pins LANTERN_SERIAL, but those three lift it and fail at once ("unplug other phones")
@@ -54,9 +57,9 @@ afterwards; items 17 and 18 also save ~/.config/lantern/settings.toml and restor
 if it was absent); item 18 restarts lanternd with the keyboard off and back on; item 19
 disconnects the phone in Lantern for ~15 s and connects it again; item 20 does the same through
 the tray menu over the session bus (and saves a screenshot of the screen to the log dir); item 24
-sets `autoconnect = true` in settings.toml (restored afterwards), drops the phone off adb with
-`adb reconnect` twice and restarts lanternd; item 25 sets `autoconnect = false` (restored),
-drops the phone off adb once and connects it through its tray row; item 26 disconnects the
+sets `autoconnect = true` in settings.toml (restored afterwards), has Sahaj replug the phone
+twice and restarts lanternd; item 25 sets `autoconnect = false` (restored), has Sahaj replug
+the phone once and connects it through its tray row; item 26 disconnects the
 phone, refuses an open of Settings and has Sahaj click Connect on the "Connect your <phone>"
 notification (real desktop only), then closes the Settings window it opened. Items 21, 22, 25
 and 26 log the session bus's Notify calls to the log dir and print only matched summaries.
@@ -82,6 +85,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 SERIAL = os.environ.get("LANTERN_SERIAL") or "20e9318"
@@ -101,7 +105,8 @@ STAY_ON_SESSION = "7"  # Session.STAY_ON in the helper
 JOURNAL = "/data/local/tmp/lantern-session.json"  # JournalStore.PATH in the helper
 RESIZE_LOGICAL = 900
 KILL_SIGNAL = "TERM"  # item 7; --signal=KILL
-MANUAL_RUN = False  # --manual: replug() asks for a real unplug
+MANUAL_RUN = False  # --manual: items that need a person run; replug() refuses without it
+MANUAL_WAIT = 900  # s: how long a step waits for Sahaj (he answers through chat)
 LOG_DIR = Path(tempfile.mkdtemp(prefix="lantern-device-test-"))
 NESTED = None  # the Nested compositor while --nested
 IME_TEXT = "Tiếng Việt 👍việ"  # item 12: the EditText after text + compose + finish
@@ -161,7 +166,10 @@ def status():
         raise Fail(f"lantern status: {e}")
     if r.returncode != 0:
         raise Fail(f"lantern status -> {r.returncode}: {r.stderr.strip()}")
-    return json.loads(r.stdout)
+    try:
+        return json.loads(r.stdout)
+    except ValueError as e:
+        raise Fail(f"lantern status: not JSON ({e})")
 
 
 def phone_status(serial=None):
@@ -197,7 +205,9 @@ def systemctl(*args, check_rc=True):
 
 
 def wait_daemon(timeout=10):
-    """Waits until lanternd answers `lantern status` (its socket is up), whatever it serves."""
+    """Waits until lanternd answers `lantern status` (its socket is up), whatever it serves.
+    Call it before any status poll that must not fail right after a `systemctl restart`: until
+    the new lanternd binds its socket, `lantern status` says "lanternd is not running"."""
     st, _ = wait_until("lanternd answering", timeout, status)
     return st
 
@@ -294,20 +304,25 @@ def only_this_phone(item):
     note(f"only {SERIAL} attached")
 
 
-def replug(manual=None):
-    """Drops the phone off adb and back: `adb -s SERIAL reconnect`, which must take it away
-    (missing or `offline`) within 5 s, then back as `device` within 15 s. Under --manual
-    Sahaj pulls the cable and plugs it back in instead."""
-    manual = MANUAL_RUN if manual is None else manual
-    if manual:
-        input(f">>> Pull {SERIAL}'s USB cable, wait 15 s, plug it back in, then press Enter: ")
-    else:
-        sh("adb", "-s", SERIAL, "reconnect", timeout=15, check_rc=False)
-        try:
-            wait_until("phone off adb", 5, lambda: adb_state() != "device", interval=0.1)
-        except Fail:
-            raise Fail("adb reconnect did not drop the phone; run --manual and pull the cable")
-    _, secs = wait_until("phone back on adb", 15, lambda: adb_state() == "device", interval=0.2)
+def ask(msg):
+    """Prints a step for Sahaj (the controller relays it through chat)."""
+    print(f"    >>> {msg}", flush=True)
+
+
+def replug():
+    """Sahaj pulls SERIAL's USB cable and plugs it back in: waits (MANUAL_WAIT each) until the
+    phone is off adb (missing or not `device`), then back as `device`. Manual only (--manual):
+    `adb reconnect` once left the Xiaomi in a non-adb USB mode (18d1:4e11) until a physical
+    replug, so it is never used."""
+    check(MANUAL_RUN, "a replug needs Sahaj to pull the cable: run this item with --manual "
+                      "(the suite never uses `adb reconnect`)")
+    ask(f"Pull {SERIAL}'s USB cable, wait 5 s, then plug it back in "
+        f"(waiting up to {MANUAL_WAIT} s).")
+    _, secs = wait_until("the phone off adb (cable pulled)", MANUAL_WAIT,
+                         lambda: adb_state() != "device", interval=0.2)
+    note(f"phone off adb after {secs:.1f} s")
+    _, secs = wait_until("the phone back on adb (cable plugged in)", MANUAL_WAIT,
+                         lambda: adb_state() == "device", interval=0.2)
     note(f"phone back on adb after {secs:.1f} s")
 
 
@@ -1705,9 +1720,6 @@ class Suite:
             got = [x for x in summaries()[before:] if x.startswith(prefix)]
             return got
 
-        def ask(msg):
-            print(f"    >>> {msg}", flush=True)
-
         saved = klipper("getClipboardContents")
         saved = saved[:-1] if saved.endswith("\n") else saved
         note(f"saved the PC clipboard text ({len(saved)} chars)")
@@ -1726,9 +1738,10 @@ class Suite:
             note(f"Notify {got[0]!r} {lag:.1f} s after the copy")
             check(got[0] == f"Unlock your {name}", f"summary {got[0]!r}")
             check(lag <= 3.0, f"notification after {lag:.1f} s (> 3 s)")
-            ask(f"Click 'Enter PIN…' in the notification and type {name}'s PIN.")
+            ask(f"Click 'Enter PIN…' in the notification and type {name}'s PIN "
+                f"(waiting up to {MANUAL_WAIT} s).")
             journal_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _, secs = wait_until("deviceLocked=0 after the PIN", 180, lambda: locked() is False,
+            _, secs = wait_until("deviceLocked=0 after the PIN", MANUAL_WAIT, lambda: locked() is False,
                                  interval=0.2)
             unlocked_at = time.time()
             sent = [l for l in sh("journalctl", "--user", "-u", UNIT, "--since", journal_since,
@@ -1754,8 +1767,8 @@ class Suite:
             klipper("setClipboardContents", tag + "-2")
             wait_until("'Unlock your' notification (second stretch)", 10,
                        lambda: notified("Unlock your", before), interval=0.1)
-            ask("Click 'Enter PIN…' and type a WRONG PIN.")
-            got, _ = wait_until("'That PIN didn't unlock'", 180,
+            ask(f"Click 'Enter PIN…' and type a WRONG PIN (waiting up to {MANUAL_WAIT} s).")
+            got, _ = wait_until("'That PIN didn't unlock'", MANUAL_WAIT,
                                 lambda: notified("That PIN didn't unlock", before), interval=0.2)
             note(f"Notify {got[0]!r}")
             check(got[0] == f"That PIN didn't unlock {name}", f"summary {got[0]!r}")
@@ -1765,8 +1778,8 @@ class Suite:
             wait_until(f"panel {want} after the wrong PIN", 5,
                        lambda: phone_state()["panel"] == want, interval=0.3)
             note(f"panel {want} after the wrong PIN")
-            ask("Click 'Try again' and type the right PIN.")
-            wait_until("deviceLocked=0 after 'Try again'", 180, lambda: locked() is False,
+            ask(f"Click 'Try again' and type the right PIN (waiting up to {MANUAL_WAIT} s).")
+            wait_until("deviceLocked=0 after 'Try again'", MANUAL_WAIT, lambda: locked() is False,
                        interval=0.2)
             note("unlocked through 'Try again'")
             ok = True
@@ -1843,9 +1856,12 @@ class Suite:
     # --- Plan 4b ---------------------------------------------------------------------------
 
     def per_phone_folders(self):
-        """The menu has a folder for this phone, named after it; this phone's entries open
-        with --phone; no entry is a shared (X-Lantern-Serials) one any more; a foreign
-        lantern.*.desktop survives a restart and a full sync byte for byte."""
+        """The menu has a TOP-LEVEL category for this phone, named after it (Plasma 6 Kickoff
+        flattens nested submenus, so there is no "Phone" parent): `lantern.menu` holds it as a
+        direct child of Applications, Lantern's old `lantern-phone.directory` is gone, and
+        `kbuildsycoca6 --menutest` lists this phone's entries under `<device_name>/` only. This
+        phone's entries open with --phone; no entry is a shared (X-Lantern-Serials) one any
+        more; a foreign lantern.*.desktop survives a restart and a full sync byte for byte."""
         foreign = applications_dir() / "lantern.dev.lantern.test.foreign.desktop"
         check(not foreign.exists(), f"{foreign} exists before the test")
         planted = ("[Desktop Entry]\nType=Application\nName=Not Lantern's\nExec=true\n"
@@ -1864,12 +1880,26 @@ class Suite:
                  "waiting 10 s for the full sync")
             time.sleep(10)
             t = tag(SERIAL)
-            # 3. This phone's submenu.
+            # 3. This phone's category, a direct child of Applications; no "Phone" parent.
             menu = menus_dir() / "lantern.menu"
             check(menu.exists(), f"{menu} is missing")
-            text = menu.read_text(errors="replace")
-            check(f"<Category>X-Lantern-{t}</Category>" in text,
-                  f"{menu.name} has no submenu for X-Lantern-{t}")
+            root = ET.fromstring(menu.read_text(errors="replace"))
+            check(root.tag == "Menu" and root.findtext("Name") == "Applications",
+                  f"{menu.name}: the root is not the Applications menu")
+            top = {m.findtext("Name"): m for m in root.findall("Menu")}
+            note(f"{menu.name}: top-level menus {sorted(top)}")
+            check("Phone" not in top, f"{menu.name} still nests phones under 'Phone'")
+            mine = top.get(f"lantern-{t}")
+            check(mine is not None, f"{menu.name} has no top-level menu lantern-{t}")
+            assert mine is not None
+            check(mine.findtext("Directory") == f"lantern-phone-{t}.directory",
+                  f"lantern-{t} Directory={mine.findtext('Directory')!r}")
+            check(mine.findtext("Include/Category") == f"X-Lantern-{t}",
+                  f"lantern-{t} gathers {mine.findtext('Include/Category')!r}")
+            legacy = directories_dir() / "lantern-phone.directory"
+            lantern_wrote = "[Desktop Entry]\nType=Directory\nName=Phone\nIcon=smartphone\n"
+            check(not (legacy.exists() and legacy.read_text(errors="replace") == lantern_wrote),
+                  f"Lantern's old {legacy.name} is still there")
             # 4. Its folder, named after the phone.
             device = adb("shell", "settings get global device_name").strip()
             folder = directories_dir() / f"lantern-phone-{t}.directory"
@@ -1879,6 +1909,24 @@ class Suite:
             check(keys.get("Name") == device, f"folder Name={keys.get('Name')!r}, want {device!r}")
             check(keys.get("X-Lantern-Serial") == SERIAL,
                   f"folder X-Lantern-Serial={keys.get('X-Lantern-Serial')!r}")
+            # 4b. What KDE builds from it: this phone's entries sit in a top-level category
+            # named after the phone (`--menutest` prints `<path>/\t<file>`; it writes no cache,
+            # and gets a scratch XDG_CACHE_HOME anyway).
+            cache = LOG_DIR / "menutest-cache"
+            cache.mkdir(exist_ok=True)
+            out = sh("kbuildsycoca6", "--menutest", timeout=60,
+                     env={**os.environ, "XDG_CACHE_HOME": str(cache)})
+            ours = {p.name for p in applications_dir().glob("lantern.*.desktop")
+                    if read_keys(p).get("X-Lantern-Serial") == SERIAL}
+            paths = {}
+            for l in out.splitlines():
+                cols = l.split("\t")
+                if len(cols) >= 2 and cols[1] in ours:
+                    paths.setdefault(cols[0], 0)
+                    paths[cols[0]] += 1
+            note(f"kbuildsycoca6 --menutest: {SERIAL}'s entries under {paths}")
+            check(paths and set(paths) == {f"{device}/"},
+                  f"{SERIAL}'s entries are under {sorted(paths)}, want only {device + '/'!r}")
             # 5. This phone's Settings entry opens on this phone.
             found = entry_for(SERIAL, SETTINGS)
             check(found is not None, f"no menu entry of {SETTINGS} for {SERIAL}")
@@ -1904,8 +1952,9 @@ class Suite:
     def autoconnect_on_remembers_off(self):
         """With `autoconnect = true` (and LANTERN_SERIAL lifted, a 0 ms unplug grace): a phone
         switched off stays off across a replug and a lanternd restart; `lantern connect` turns
-        it back on, and a replug then reconnects it by itself. Refused while another phone is
-        attached."""
+        it back on, and a replug then reconnects it by itself. Manual: Sahaj replugs the phone
+        twice (`replug`). Refused while another phone is attached."""
+        check(MANUAL_RUN, "item 24 needs two real replugs: run it with --manual")
         only_this_phone("24")
         # The originals now, while the suite's phone is served: read later (inside restored())
         # it would stop and start lanternd with the phone switched off.
@@ -1922,6 +1971,9 @@ class Suite:
                 path.write_bytes(saved_file)
 
         def stays_off(secs):
+            # Right after a `systemctl restart` the new lanternd has no socket yet ("lanternd is
+            # not running"): tolerated only until it first answers, then every poll must work.
+            wait_daemon(15)
             deadline = time.monotonic() + secs
             while time.monotonic() < deadline:
                 now = status()
@@ -1984,7 +2036,9 @@ class Suite:
         """With `autoconnect = false` (and LANTERN_SERIAL lifted, a 0 ms unplug grace): the
         restart reconnects the phone through its `live` flag without a "plugged in" notice; a
         replug then asks: a Notify "<phone> is plugged in" within 5 s, the phone waiting and
-        restored; clicking its tray row connects it. Refused while another phone is attached."""
+        restored; clicking its tray row connects it. Manual: Sahaj replugs the phone once (`replug`).
+        Refused while another phone is attached."""
+        check(MANUAL_RUN, "item 25 needs a real replug: run it with --manual")
         only_this_phone("25")
         baseline()  # the originals now, while the suite's phone is served (see item 24)
         path = settings_file()
@@ -2106,9 +2160,10 @@ class Suite:
                      f"actions {got[0][1]}")
                 check("connect" in got[0][1][::2], f"no `connect` action: {got[0][1]}")
                 # 3. Sahaj clicks Connect.
-                print(f"    >>> Click Connect on the notification {summary!r}.", flush=True)
+                ask(f"Click Connect on the notification {summary!r} "
+                    f"(waiting up to {MANUAL_WAIT} s).")
                 # 4. Connected, and Settings opens once. The click clears `off` at once.
-                _, secs = wait_until("the Connect click", 180,
+                _, secs = wait_until("the Connect click", MANUAL_WAIT,
                                      lambda: phone_status(SERIAL).get("state") != "off",
                                      interval=0.2)
                 note(f"clicked {secs:.1f} s after the prompt")
@@ -2167,8 +2222,9 @@ ITEMS = [
     "autoconnect_off_asks_on_plug",
     "connect_from_entry_opens_app",
 ]
-# Need a person: pull the cable (8, 14), type the phone's PIN (21) or click Connect (26).
+# Need a person: pull the cable (8, 14, 24, 25), type the phone's PIN (21) or click Connect (26).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt",
+          "autoconnect_on_remembers_off", "autoconnect_off_asks_on_plug",
           "connect_from_entry_opens_app"}
 
 
@@ -2190,8 +2246,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manual", action="store_true",
-                    help="also run items 8, 14, 21 and 26 (USB unplug, typing the PIN, "
-                         "clicking Connect; prompts)")
+                    help="also run items 8, 14, 21, 24, 25 and 26 (USB unplug/replug, typing "
+                         "the PIN, clicking Connect; prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
     ap.add_argument("--only", nargs="*", help="run only these items (numbers or names)")
     ap.add_argument("--nested", action="store_true",

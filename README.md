@@ -108,8 +108,9 @@ lantern connect [<serial>]            # switch it on and connect it
 
 You rarely need the command: once a phone has connected, every app on its launcher (each
 profile's, work apps too) has an entry with its icon in the KDE application menu (and in
-KRunner), under **Phone** → *the phone's name* (for example Phone → "Xiaomi 11T Pro" and Phone →
-"edge 50 pro"). Each phone has its own entries, even for an app both phones have, and each entry
+KRunner), in a category of its own named after the phone (for example "Xiaomi 11T Pro" and
+"edge 50 pro", next to Games, Internet and the rest; Plasma's launcher shows only top-level
+categories, so there is no "Phone" parent any more). Each phone has its own entries, even for an app both phones have, and each entry
 opens on its own phone (`lantern open --phone <serial>`). The entries follow the phone while it
 is connected: an app installed or removed there is added or removed here. They stay when the
 phone is unplugged or switched off, and syncing one phone never touches another phone's entries
@@ -374,10 +375,13 @@ survive this phone's sync, 16 "Connect your …" for another phone's app, 17 cli
 18 keyboard setting off, 19 `lantern disconnect`/`connect`, 20 the tray menu (needs the real,
 unlocked desktop and its session bus), 21 the unlock prompt (manual: a PIN-locked phone, you
 type its PIN into the real dialog; `LANTERN_SERIAL` must name that phone), 22 a phone without a
-PIN never gets the unlock prompt, 23 per-phone menu folders, 24 autoconnect on remembers a phone
-switched off, 25 autoconnect off asks with "… is plugged in" and connects from the tray row, 26
-"Connect your …" from a menu entry connects the phone and opens the app (manual: you click
-Connect; real desktop only).
+PIN never gets the unlock prompt, 23 one top-level menu category per phone, 24 autoconnect on
+remembers a phone switched off (manual: you replug the phone twice), 25 autoconnect off asks
+with "… is plugged in" and connects from the tray row (manual: you replug it once), 26 "Connect
+your …" from a menu entry connects the phone and opens the app (manual: you click Connect; real
+desktop only). Every step that waits for you prints `>>>` first and waits up to 15 minutes. The
+suite never drops the phone with `adb reconnect` (it once left the Xiaomi in a USB mode without
+adb until a real replug).
 
 The test restarts lanternd, and serves only `LANTERN_SERIAL`'s phone (default the Xiaomi
 `20e9318`) for the run: it sets `LANTERN_SERIAL` in the systemd user environment if needed and

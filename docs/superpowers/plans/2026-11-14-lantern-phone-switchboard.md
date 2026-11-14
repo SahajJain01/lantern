@@ -21,7 +21,9 @@ only one phone is live at a time.
   a `-p<tag>` suffix and `@<serial>` keys. The primary is recorded in
   `~/.local/state/lantern/menu.json`.
 - **Catalogue.** One `.desktop` file per (phone, app, Android user), with
-  `Categories=X-Lantern-<tag>;`. The merged menu nests one submenu per phone under "Phone". A
+  `Categories=X-Lantern-<tag>;`. The merged menu makes each phone a top-level category named
+  after it (Ruling R9, acceptance: Plasma 6 Kickoff flattens nested submenus, so the "Phone"
+  parent first planned here showed one mixed list). A
   one-time migration splits today's shared `X-Lantern-Serials` files.
 - **Daemon.** The run loop's `connected`/`paused` lists become a phone table: plugged phones in
   online order, the one *wanted* phone (4b: at most one), the per-phone `off`/`live` flags, a 10 s
@@ -314,13 +316,13 @@ Test commands:
 - `pub fn app_name(dirs: &Dirs, pkg: &str, user: u32) -> String`: the Name of any entry for
   (pkg, user), else `pkg`. Task 3's `PlugIn` and Task 5's `OpenRefused` use it.
 - `pub fn ensure_menu(dirs: &Dirs, phones: &[(String, Option<String>)]) -> Result<bool>`:
-  - It writes `lantern.menu`, with the "Phone" parent containing one `<Menu>` per phone that has
-    ≥1 entry, sorted by display name:
+  - It writes `lantern.menu`, with one top-level `<Menu>` under Applications per phone that has
+    ≥1 entry, sorted by display name (R9; first planned under a "Phone" parent):
     ```
     <Menu><Name>lantern-<tag></Name><Directory>lantern-phone-<tag>.directory</Directory>
       <Include><Category>X-Lantern-<tag></Category></Include></Menu>
     ```
-  - It writes `lantern-phone.directory` (unchanged) and, per phone,
+  - It removes `lantern-phone.directory` only while it is exactly what Lantern wrote (R9) and, per phone, writes
     `[Desktop Entry]\nType=Directory\nName=<escaped name or serial>\nIcon=smartphone\nX-Lantern-Serial=<serial>\n`.
   - It removes a `lantern-phone-*.directory` with `X-Lantern-Serial=` whose phone has no entry
     left, and both menu files when no entry is left.

@@ -4,9 +4,12 @@
 //! `$XDG_DATA_HOME/applications`, named by the phone's [`Naming::app_id`] (so the window's app_id
 //! matches `StartupWMClass`): the primary phone keeps the names from before Lantern served
 //! several phones, every other phone gets a `-p<tag>` suffix. The icon goes to
-//! `$XDG_DATA_HOME/lantern/icons/<app_id>.png`. A merged menu (`lantern.menu`,
-//! `lantern-phone.directory` and one `lantern-phone-<tag>.directory` per phone) nests one submenu
-//! per phone under "Phone", gathering `Categories=X-Lantern-<tag>`.
+//! `$XDG_DATA_HOME/lantern/icons/<app_id>.png`. A merged menu (`lantern.menu` and one
+//! `lantern-phone-<tag>.directory` per phone) makes each phone a top-level category of the
+//! application menu, named after the phone and gathering `Categories=X-Lantern-<tag>`. (Plasma 6
+//! Kickoff shows only top-level categories and flattens nested submenus, so the earlier "Phone"
+//! parent showed every phone's apps as one list; its `lantern-phone.directory` is removed when
+//! it holds exactly what Lantern wrote.)
 //!
 //! Every `.desktop` file Lantern writes carries `X-Lantern-Serial=`, and so do the per-phone
 //! folder files; a file without it is never modified or deleted. A phone's session only writes,
@@ -484,16 +487,31 @@ fn remove_entry(dirs: &Dirs, path: &Path) -> Result<()> {
 }
 
 const MENU_FILE: &str = "lantern.menu";
-const DIRECTORY_FILE: &str = "lantern-phone.directory";
+/// The "Phone" parent folder of earlier builds: no longer written, removed only while it holds
+/// exactly [`LEGACY_DIRECTORY`] (it has no `X-Lantern-Serial`).
+const LEGACY_DIRECTORY_FILE: &str = "lantern-phone.directory";
 
 const MENU_HEAD: &str = "<!DOCTYPE Menu PUBLIC \"-//freedesktop//DTD Menu 1.0//EN\" \
 \"http://www.freedesktop.org/standards/menu-spec/menu-1.0.dtd\">\n\
-<Menu><Name>Applications</Name><Menu><Name>Phone</Name>\
-<Directory>lantern-phone.directory</Directory>";
+<Menu><Name>Applications</Name>";
 
-const MENU_TAIL: &str = "\n</Menu></Menu>\n";
+const MENU_TAIL: &str = "\n</Menu>\n";
 
-const DIRECTORY: &str = "[Desktop Entry]\nType=Directory\nName=Phone\nIcon=smartphone\n";
+/// What every earlier build wrote to [`LEGACY_DIRECTORY_FILE`].
+const LEGACY_DIRECTORY: &str = "[Desktop Entry]\nType=Directory\nName=Phone\nIcon=smartphone\n";
+
+/// Removes the legacy "Phone" folder file if it is exactly Lantern's; returns whether it did.
+fn remove_legacy_directory(dirs: &Dirs) -> Result<bool> {
+    let path = dirs.directories.join(LEGACY_DIRECTORY_FILE);
+    match read_text(&path)? {
+        Some(text) if text == LEGACY_DIRECTORY => remove_file(&path),
+        Some(_) => {
+            tracing::debug!(path = %path.display(), "not Lantern's Phone folder file; leaving it");
+            Ok(false)
+        }
+        None => Ok(false),
+    }
+}
 
 fn folder_text(name: &str, serial: &str) -> String {
     format!(
@@ -516,13 +534,15 @@ pub fn ensure_menu(dirs: &Dirs, phones: &[(String, Option<String>)]) -> Result<b
 }
 
 /// The menu files for the phones that have at least one per-phone entry in `entries`:
-/// `lantern.menu` nests one submenu per phone (sorted by display name) under "Phone", plus
-/// `lantern-phone.directory` and each phone's folder file. A phone is named by `names`, else
-/// by its folder file's own `Name`, else by its serial. A folder file of a phone with no entry
-/// left goes, and with no Lantern entry left at all both menu files go (with only Plan 3
-/// shared entries left, the menu files are left alone). Only files with
-/// `X-Lantern-Serial=` (and the two fixed menu files) are written or removed; the smallest
-/// serial keeps a tag shared by two phones. Returns whether anything changed.
+/// `lantern.menu` makes each phone (sorted by display name) a top-level submenu of
+/// Applications, shown with its folder file's `Name`; there is no "Phone" parent. A phone is
+/// named by `names`, else by its folder file's own `Name`, else by its serial. A folder file of
+/// a phone with no entry left goes, and with no Lantern entry left at all `lantern.menu` goes
+/// (with only Plan 3 shared entries left, the menu files are left alone). Whenever the menu is
+/// written or removed, the legacy `lantern-phone.directory` goes if it holds exactly what
+/// Lantern wrote. Only files with `X-Lantern-Serial=` (and those two fixed files) are written
+/// or removed; the smallest serial keeps a tag shared by two phones. Returns whether anything
+/// changed.
 fn write_menu(
     dirs: &Dirs,
     entries: &[(PathBuf, Owned)],
@@ -578,12 +598,11 @@ fn write_menu(
         }
     }
     let menu = dirs.menus.join(MENU_FILE);
-    let directory = dirs.directories.join(DIRECTORY_FILE);
     if phones.is_empty() {
         // Only Plan 3 shared entries left (not migrated yet): their menu stays as it is.
         if entries.is_empty() {
             changed |= remove_file(&menu)?;
-            changed |= remove_file(&directory)?;
+            changed |= remove_legacy_directory(dirs)?;
         }
         return Ok(changed);
     }
@@ -598,8 +617,15 @@ fn write_menu(
     }
     text += MENU_TAIL;
     changed |= write_if_changed(&menu, text.as_bytes())?;
-    changed |= write_if_changed(&directory, DIRECTORY.as_bytes())?;
+    changed |= remove_legacy_directory(dirs)?;
     Ok(changed)
+}
+
+/// Brings the menu files up to date for the entries on disk, folders named by the device
+/// records in `dirs.state` (lanternd's start). Returns whether anything changed.
+pub fn refresh_menu(dirs: &Dirs) -> Result<bool> {
+    let names = companion::names_in(dirs.state.clone());
+    write_menu(dirs, &owned_entries(dirs)?, &*names)
 }
 
 /// Every `lantern.*.desktop` in `applications` that Lantern owns, sorted by path.
@@ -783,7 +809,7 @@ impl Catalog {
     }
 
     /// A catalogue that runs `rebuild` (debounced) after changes, named by the `menu.json` in
-    /// `dirs.state`. Writes nothing yet: the Phone menu files come with the first entry.
+    /// `dirs.state`. Writes nothing yet: the menu files come with the first entry.
     pub fn with_rebuild(dirs: Dirs, rebuild: Rebuild) -> Self {
         Self {
             naming: Naming::load(&dirs.state),
@@ -875,7 +901,7 @@ impl Catalog {
             Err(error) => {
                 tracing::warn!(
                     error = format!("{error:#}"),
-                    "could not write the Phone menu"
+                    "could not write the phones' menu"
                 );
                 None
             }
@@ -1015,7 +1041,7 @@ impl Catalog {
     }
 
     /// Removes `serial`'s entries, their icons and its folder (undo-setup); a Plan 3 shared
-    /// entry only loses `serial` from its list. With no entry left the Phone menu goes too.
+    /// entry only loses `serial` from its list. With no entry left the menu goes too.
     /// Returns how many entries `serial` came off.
     pub fn remove_serial(&mut self, serial: &str) -> Result<usize> {
         let mut removed = 0;
@@ -1468,6 +1494,19 @@ mod tests {
         )
     }
 
+    /// The whole `lantern.menu` holding `submenus` as top-level categories, in this order.
+    fn menu_of(submenus: &[&str]) -> String {
+        let mut m = "<!DOCTYPE Menu PUBLIC \"-//freedesktop//DTD Menu 1.0//EN\" \
+                     \"http://www.freedesktop.org/standards/menu-spec/menu-1.0.dtd\">\n\
+                     <Menu><Name>Applications</Name>"
+            .to_owned();
+        for s in submenus {
+            m += "\n";
+            m += s;
+        }
+        m + "\n</Menu>\n"
+    }
+
     /// Names for "A", "B" and "H" only; any other serial has none.
     fn names(serial: &str) -> Option<String> {
         match serial {
@@ -1517,15 +1556,11 @@ mod tests {
         assert_eq!(std::fs::read(icon(&dirs, "lantern.com.s-pB")).unwrap(), PNG);
         assert_eq!(cat.phones("com.s", 0), ["A", "B"]);
 
-        // One submenu per phone under "Phone", named by `names`, sorted by name.
+        // One top-level category per phone (Kickoff flattens nested submenus), named by
+        // `names`, sorted by name; no "Phone" parent.
         let m = read(&menu(&dirs));
         let (sa, sb) = (submenu("A"), submenu("B"));
-        assert!(m.contains(&sa) && m.contains(&sb), "{m}");
-        assert!(m.find(&sa) < m.find(&sb), "Phone A sorts first: {m}");
-        assert!(
-            m.contains("<Name>Phone</Name><Directory>lantern-phone.directory</Directory>"),
-            "{m}"
-        );
+        assert_eq!(m, menu_of(&[&sa, &sb]), "Phone A sorts first");
         assert_eq!(
             read(&folder(&dirs, "A")),
             "[Desktop Entry]\nType=Directory\nName=Phone A\nIcon=smartphone\nX-Lantern-Serial=A\n"
@@ -1534,10 +1569,7 @@ mod tests {
             read(&folder(&dirs, "B")),
             "[Desktop Entry]\nType=Directory\nName=Phone B\nIcon=smartphone\nX-Lantern-Serial=B\n"
         );
-        assert_eq!(
-            read(&dirs.directories.join("lantern-phone.directory")),
-            "[Desktop Entry]\nType=Directory\nName=Phone\nIcon=smartphone\n"
-        );
+        assert!(!dirs.directories.join("lantern-phone.directory").exists());
 
         // A session start rewrites the menu: B's new name sorts it first.
         cat.set_names(Arc::new(|s: &str| match s {
@@ -1545,8 +1577,7 @@ mod tests {
             other => names(other),
         }));
         cat.start_session("B");
-        let m = read(&menu(&dirs));
-        assert!(m.find(&sb) < m.find(&sa), "{m}");
+        assert_eq!(read(&menu(&dirs)), menu_of(&[&sb, &sa]));
         assert_eq!(line(&read(&folder(&dirs, "B")), "Name"), ["Aardvark <1>"]);
     }
 
@@ -1730,7 +1761,7 @@ mod tests {
             "{m}"
         );
         assert!(folder(&dirs, "A").exists());
-        // A full sync that prunes A's last entry takes the whole Phone menu.
+        // A full sync that prunes A's last entry takes the whole menu.
         assert_eq!(
             full_sync(&mut cat, "A", &[]),
             0,
@@ -2155,7 +2186,7 @@ mod tests {
         let mut cat = named(dirs.clone());
         full_sync(&mut cat, "A", &[("com.a", 0), ("com.s", 0)]);
         full_sync(&mut cat, "B", &[("com.b", 0), ("com.s", 0)]);
-        assert!(menu(&dirs).exists() && phone_dir.exists());
+        assert!(menu(&dirs).exists() && !phone_dir.exists());
         assert!(folder(&dirs, "A").exists() && folder(&dirs, "B").exists());
         assert_eq!(cat.remove_serial("A").unwrap(), 2);
         assert!(!a.exists() && !s.exists() && b.exists() && sb.exists());
@@ -2168,14 +2199,11 @@ mod tests {
             !m.contains(&submenu("A")) && m.contains(&submenu("B")),
             "{m}"
         );
-        assert!(phone_dir.exists(), "other entries remain: the menu stays");
+        assert!(menu(&dirs).exists(), "other entries remain: the menu stays");
         assert_eq!(cat.remove_serial("A").unwrap(), 0);
         assert_eq!(cat.remove_serial("B").unwrap(), 2);
         assert!(!b.exists() && !sb.exists() && !folder(&dirs, "B").exists());
-        assert!(
-            !menu(&dirs).exists() && !phone_dir.exists(),
-            "no entries left: menu removed"
-        );
+        assert!(!menu(&dirs).exists(), "no entries left: menu removed");
     }
 
     #[test]
@@ -2213,7 +2241,10 @@ mod tests {
         let old_menu = "<Menu><Include><Category>X-Lantern</Category></Include></Menu>\n";
         let files = [
             (menu(&dirs), old_menu),
-            (dirs.directories.join("lantern-phone.directory"), DIRECTORY),
+            (
+                dirs.directories.join("lantern-phone.directory"),
+                LEGACY_DIRECTORY,
+            ),
         ];
         let stamp = SystemTime::now() - Duration::from_secs(3600);
         for (path, text) in &files {
@@ -2252,23 +2283,70 @@ mod tests {
         assert!(!menu(&dirs).exists(), "no entry yet: no menu");
         cat.upsert(&entry("com.a", 0)).unwrap();
         let m = read(&menu(&dirs));
-        for want in [
-            "<Menu>",
-            "<Name>Applications</Name>",
-            "<Name>Phone</Name>",
-            "<Directory>lantern-phone.directory</Directory>",
-            &submenu("s"),
-        ] {
-            assert!(m.contains(want), "{want} missing in {m}");
-        }
+        assert_eq!(m, menu_of(&[&submenu("s")]));
+        assert!(!m.contains("<Name>Phone</Name>"), "{m}");
         assert!(!m.contains("<Category>X-Lantern</Category>"), "{m}");
-        let d = read(&dirs.directories.join("lantern-phone.directory"));
-        assert_eq!(
-            d,
-            "[Desktop Entry]\nType=Directory\nName=Phone\nIcon=smartphone\n"
-        );
+        assert!(!dirs.directories.join("lantern-phone.directory").exists());
         // Without a name the folder is named by the serial.
         assert_eq!(line(&read(&folder(&dirs, "s")), "Name"), ["s"]);
+    }
+
+    /// The Plan 4b menu nested every phone under "Phone"; Plasma 6 Kickoff flattens nested
+    /// submenus, so a rerun moves each phone to the top level and removes Lantern's own
+    /// `lantern-phone.directory`, and a second rerun changes nothing.
+    #[test]
+    fn nested_phone_menu_becomes_top_level_and_converges() {
+        let (_t, dirs) = tmp();
+        set_primary(&dirs, "A");
+        let mut cat = named(dirs.clone());
+        full_sync(&mut cat, "A", &[("com.a", 0)]);
+        full_sync(&mut cat, "B", &[("com.b", 0)]);
+        drop(cat);
+        // What the earlier build left: a "Phone" parent and its folder file.
+        let parent = dirs.directories.join("lantern-phone.directory");
+        let nested = format!(
+            "<!DOCTYPE Menu PUBLIC \"-//freedesktop//DTD Menu 1.0//EN\" \
+             \"http://www.freedesktop.org/standards/menu-spec/menu-1.0.dtd\">\n\
+             <Menu><Name>Applications</Name><Menu><Name>Phone</Name>\
+             <Directory>lantern-phone.directory</Directory>\n{}\n{}\n</Menu></Menu>\n",
+            submenu("A"),
+            submenu("B")
+        );
+        std::fs::write(menu(&dirs), &nested).unwrap();
+        std::fs::write(&parent, LEGACY_DIRECTORY).unwrap();
+        let phones = [
+            ("A".to_owned(), Some("Phone A".to_owned())),
+            ("B".to_owned(), Some("Phone B".to_owned())),
+        ];
+        assert!(ensure_menu(&dirs, &phones).unwrap());
+        assert_eq!(read(&menu(&dirs)), menu_of(&[&submenu("A"), &submenu("B")]));
+        assert!(!parent.exists(), "Lantern's own Phone folder file goes");
+        assert!(folder(&dirs, "A").exists() && folder(&dirs, "B").exists());
+        let before = snapshot(&dirs);
+        assert!(!ensure_menu(&dirs, &phones).unwrap(), "a rerun converges");
+        assert_eq!(snapshot(&dirs), before);
+    }
+
+    #[test]
+    fn foreign_phone_directory_is_left_alone() {
+        let (_t, dirs) = tmp();
+        std::fs::create_dir_all(&dirs.directories).unwrap();
+        let parent = dirs.directories.join("lantern-phone.directory");
+        let mine = "[Desktop Entry]\nType=Directory\nName=Phone\nIcon=my-phone\n";
+        std::fs::write(&parent, mine).unwrap();
+        let (mut cat, _) = quiet(dirs.clone());
+        cat.start_session("s");
+        cat.upsert(&entry("com.a", 0)).unwrap();
+        assert_eq!(read(&parent), mine, "not exactly what Lantern wrote: kept");
+        // With no entry left the menu goes, but the foreign file stays.
+        cat.remove("com.a", 0).unwrap();
+        assert!(!menu(&dirs).exists());
+        assert_eq!(read(&parent), mine);
+        // Lantern's own one goes with the last entry too.
+        std::fs::write(&parent, LEGACY_DIRECTORY).unwrap();
+        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.remove("com.a", 0).unwrap();
+        assert!(!parent.exists());
     }
 
     #[test]
