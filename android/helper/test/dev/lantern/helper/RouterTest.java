@@ -135,6 +135,8 @@ public final class RouterTest {
         volatile boolean failOnCloseNext;
         /** {@link Router#keyboardWanted()} as the session starter saw it; null before it ran. */
         volatile Boolean keyboardAtStart;
+        /** {@link Router#screenOffWanted()} as the session starter saw it; null before it ran. */
+        volatile Boolean screenOffAtStart;
 
         Rig() throws IOException {
             this(r -> { });
@@ -180,6 +182,7 @@ public final class RouterTest {
                 new DataOutputStream(server.getOutputStream()), factory, injector, CODEC, TOKEN,
                 () -> {
                     keyboardAtStart = self[0].keyboardWanted();
+                    screenOffAtStart = self[0].screenOffWanted();
                     event("session start");
                     return () -> event("session close");
                 },
@@ -293,6 +296,34 @@ public final class RouterTest {
             Msg m = r.control(0);
             eq("hello", m.t, "hello reply");
             eq(Boolean.FALSE, r.keyboardAtStart, "the starter sees keyboard=false");
+        }
+    }
+
+    static void helloScreenOffFalseReachesStarter() throws Exception {
+        try (Rig r = new Rig()) {
+            r.send(0, "{\"t\":\"hello\",\"version\":1,\"token\":\"" + TOKEN + "\",\"screen_off\":false}");
+            Msg m = r.control(0);
+            eq("hello", m.t, "hello reply");
+            eq(Boolean.FALSE, r.screenOffAtStart, "the starter sees screen_off=false");
+            eq(Boolean.TRUE, r.keyboardAtStart, "keyboard still defaults to true");
+        }
+    }
+
+    static void helloScreenOffAbsentIsTrue() throws Exception {
+        try (Rig r = new Rig()) {
+            r.hello();
+            eq(Boolean.TRUE, r.screenOffAtStart, "absent screen_off means true");
+        }
+    }
+
+    static void helloScreenOffNotBooleanIsProtocolError() throws Exception {
+        try (Rig r = new Rig()) {
+            r.send(0, "{\"t\":\"hello\",\"version\":1,\"token\":\"" + TOKEN + "\",\"screen_off\":0}");
+            Msg m = r.control(0);
+            eq("error", m.t, "reply to screen_off=0");
+            check(m.str("msg").contains("screen_off"), "msg names screen_off: " + m.str("msg"));
+            r.awaitExit(2000);
+            check(!r.events.contains("session start"), "session must not start: " + r.events);
         }
     }
 
@@ -994,6 +1025,9 @@ public final class RouterTest {
             {"requiresHelloFirst", (Case) RouterTest::requiresHelloFirst},
             {"helloKeyboardFalseReachesStarter", (Case) RouterTest::helloKeyboardFalseReachesStarter},
             {"helloKeyboardAbsentIsTrue", (Case) RouterTest::helloKeyboardAbsentIsTrue},
+            {"helloScreenOffFalseReachesStarter", (Case) RouterTest::helloScreenOffFalseReachesStarter},
+            {"helloScreenOffAbsentIsTrue", (Case) RouterTest::helloScreenOffAbsentIsTrue},
+            {"helloScreenOffNotBooleanIsProtocolError", (Case) RouterTest::helloScreenOffNotBooleanIsProtocolError},
             {"helloKeyboardNotBooleanIsProtocolError", (Case) RouterTest::helloKeyboardNotBooleanIsProtocolError},
             {"helloStartsSessionAndReplies", (Case) RouterTest::helloStartsSessionAndReplies},
             {"onSessionUpRunsAfterHelloReply", (Case) RouterTest::onSessionUpRunsAfterHelloReply},

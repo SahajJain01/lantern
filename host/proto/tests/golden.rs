@@ -153,6 +153,7 @@ fn hello_keyboard_off() -> Control {
         version: 1,
         token: "t".into(),
         keyboard: false,
+        screen_off: true,
     }
 }
 

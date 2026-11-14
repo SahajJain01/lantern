@@ -31,8 +31,7 @@ const PROBE_EVERY: Duration = Duration::from_secs(3);
 pub fn plugged_notice(name: &str) -> (String, String) {
     (
         format!("{name} is plugged in"),
-        "Connect it to use its apps on this PC. Its screen turns off while it is connected."
-            .to_owned(),
+        "Connect it to use its apps on this PC.".to_owned(),
     )
 }
 

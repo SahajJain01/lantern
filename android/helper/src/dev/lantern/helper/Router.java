@@ -76,6 +76,8 @@ public final class Router {
     private AutoCloseable session;
     /** The hello's {@code keyboard} (absent means true); set before the session starter runs. */
     private volatile boolean keyboardWanted = true;
+    /** The hello's {@code screen_off} (absent means true); set before the session starter runs. */
+    private volatile boolean screenOffWanted = true;
     private volatile boolean stopping;
     private volatile Runnable onSessionUp = () -> { };
     private volatile Extras extras = NO_EXTRAS;
@@ -154,6 +156,14 @@ public final class Router {
      */
     public boolean keyboardWanted() {
         return keyboardWanted;
+    }
+
+    /**
+     * Whether lanternd wants the phone's own screen (panel) off for this session (the hello's
+     * optional {@code screen_off}, true when absent). Valid from the session starter on.
+     */
+    public boolean screenOffWanted() {
+        return screenOffWanted;
     }
 
     /**
@@ -295,6 +305,11 @@ public final class Router {
             throw new ProtocolError("hello.keyboard: want boolean, got " + keyboard);
         }
         keyboardWanted = keyboard == null || (Boolean) keyboard;
+        Object screenOff = m.fields().get("screen_off");
+        if (screenOff != null && !(screenOff instanceof Boolean)) {
+            throw new ProtocolError("hello.screen_off: want boolean, got " + screenOff);
+        }
+        screenOffWanted = screenOff == null || (Boolean) screenOff;
         try {
             session = sessionStarter.call();
         } catch (Exception e) {

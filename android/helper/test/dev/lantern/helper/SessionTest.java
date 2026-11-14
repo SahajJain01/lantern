@@ -103,6 +103,29 @@ public final class SessionTest {
         eq("[wake, panel(false), panel(true)]", p.calls.toString(), "power calls after close");
     }
 
+    static void panelLeftOnWithoutScreenOff() throws Exception {
+        FakeSettings s = new FakeSettings();
+        FakePower p = new FakePower();
+        Session.Guard noGuard = new Session.Guard() {
+            @Override
+            public void arm(String journalJson) {
+            }
+
+            @Override
+            public void disarm() {
+            }
+        };
+        Session session = Session.start(s, p, noGuard, JournalStore.none(),
+            java.util.Collections.singletonList(Session.STAY_ON), false);
+        eq("[wake]", p.calls.toString(), "woken, panel untouched");
+        eq("7", s.get(NS, KEY), "stay-awake still set");
+        eq(false, session.panelOff(), "panel not held off");
+        session.panelOffAgain();
+        eq("[wake]", p.calls.toString(), "the unlock never turns it off");
+        session.close();
+        eq("[wake]", p.calls.toString(), "close touches no panel it never turned off");
+    }
+
     /** The unlock's panel-off goes through the live session only: never after close's panel-on. */
     static void panelOffAgainOnlyWhileLive() throws Exception {
         FakeSettings s = new FakeSettings();
@@ -387,6 +410,7 @@ public final class SessionTest {
             {"closeIsIdempotent", (Case) SessionTest::closeIsIdempotent},
             {"panelTurnedOnAtClose", (Case) SessionTest::panelTurnedOnAtClose},
             {"panelOffAgainOnlyWhileLive", (Case) SessionTest::panelOffAgainOnlyWhileLive},
+            {"panelLeftOnWithoutScreenOff", (Case) SessionTest::panelLeftOnWithoutScreenOff},
             {"journalJsonRoundTrip", (Case) SessionTest::journalJsonRoundTrip},
             {"guardArmedBeforeAnyChange", (Case) SessionTest::guardArmedBeforeAnyChange},
             {"cleanupSkipsAfterDone", (Case) SessionTest::cleanupSkipsAfterDone},

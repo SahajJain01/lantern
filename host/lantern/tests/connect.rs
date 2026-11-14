@@ -134,8 +134,7 @@ fn gone(serial: &str) -> ConnectEvent {
     }
 }
 
-const PLUGGED_BODY: &str =
-    "Connect it to use its apps on this PC. Its screen turns off while it is connected.";
+const PLUGGED_BODY: &str = "Connect it to use its apps on this PC.";
 
 // ---------------------------------------------------------------------------------------------
 

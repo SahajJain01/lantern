@@ -35,7 +35,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 
 | `t` | fields |
 |---|---|
-| `hello` | `version: u32`, `token: string`, optional `keyboard: bool` (absent = true; lanternd → helper only) |
+| `hello` | `version: u32`, `token: string`, optional `keyboard: bool`, optional `screen_off: bool` (each absent = true; lanternd → helper only) |
 | `open` | `pkg: string`, `user: u32` (Android user/profile id, `0..=i32::MAX`), `w: u32`, `h: u32`, `dpi: u32`, optional `activation_token: string`, optional `phone: string` (window → daemon only) |
 | `opened` | `display: i32`, `task: i32`, `codec: string`, `w: u32`, `h: u32`, optional `moved: bool` (absent = false), optional `label: string` (the app's launcher label), optional `work: bool` (absent = false; the app runs in a work profile) |
 | `resize` | `w: u32`, `h: u32`, `dpi: u32` |
@@ -70,6 +70,11 @@ JSON objects tagged by `"t"` (snake_case). Example:
   non-boolean `keyboard` is a protocol error. With `keyboard:false` the session is stay-awake
   only: no keyboard setting is touched, no `ime_prev` goes to the companion, and `ime` from a
   window is dropped (logged once per stretch, never the text).
+- lanternd sends `screen_off:false` unless the user turned "Turn the phone's screen off" on
+  (`screen_off = true` in settings.toml, default false, read at each session start); `true` is
+  omitted, so that `hello` keeps its v1 bytes and an absent field means the panel goes off. With
+  `screen_off:false` the helper wakes the phone but leaves its panel on, and the unlock never turns
+  it off afterwards. A non-boolean `screen_off` is a protocol error.
 - `lanternd` treats a handshake `error` with `code:"version"` (or, from a helper predating
   `code`, a `msg` starting `protocol version mismatch`) as a version mismatch and exits 3 (see
   Exit statuses); any other handshake `error` is retried with backoff.

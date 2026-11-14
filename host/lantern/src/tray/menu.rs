@@ -25,6 +25,7 @@ pub enum Action {
     ToggleClipboard,
     ToggleKeyboard,
     ToggleAutoconnect,
+    ToggleScreenOff,
     ToggleLogin,
     OpenSettings,
     /// Asks before removing Lantern from that phone (kdialog), then undoes its setup.
@@ -270,6 +271,12 @@ pub fn items(
         action: Action::ToggleKeyboard,
     });
     rows.push(Item::Check {
+        id: 16,
+        text: "Turn the phone's screen off (from the next connection)".to_owned(),
+        on: settings.screen_off,
+        action: Action::ToggleScreenOff,
+    });
+    rows.push(Item::Check {
         id: 14,
         text: "Connect phones when plugged in".to_owned(),
         on: settings.autoconnect,
@@ -449,6 +456,12 @@ mod tests {
                 "Type with the Lantern keyboard (from the next connection)",
                 true,
                 Action::ToggleKeyboard,
+            ),
+            check(
+                16,
+                "Turn the phone's screen off (from the next connection)",
+                false,
+                Action::ToggleScreenOff,
             ),
             check(
                 14,
@@ -735,6 +748,7 @@ mod tests {
         assert_eq!(action(&ready, 5), Some(Action::ToggleClipboard));
         assert_eq!(action(&ready, 6), Some(Action::ToggleKeyboard));
         assert_eq!(action(&ready, 14), Some(Action::ToggleAutoconnect));
+        assert_eq!(action(&ready, 16), Some(Action::ToggleScreenOff));
         assert_eq!(action(&ready, 7), Some(Action::ToggleLogin));
         assert_eq!(action(&ready, 8), Some(Action::OpenSettings));
         assert_eq!(action(&ready, 11), Some(Action::Quit));
@@ -800,11 +814,12 @@ mod tests {
             clipboard_sync: false,
             lantern_keyboard: false,
             autoconnect: true,
+            screen_off: true,
         };
         let got = items(&v, &settings, None, true, &mut Slots::default());
         let ids: Vec<i32> = got.iter().map(Item::id).collect();
         // Row 12 right after the phone rows; row 7 hidden without a login state.
-        assert_eq!(ids, [100, 101, 12, 4, 5, 6, 14, 8, 9, 10, 11]);
+        assert_eq!(ids, [100, 101, 12, 4, 5, 6, 16, 14, 8, 9, 10, 11]);
         assert_eq!(
             got[2],
             label(12, "Settings file has an error; using defaults")
@@ -818,6 +833,14 @@ mod tests {
         }
         assert!(matches!(
             &got[6],
+            Item::Check {
+                id: 16,
+                on: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &got[7],
             Item::Check {
                 id: 14,
                 on: true,

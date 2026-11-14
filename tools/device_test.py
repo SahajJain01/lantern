@@ -708,9 +708,21 @@ def cleanup(ok, *steps):
         raise Fail("cleanup: " + "; ".join(errors))
 
 
+def session_panel():
+    """The panel state a session leaves: "Off" only with `screen_off = true` in settings.toml
+    (read at each session start; the default leaves the phone's screen on)."""
+    try:
+        text = settings_file().read_text(errors="replace")
+    except OSError:
+        return "On"
+    on = re.search(r"(?m)^\s*screen_off\s*=\s*true\s*(#.*)?$", text)
+    return "Off" if on else "On"
+
+
 def armed(st):
     """The phone as a ready session with no windows leaves it."""
-    return (st["stay_on"] == STAY_ON_SESSION and st["panel"] == "Off" and st["displays"] == ["0"]
+    return (st["stay_on"] == STAY_ON_SESSION and st["panel"] == session_panel()
+            and st["displays"] == ["0"]
             and len(st["forwards"]) == 1 and st["helper_pids"] and st["journal"])
 
 
@@ -1653,8 +1665,9 @@ class Suite:
         or prints it. Locks the phone, copies a tag on the PC and expects "Unlock your <name>"
         (a Notify on the session bus) within 3 s; after Sahaj submits the right PIN the phone
         unlocks within 5 s, the tag is on the phone's clipboard (pasted into the test screen)
-        and the panel is off again. Then a wrong-PIN pass: "That PIN didn't unlock", exactly
-        one `unlock: still locked` in the helper log, the panel off, and Sahaj unlocks through
+        and the panel is back as the session left it (off only with `screen_off = true`). Then a
+        wrong-PIN pass: "That PIN didn't unlock", exactly one `unlock: still locked` in the helper
+        log, the panel as the session left it, and Sahaj unlocks through
         "Try again". The PC clipboard and the test screen are restored afterwards."""
         check(SERIAL == "ZD222LMDFV",
               f"item 21 needs the PIN-locked Motorola: LANTERN_SERIAL=ZD222LMDFV (got {SERIAL}), "
@@ -1725,9 +1738,10 @@ class Suite:
             took = unlocked_at - float(sent[-1].split()[0])
             note(f"deviceLocked=0 {took:.1f} s after lanternd sent the unlock")
             check(took <= 5.0, f"unlocked {took:.1f} s after the unlock was sent (> 5 s)")
-            wait_until("panel off again", 5,
-                                  lambda: phone_state()["panel"] == "Off", interval=0.3)
-            note("panel off again after the unlock")
+            want = session_panel()
+            wait_until(f"panel {want} after the unlock", 5,
+                       lambda: phone_state()["panel"] == want, interval=0.3)
+            note(f"panel {want} after the unlock")
             _, since = self._test_window("unlock-paste", "tap:0.5,0.15;key:Ctrl+V;close", 40)
             texts = [m for _, m in logcat_since(since, ["LanternTest"])]
             for t in texts:
@@ -1748,9 +1762,9 @@ class Suite:
             check(locked() is True, "the phone unlocked with a wrong PIN?")
             still = [m for _, m in logcat_since(since, ["lantern"]) if m == "unlock: still locked"]
             check(len(still) == 1, f"{len(still)} 'unlock: still locked' lines, want 1")
-            wait_until("panel off after the wrong PIN", 5,
-                       lambda: phone_state()["panel"] == "Off", interval=0.3)
-            note("panel off after the wrong PIN")
+            wait_until(f"panel {want} after the wrong PIN", 5,
+                       lambda: phone_state()["panel"] == want, interval=0.3)
+            note(f"panel {want} after the wrong PIN")
             ask("Click 'Try again' and type the right PIN.")
             wait_until("deviceLocked=0 after 'Try again'", 180, lambda: locked() is False,
                        interval=0.2)

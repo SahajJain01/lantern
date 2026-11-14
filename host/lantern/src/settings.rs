@@ -2,7 +2,8 @@
 //!
 //! The tray menu writes the file through [`set`]; hand edits are picked up by
 //! [`SettingsHandle::spawn_poll`] within [`POLL`]. Readers hold a `watch` of the typed values.
-//! - A missing file or key means the default (every setting on except `autoconnect`).
+//! - A missing file or key means the default (every setting on except `autoconnect` and
+//!   `screen_off`).
 //! - A known key with a wrong-typed value gets its default plus a warning; unknown keys are
 //!   ignored when reading and kept when writing.
 //! - A file that doesn't parse gives the defaults and is never overwritten: [`set`] refuses.
@@ -24,6 +25,7 @@ pub const HEADER: &str = "\
 # clipboard_sync: copy text between the PC and the phone (true/false).
 # lantern_keyboard: type on the phone through the Lantern keyboard (true/false; applies at the next connection).
 # autoconnect: connect a phone as soon as it is plugged in (true/false; when false, Lantern asks each time).
+# screen_off: turn the phone's own screen off while it is connected (true/false; applies at the next connection).
 ";
 
 /// How often [`SettingsHandle::spawn_poll`] checks the file for hand edits.
@@ -37,6 +39,8 @@ pub struct Settings {
     pub lantern_keyboard: bool,
     /// Connect a phone as soon as it is plugged in (else Lantern asks); read at each plug-in.
     pub autoconnect: bool,
+    /// Turn the phone's own screen off while it is connected; applies at the next connection.
+    pub screen_off: bool,
 }
 
 impl Default for Settings {
@@ -45,6 +49,7 @@ impl Default for Settings {
             clipboard_sync: true,
             lantern_keyboard: true,
             autoconnect: false,
+            screen_off: false,
         }
     }
 }
@@ -54,10 +59,16 @@ pub enum Key {
     ClipboardSync,
     LanternKeyboard,
     Autoconnect,
+    ScreenOff,
 }
 
 impl Key {
-    const ALL: [Key; 3] = [Key::ClipboardSync, Key::LanternKeyboard, Key::Autoconnect];
+    const ALL: [Key; 4] = [
+        Key::ClipboardSync,
+        Key::LanternKeyboard,
+        Key::Autoconnect,
+        Key::ScreenOff,
+    ];
 
     /// The key's name in the file.
     pub fn name(self) -> &'static str {
@@ -65,6 +76,7 @@ impl Key {
             Key::ClipboardSync => "clipboard_sync",
             Key::LanternKeyboard => "lantern_keyboard",
             Key::Autoconnect => "autoconnect",
+            Key::ScreenOff => "screen_off",
         }
     }
 
@@ -73,6 +85,7 @@ impl Key {
             Key::ClipboardSync => &mut settings.clipboard_sync,
             Key::LanternKeyboard => &mut settings.lantern_keyboard,
             Key::Autoconnect => &mut settings.autoconnect,
+            Key::ScreenOff => &mut settings.screen_off,
         }
     }
 
@@ -82,6 +95,7 @@ impl Key {
             Key::ClipboardSync => settings.clipboard_sync,
             Key::LanternKeyboard => settings.lantern_keyboard,
             Key::Autoconnect => settings.autoconnect,
+            Key::ScreenOff => settings.screen_off,
         }
     }
 }
@@ -388,6 +402,7 @@ mod tests {
                 clipboard_sync: true,
                 lantern_keyboard: true,
                 autoconnect: false,
+                screen_off: false,
             }
         );
         let handle = SettingsHandle::new(Some(path.clone()));
@@ -401,6 +416,21 @@ mod tests {
         assert_eq!(Key::ClipboardSync.name(), "clipboard_sync");
         assert_eq!(Key::LanternKeyboard.name(), "lantern_keyboard");
         assert_eq!(Key::Autoconnect.name(), "autoconnect");
+        assert_eq!(Key::ScreenOff.name(), "screen_off");
+    }
+
+    #[test]
+    fn screen_off_defaults_off() {
+        assert!(!Settings::default().screen_off);
+        assert!(!parse("clipboard_sync = false\n").unwrap().0.screen_off);
+        assert!(parse("screen_off = true\n").unwrap().0.screen_off);
+        assert!(HEADER.contains("# screen_off: turn the phone's own screen off"));
+        let path = scratch().join("lantern").join("settings.toml");
+        ensure_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("screen_off = false"), "{text}");
+        assert!(set(&path, Key::ScreenOff, true).unwrap().screen_off);
+        assert!(load(&path).0.screen_off);
     }
 
     #[test]
@@ -457,6 +487,7 @@ mod tests {
                 clipboard_sync: false,
                 lantern_keyboard: false,
                 autoconnect: false,
+                screen_off: false,
             }
         );
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -467,6 +498,7 @@ mod tests {
                 clipboard_sync: true,
                 lantern_keyboard: false,
                 autoconnect: false,
+                screen_off: false,
             }
         );
         assert_eq!(parse("").unwrap(), (Settings::default(), vec![]));
@@ -518,6 +550,7 @@ mod tests {
                 clipboard_sync: false,
                 lantern_keyboard: false,
                 autoconnect: false,
+                screen_off: false,
             }
         );
         let text = std::fs::read_to_string(&path).unwrap();

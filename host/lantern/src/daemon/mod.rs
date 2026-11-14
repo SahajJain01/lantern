@@ -1350,9 +1350,13 @@ pub async fn run() -> Result<()> {
         track_devices(),
         move |serial| {
             let setup = setup.clone();
-            // Read at each session start: a changed `lantern_keyboard` applies from the next one.
-            let keyboard = session_settings.get().lantern_keyboard;
-            async move { start_with_companion(&Adb::new(serial), &setup, keyboard).await }
+            // Read at each session start: a changed `lantern_keyboard` or `screen_off` applies
+            // from the next one.
+            let settings = session_settings.get();
+            let (keyboard, screen_off) = (settings.lantern_keyboard, settings.screen_off);
+            async move {
+                start_with_companion(&Adb::new(serial), &setup, keyboard, screen_off).await
+            }
         },
         shutdown,
         RetryPolicy::default(),

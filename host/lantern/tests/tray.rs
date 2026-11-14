@@ -336,6 +336,7 @@ async fn registers_and_serves_layout() {
                 6,
                 "Type with the Lantern keyboard (from the next connection)"
             ),
+            (16, "Turn the phone's screen off (from the next connection)"),
             (14, "Connect phones when plugged in"),
             (8, "Open settings folder"),
             (9, ""),

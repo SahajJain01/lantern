@@ -265,8 +265,10 @@ While a phone is connected (see [Phones](#phones-connect-autoconnect): you conne
 connects by itself with autoconnect or after a lanternd restart), lanternd keeps a session on it,
 even if no window is open:
 
-- **The phone's own screen (panel) is off while a session runs.** The phone stays awake, and
-  the apps keep drawing to their Lantern displays. The panel comes back on when the session ends.
+- **The phone's own screen stays on by default.** Turn on "Turn the phone's screen off" in the
+  tray menu (`screen_off = true` in settings.toml; applies from the next connection) to switch
+  the panel off while a session runs. The phone stays awake and the apps keep drawing to their
+  Lantern displays either way; a panel Lantern turned off comes back on when the session ends.
 - **Two settings are changed for the session and restored after it:**
   - "stay awake while charging" (`settings global stay_on_while_plugged_in`) is set to `7`;
   - the keyboard: the Lantern keyboard (`dev.lantern.companion/.LanternIme`) is added to

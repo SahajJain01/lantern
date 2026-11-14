@@ -192,6 +192,10 @@ pub enum Control {
         /// so every v1 `hello` is byte-identical; a missing field decodes as true.
         #[serde(default = "yes", skip_serializing_if = "is_true")]
         keyboard: bool,
+        /// Whether the session turns the phone's own screen (panel) off. Absent on the wire
+        /// when true, so a v1 `hello` keeps its bytes; a missing field decodes as true.
+        #[serde(default = "yes", skip_serializing_if = "is_true")]
+        screen_off: bool,
     },
     Open {
         pkg: String,
@@ -995,11 +999,13 @@ mod tests {
                 version: 1,
                 token: "abc".into(),
                 keyboard: true,
+                screen_off: true,
             },
             Control::Hello {
                 version: 1,
                 token: "abc".into(),
                 keyboard: false,
+                screen_off: false,
             },
             Control::Opened {
                 display: 12,
@@ -1058,7 +1064,29 @@ mod tests {
             version: 1,
             token: "t".into(),
             keyboard,
+            screen_off: true,
         }
+    }
+
+    #[test]
+    fn hello_screen_off_omitted_when_true_and_decodes_true_when_absent() {
+        let on = Control::Hello {
+            version: 1,
+            token: "t".into(),
+            keyboard: true,
+            screen_off: false,
+        };
+        let s = serde_json::to_string(&on).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"hello","version":1,"token":"t","screen_off":false}"#
+        );
+        assert_eq!(serde_json::from_str::<Control>(&s).unwrap(), on);
+        // Absent means true (the v1 behaviour); true is never written.
+        assert_eq!(
+            serde_json::to_string(&hello(true)).unwrap(),
+            r#"{"t":"hello","version":1,"token":"t"}"#
+        );
     }
 
     #[test]
@@ -1092,6 +1120,7 @@ mod tests {
                 version: 1,
                 token: String::new(),
                 keyboard: true,
+                screen_off: true,
             }
         );
     }

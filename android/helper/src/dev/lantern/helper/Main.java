@@ -144,11 +144,16 @@ public final class Main {
                     if (!keyboardWanted[0]) {
                         Droid.log("serve: keyboard off in Lantern settings, session without the Lantern keyboard");
                     }
+                    // hello.screen_off=false (the default setting): the phone's own screen stays on.
+                    final boolean screenOff = routerRef[0].screenOffWanted();
+                    if (!screenOff) {
+                        Droid.log("serve: screen off disabled in Lantern settings, panel stays on");
+                    }
                     ImeSetup.Started started;
                     try {
                         started = ImeSetup.start(linked[0] && keyboardWanted[0], changes -> Session.start(new ShellSettings(),
                             new DevicePower(), Cleanup.spawnGuard(Droid::log), JournalStore.device(Droid::log),
-                            changes), Droid::log);
+                            changes, screenOff), Droid::log);
                     } catch (RuntimeException e) {
                         closeLink(linkRef[0]);
                         throw e;

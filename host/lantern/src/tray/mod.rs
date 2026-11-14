@@ -341,6 +341,7 @@ pub(crate) fn perform(shared: &Arc<Shared>, action: Action) {
         Action::ToggleClipboard => toggle(shared, Key::ClipboardSync),
         Action::ToggleKeyboard => toggle(shared, Key::LanternKeyboard),
         Action::ToggleAutoconnect => toggle(shared, Key::Autoconnect),
+        Action::ToggleScreenOff => toggle(shared, Key::ScreenOff),
         Action::ToggleLogin => {
             let shared = shared.clone();
             tokio::spawn(async move { toggle_login(&shared).await });

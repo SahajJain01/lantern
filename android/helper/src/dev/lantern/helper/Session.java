@@ -80,6 +80,15 @@ public final class Session implements AutoCloseable {
      * (first, so they are restored last) and restored at the end too.
      */
     public static Session start(SettingsBackend s, Power p, Guard g, JournalStore store, List<Change> changes) {
+        return start(s, p, g, store, changes, true);
+    }
+
+    /**
+     * As above; without {@code screenOff} the phone is only woken and its panel is left on (the
+     * user's {@code screen_off} setting is false), so {@link #panelOff()} stays false.
+     */
+    public static Session start(SettingsBackend s, Power p, Guard g, JournalStore store, List<Change> changes,
+            boolean screenOff) {
         Journal recovered = store.load();
         List<Journal.Entry> entries = new ArrayList<>();
         if (recovered != null) {
@@ -113,8 +122,10 @@ public final class Session implements AutoCloseable {
                 changes.get(i).apply(s, entries.get(first + i).set);
             }
             p.wake();
-            session.panelOff = true;
-            p.setPanel(false);
+            if (screenOff) {
+                session.panelOff = true;
+                p.setPanel(false);
+            }
         } catch (RuntimeException e) {
             try {
                 session.close();
