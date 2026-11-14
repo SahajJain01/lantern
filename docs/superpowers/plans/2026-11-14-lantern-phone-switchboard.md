@@ -828,7 +828,7 @@ Test commands:
 
   | Event | summary | body | action |
   |---|---|---|---|
-  | `PluggedIn` | `{name} is plugged in` | `Connect it to use its apps on this PC. Its screen turns off while it is connected.` | `connect` / `Connect` |
+  | `PluggedIn` | `{name} is plugged in` | `Connect it to use its apps on this PC.` | `connect` / `Connect` |
   | `OpenRefused` | `Connect your {name}` | `{app} is on your {name}. Connect it to open {app} here.` | `connect` / `Connect` |
   | `PlugIn` | `Plug in your {name}` | `{app} opens if you plug it in within 2 minutes.`, or `It connects if you plug it in within 2 minutes.` without an app | none |
 
@@ -900,7 +900,8 @@ Test commands:
   - Then `python3 tools/device_test.py --manual --only 26`. Give Sahaj the step ("click Connect on
     the notification") in chat before starting it.
   - Record the summary line and timings in HANDOFF.
-  - Tell Sahaj in the status line that the install restarts lanternd (panel off, stay-awake 7).
+  - Tell Sahaj in the status line that the install restarts lanternd (stay-awake 7; the panel
+    stays on unless `screen_off = true`).
 - [ ] **Step 3: Migration check on the real menu**, run before Step 2's install.
   - Before: copy `~/.local/share/applications/lantern.*.desktop` and the Plasma appletsrc
     `launchers=` line to scratch.

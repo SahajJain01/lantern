@@ -152,7 +152,7 @@ public final class Main {
                     ImeSetup.Started started;
                     try {
                         started = ImeSetup.start(linked[0] && keyboardWanted[0], changes -> Session.start(new ShellSettings(),
-                            new DevicePower(), Cleanup.spawnGuard(Droid::log), JournalStore.device(Droid::log),
+                            new DevicePower(), Cleanup.spawnGuard(Droid::log, screenOff), JournalStore.device(Droid::log),
                             changes, screenOff), Droid::log);
                     } catch (RuntimeException e) {
                         closeLink(linkRef[0]);

@@ -63,13 +63,15 @@ Start here in a new session. Read this file, then `README.md`, then the spec
 Lantern is **installed and running** on the PC from the **Plan 4a** branch build (2026-11-13; same code as `main` `08b974b`); the Plan 4b build is not installed yet (its first `build.py install` migrates the real menu):
 `~/.local/bin/lantern`, user unit `lanternd.service` (enabled). When the phone is plugged in, its
 screen turns off, the Lantern keyboard is selected, and its apps are in the KDE menu under
-**Phone**.
+**Phone**. (From the Plan 4b build on, the phone's screen stays on unless `screen_off = true` in
+settings.toml or the tray's "Turn the phone's screen off" is ticked.)
 
 ### Plan 4b device acceptance (pending: plan Task 7 Steps 2–4)
 
 Run in `.worktrees/plan4b` with Sahaj, the desktop **unlocked**. `build.py install` restarts
-lanternd from the Plan 4b build: the served phone's panel goes off and stay-awake reads 7. Ask
-first if `lantern status` shows windows he is using.
+lanternd from the Plan 4b build: stay-awake reads 7 on the served phone, and its panel stays on
+unless `screen_off = true` in settings.toml (default false). Ask first if `lantern status` shows
+windows he is using.
 
 1. **Migration check (Step 3), before the install.** Save the real menu and pins:
    ```sh
@@ -328,7 +330,8 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
   - During a session: `/data/local/tmp/lantern-session.json`, a journal of the originals of
     `stay_on_while_plugged_in`, `enabled_input_methods` and `default_input_method`. While a
     session is live, stay-awake reads 7, the keyboard is `dev.lantern.companion/.LanternIme`
-    (appended to the enabled list), and the panel is off.
+    (appended to the enabled list), and the panel stays on unless `screen_off = true` (then it
+    is off; Cleanup turns it back on only when the session turned it off).
 - Any helper or daemon death restores the phone, through the setsid Cleanup child and the persisted
   journal; the companion's watchdog is the last line for the keyboard, also after a phone reboot
   or battery death mid-session (it persists `ime_prev` in device-protected storage and arms when

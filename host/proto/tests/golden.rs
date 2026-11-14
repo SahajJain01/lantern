@@ -28,6 +28,10 @@
 //!                     Control::Hello { version: 1, token: "t", keyboard: false }
 //!                     payload = {"t":"hello","version":1,"token":"t","keyboard":false}
 //!                     (keyboard: true is omitted, so every other hello keeps its v1 bytes)
+//! control_hello_screen_on.bin : kind=Control(1), stream=0,
+//!                     Control::Hello { version: 1, token: "t", keyboard: true, screen_off: false }
+//!                     payload = {"t":"hello","version":1,"token":"t","screen_off":false}
+//!                     (the default setting: the phone's screen stays on; screen_off: true is omitted)
 //! control_locked.bin : kind=Control(1), stream=0, Control::Locked { reason: Clipboard }
 //!                     payload = {"t":"locked","reason":"clipboard"}
 //! control_unlock_result.bin : kind=Control(1), stream=0,
@@ -118,6 +122,10 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             frame_bytes(Kind::Control, 0, hello_keyboard_off().encode()),
         ),
         (
+            "control_hello_screen_on",
+            frame_bytes(Kind::Control, 0, hello_screen_on().encode()),
+        ),
+        (
             "control_locked",
             frame_bytes(Kind::Control, 0, locked().encode()),
         ),
@@ -154,6 +162,15 @@ fn hello_keyboard_off() -> Control {
         token: "t".into(),
         keyboard: false,
         screen_off: true,
+    }
+}
+
+fn hello_screen_on() -> Control {
+    Control::Hello {
+        version: 1,
+        token: "t".into(),
+        keyboard: true,
+        screen_off: false,
     }
 }
 
@@ -271,6 +288,13 @@ fn golden_files_decode() {
                     br#"{"t":"hello","version":1,"token":"t","keyboard":false}"#
                 );
                 assert_eq!(Control::decode(&f.payload).unwrap(), hello_keyboard_off());
+            }
+            "control_hello_screen_on" => {
+                assert_eq!(
+                    f.payload,
+                    br#"{"t":"hello","version":1,"token":"t","screen_off":false}"#
+                );
+                assert_eq!(Control::decode(&f.payload).unwrap(), hello_screen_on());
             }
             "control_locked" => {
                 assert_eq!(f.payload, br#"{"t":"locked","reason":"clipboard"}"#);

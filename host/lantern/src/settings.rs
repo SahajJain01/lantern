@@ -516,6 +516,26 @@ mod tests {
     }
 
     #[test]
+    fn bad_screen_off_type_uses_default() {
+        let (s, warnings) = parse("screen_off = 1\nlantern_keyboard = false\n").unwrap();
+        assert_eq!(
+            s,
+            Settings {
+                lantern_keyboard: false,
+                ..Settings::default()
+            }
+        );
+        assert!(
+            !s.screen_off,
+            "a wrong-typed screen_off leaves the screen on"
+        );
+        assert_eq!(
+            warnings,
+            vec!["screen_off must be true or false; using false".to_owned()]
+        );
+    }
+
+    #[test]
     fn unparseable_file_is_not_overwritten() {
         let dir = scratch();
         std::fs::create_dir_all(&dir).unwrap();

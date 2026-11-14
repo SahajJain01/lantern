@@ -7,6 +7,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -18,6 +19,8 @@ import java.util.function.Consumer;
  * Out-of-process restore. {@link Main} spawns {@code app_process / dev.lantern.helper.Cleanup
  * <journal-json>} with a pipe on its stdin. When the pipe hits EOF (the parent died) the journal is
  * applied; if the parent first writes {@code done\n} (clean close) it exits without acting.
+ * An optional second argument {@link #LEAVE_PANEL} means the session never turned the panel off
+ * (the user's {@code screen_off} is false), so the restore leaves the panel alone.
  * Startup handshake: once detached, prepared and holding a parsed journal, Cleanup writes
  * {@code ready\n} to its stdout pipe exactly once; the parent changes nothing until it reads it.
  *
@@ -27,6 +30,8 @@ public final class Cleanup {
     static final String DONE = "done";
     /** Written to stdout exactly once, after setsid, prepare and journal parse. */
     static final String READY = "ready";
+    /** Cleanup's optional second argument: the session left the panel on, so don't touch it. */
+    static final String LEAVE_PANEL = "--leave-panel";
 
     private Cleanup() {
     }
@@ -41,9 +46,22 @@ public final class Cleanup {
      * persisted journal is removed only after the restore succeeded.
      */
     public static void apply(Journal j, SettingsBackend s, Power p, JournalStore store, Consumer<String> log) {
+        apply(j, s, p, store, log, true);
+    }
+
+    /**
+     * As above; without {@code restorePanel} (the session never turned the panel off) the panel
+     * is left as it is and only the journal is restored.
+     */
+    public static void apply(Journal j, SettingsBackend s, Power p, JournalStore store, Consumer<String> log,
+            boolean restorePanel) {
         try {
-            p.setPanel(true);
-            log.accept("cleanup: panel on");
+            if (restorePanel) {
+                p.setPanel(true);
+                log.accept("cleanup: panel on");
+            } else {
+                log.accept("cleanup: panel left as it is (the session never turned it off)");
+            }
         } catch (RuntimeException e) {
             log.accept("cleanup: panel on failed: " + e);
         } finally {
@@ -97,7 +115,29 @@ public final class Cleanup {
 
     /** Spawns the Cleanup process; the returned guard writes {@code done} on disarm. */
     static Session.Guard spawnGuard(Consumer<String> log) {
-        return new ProcessGuard(ProcessGuard::launch, System.getenv("CLASSPATH"), READY_TIMEOUT_MS, log);
+        return spawnGuard(log, true);
+    }
+
+    /**
+     * As above; {@code restorePanel} is whether the session turns the panel off (its
+     * {@code screenOff}), so whether Cleanup turns it back on after a helper death.
+     */
+    static Session.Guard spawnGuard(Consumer<String> log, boolean restorePanel) {
+        return new ProcessGuard(ProcessGuard::launch, System.getenv("CLASSPATH"), READY_TIMEOUT_MS, restorePanel, log);
+    }
+
+    /**
+     * Cleanup's command-line arguments: {@code <journal-json> [--leave-panel]}. True to turn the
+     * panel on at restore, false with {@link #LEAVE_PANEL}, null for a bad command line.
+     */
+    static Boolean restoresPanel(String[] args) {
+        if (args.length == 1) {
+            return Boolean.TRUE;
+        }
+        if (args.length == 2 && LEAVE_PANEL.equals(args[1])) {
+            return Boolean.FALSE;
+        }
+        return null;
     }
 
     static final long READY_TIMEOUT_MS = 3000;
@@ -111,13 +151,20 @@ public final class Cleanup {
         private final Launcher launcher;
         private final String classpath;
         private final long readyTimeoutMs;
+        private final boolean restorePanel;
         private final Consumer<String> log;
         private Process process;
 
         ProcessGuard(Launcher launcher, String classpath, long readyTimeoutMs, Consumer<String> log) {
+            this(launcher, classpath, readyTimeoutMs, true, log);
+        }
+
+        ProcessGuard(Launcher launcher, String classpath, long readyTimeoutMs, boolean restorePanel,
+                Consumer<String> log) {
             this.launcher = launcher;
             this.classpath = classpath;
             this.readyTimeoutMs = readyTimeoutMs;
+            this.restorePanel = restorePanel;
             this.log = log;
         }
 
@@ -135,7 +182,12 @@ public final class Cleanup {
                 throw new IllegalStateException("CLASSPATH not set; cannot spawn Cleanup");
             }
             try {
-                process = launcher.start(Arrays.asList("app_process", "/", Cleanup.class.getName(), journalJson), classpath);
+                List<String> command = new ArrayList<>(Arrays.asList("app_process", "/", Cleanup.class.getName(),
+                    journalJson));
+                if (!restorePanel) {
+                    command.add(LEAVE_PANEL);
+                }
+                process = launcher.start(command, classpath);
             } catch (IOException e) {
                 throw new IllegalStateException("spawn Cleanup", e);
             }
@@ -209,9 +261,11 @@ public final class Cleanup {
     public static void main(String[] args) {
         Droid.detach();
         Droid.prepare();
-        if (args.length != 1) {
-            Droid.log("cleanup: usage: Cleanup <journal-json>");
+        Boolean restorePanel = restoresPanel(args);
+        if (restorePanel == null) {
+            Droid.log("cleanup: usage: Cleanup <journal-json> [" + LEAVE_PANEL + "]");
             System.exit(2);
+            return;
         }
         Journal j;
         try {
@@ -233,7 +287,8 @@ public final class Cleanup {
         }
         Droid.log("cleanup: parent died, restoring");
         try {
-            apply(j, new ShellSettings(), new DevicePower(), JournalStore.device(Droid::log), Droid::log);
+            apply(j, new ShellSettings(), new DevicePower(), JournalStore.device(Droid::log), Droid::log,
+                restorePanel);
         } catch (RuntimeException | Error e) {
             Droid.log("cleanup: restore failed: " + e);
             System.exit(1);

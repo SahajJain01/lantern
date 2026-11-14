@@ -121,6 +121,21 @@ public final class ProtoTest {
         eq(Boolean.FALSE, m.fields().get("keyboard"), "keyboard");
     }
 
+    /** hello with screen_off:false (the default setting: the phone's screen stays on). */
+    static void goldenHelloScreenOn() throws Exception {
+        Proto.Frame f = readOnly("control_hello_screen_on");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(0, f.stream, "stream");
+        eq("{\"t\":\"hello\",\"version\":1,\"token\":\"t\",\"screen_off\":false}",
+            new String(f.payload, StandardCharsets.UTF_8), "json");
+        Msg m = new TestCodec().decode(f.payload);
+        eq("hello", m.t, "t");
+        eq(1L, m.num("version"), "version");
+        eq("t", m.str("token"), "token");
+        eq(Boolean.FALSE, m.fields().get("screen_off"), "screen_off");
+        check(!m.fields().containsKey("keyboard"), "keyboard absent (true)");
+    }
+
     /** locked{reason:"clipboard"} as the helper builds it is the Rust bytes. */
     static void goldenLockedMatchesRust() throws Exception {
         Proto.Frame f = readOnly("control_locked");
@@ -325,6 +340,7 @@ public final class ProtoTest {
             {"goldenImeMatchesRust", (Case) ProtoTest::goldenImeMatchesRust},
             {"goldenAppMatchesRust", (Case) ProtoTest::goldenAppMatchesRust},
             {"goldenHelloKeyboardOff", (Case) ProtoTest::goldenHelloKeyboardOff},
+            {"goldenHelloScreenOn", (Case) ProtoTest::goldenHelloScreenOn},
             {"goldenLockedMatchesRust", (Case) ProtoTest::goldenLockedMatchesRust},
             {"goldenUnlockResultMatchesRust", (Case) ProtoTest::goldenUnlockResultMatchesRust},
             {"newTypesAndLimits", (Case) ProtoTest::newTypesAndLimits},

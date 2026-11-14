@@ -1109,29 +1109,70 @@ class Suite:
         note(f"lanternd restarted by systemd; ready: {json.dumps(rst)}")
 
     def usb_yank(self):
-        stay_on_baseline()
-        before = status()
-        pids = phone_state()["helper_pids"]
-        check(before["state"] == "ready", f"not ready before the yank: {before}")
-        input(">>> Unplug the phone's USB cable now, then press Enter ")
-        wait_until("device gone", 20, lambda: SERIAL not in sh("adb", "devices"))
-        st, _ = wait_until("daemon idle", 10, lambda: (s := status())["state"] == "idle" and s)
-        note(f"unplugged: daemon {st['state']}")
-        print(">>> Keep it unplugged for 10 s (watch the phone screen)...", flush=True)
-        time.sleep(10)
-        lit = input(">>> Is the phone's screen on now (panel restored)? [y/n] ").strip().lower()
-        check(lit.startswith("y"), "panel not restored while unplugged")
-        input(">>> Plug the phone back in, then press Enter ")
-        sh("adb", "-s", SERIAL, "wait-for-device", timeout=120)
-        log = adb("logcat", "-d", "-s", "lantern")
-        restores = [l for l in log.splitlines() if "restored" in l]
-        note(f"helper log: {restores[-1].strip() if restores else '(no restore line)'}")
-        st, secs = wait_ready(15)
-        new = phone_state()["helper_pids"]
-        note(f"fresh session {secs:.1f} s after replug; helper pids {pids} -> {new}")
-        check(set(new).isdisjoint(pids), "helper process was not replaced")
-        check(any("stay_on_while_plugged_in to " + stay_on_baseline() in l for l in restores),
-              "no stay-awake restore logged")
+        """Unplug mid-session: the phone's own Cleanup turns the panel back on and restores
+        stay-awake. Runs with `screen_off = true` in settings.toml (saved, set, lanternd
+        restarted so the session applies it; the file is restored and lanternd restarted in a
+        guarded cleanup), so the panel really is off before the yank and the restore path that
+        turns it on is the one tested."""
+        base_stay_on = stay_on_baseline()
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+
+        def restore_file():
+            if saved_file is None:
+                path.unlink(missing_ok=True)
+                note(f"removed {path} (it was absent)")
+            else:
+                path.write_bytes(saved_file)
+                note(f"restored {path}")
+
+        def restart_ready():
+            systemctl("restart", UNIT)
+            _, secs = wait_ready(15)
+            note(f"lanternd restarted with the saved settings; ready {secs:.1f} s after")
+
+        ok = False
+        try:
+            edit_settings(saved_file, "screen_off", "true")
+            systemctl("restart", UNIT)
+            _, secs = wait_ready(15)
+            panel, psecs = wait_until("panel Off with screen_off = true", 10,
+                                      lambda: (p := phone_state()["panel"]) == "Off" and p,
+                                      interval=0.3)
+            note(f"screen_off = true: ready {secs:.1f} s after the restart, panel {panel} "
+                 f"{psecs:.1f} s after")
+            before = status()
+            pids = phone_state()["helper_pids"]
+            check(before["state"] == "ready", f"not ready before the yank: {before}")
+            input(">>> Unplug the phone's USB cable now, then press Enter ")
+            wait_until("device gone", 20, lambda: SERIAL not in sh("adb", "devices"))
+            st, _ = wait_until("daemon idle", 10,
+                               lambda: (s := status())["state"] == "idle" and s)
+            note(f"unplugged: daemon {st['state']}")
+            print(">>> Keep it unplugged for 10 s (watch the phone screen)...", flush=True)
+            time.sleep(10)
+            lit = input(">>> Is the phone's screen on now (panel restored)? [y/n] ").strip().lower()
+            check(lit.startswith("y"), "panel not restored while unplugged")
+            input(">>> Plug the phone back in, then press Enter ")
+            sh("adb", "-s", SERIAL, "wait-for-device", timeout=120)
+            log = adb("logcat", "-d", "-s", "lantern")
+            restores = [l for l in log.splitlines() if "restored" in l]
+            note(f"helper log: {restores[-1].strip() if restores else '(no restore line)'}")
+            check(any("cleanup: panel on" in l for l in log.splitlines()),
+                  "no 'cleanup: panel on' in the helper log")
+            st, secs = wait_ready(15)
+            new = phone_state()["helper_pids"]
+            note(f"fresh session {secs:.1f} s after replug; helper pids {pids} -> {new}")
+            check(set(new).isdisjoint(pids), "helper process was not replaced")
+            check(any("stay_on_while_plugged_in to " + base_stay_on in l for l in restores),
+                  "no stay-awake restore logged")
+            ok = True
+        finally:
+            # The settings file first, then a session with Sahaj's own settings.
+            cleanup(ok, ("restore settings.toml", restore_file),
+                    ("restart lanternd with the saved settings", restart_ready))
 
     # --- Plan 2 ----------------------------------------------------------------------------
 

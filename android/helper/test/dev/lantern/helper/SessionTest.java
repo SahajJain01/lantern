@@ -196,6 +196,49 @@ public final class SessionTest {
         eq("[15 []]", seen.toString(), "state when guard armed");
     }
 
+    /**
+     * A session with screen_off=false never turned the panel off, so its Cleanup (helper death)
+     * must not turn it on: the guard tells the child, and the child's restore leaves the panel.
+     */
+    static void cleanupLeavesPanelTheSessionLeftOn() throws Exception {
+        FakeSettings s = new FakeSettings();
+        s.values.put(NS + "/" + KEY, "15");
+        FakePower p = new FakePower();
+        FakeChild child = new FakeChild();
+        child.say("ready\n");
+        Session session = Session.start(s, p, fakeGuard(child, 3000, false), JournalStore.none(),
+            java.util.Collections.singletonList(Session.STAY_ON), false);
+        eq(5, child.command.size(), "journal plus the leave-panel flag: " + child.command);
+        eq(session.journal().toJson(), child.command.get(3), "journal passed as arg");
+        eq(Cleanup.LEAVE_PANEL, child.command.get(4), "leave-panel flag");
+        eq(Boolean.FALSE, Cleanup.restoresPanel(child.command.subList(3, 5).toArray(new String[0])),
+            "the child reads it as: leave the panel");
+
+        // The helper dies: Cleanup restores the setting and makes no power call.
+        FakePower cp = new FakePower();
+        Cleanup.apply(session.journal(), s, cp, JournalStore.none(), msg -> { }, false);
+        eq("15", s.get(NS, KEY), "setting restored");
+        eq("[]", cp.calls.toString(), "panel left alone");
+        session.close();
+    }
+
+    /** The default guard (screen_off=true) keeps the old command line, and Cleanup turns the panel on. */
+    static void cleanupRestoresPanelTheSessionTurnedOff() throws Exception {
+        FakeChild child = new FakeChild();
+        child.say("ready\n");
+        FakeSettings s = new FakeSettings();
+        Session session = Session.start(s, new FakePower(), fakeGuard(child, 3000, true));
+        eq(4, child.command.size(), "no flag: " + child.command);
+        eq(Boolean.TRUE, Cleanup.restoresPanel(new String[] {child.command.get(3)}), "panel restored");
+        FakePower cp = new FakePower();
+        Cleanup.apply(session.journal(), s, cp, JournalStore.none(), msg -> { }, true);
+        eq("[panel(true)]", cp.calls.toString(), "panel on");
+        session.close();
+        eq(null, Cleanup.restoresPanel(new String[0]), "no journal: usage");
+        eq(null, Cleanup.restoresPanel(new String[] {"{}", "--bogus"}), "unknown flag: usage");
+        eq(null, Cleanup.restoresPanel(new String[] {"{}", Cleanup.LEAVE_PANEL, "x"}), "extra arg: usage");
+    }
+
     static void cleanupSkipsAfterDone() throws Exception {
         eq(true, Cleanup.shouldRestore(new java.io.ByteArrayInputStream(new byte[0])), "EOF restores");
         eq(true, Cleanup.shouldRestore(new java.io.ByteArrayInputStream("noise\n".getBytes())), "garbage restores");
@@ -266,10 +309,14 @@ public final class SessionTest {
     }
 
     static Cleanup.ProcessGuard fakeGuard(FakeChild child, long timeoutMs) {
+        return fakeGuard(child, timeoutMs, true);
+    }
+
+    static Cleanup.ProcessGuard fakeGuard(FakeChild child, long timeoutMs, boolean restorePanel) {
         return new Cleanup.ProcessGuard((cmd, cp) -> {
             child.command.addAll(cmd);
             return child;
-        }, "/data/local/tmp/x.jar", timeoutMs, msg -> { });
+        }, "/data/local/tmp/x.jar", timeoutMs, restorePanel, msg -> { });
     }
 
     static void armFailsWithoutReady() throws Exception {
@@ -417,6 +464,8 @@ public final class SessionTest {
             {"armFailsWithoutReady", (Case) SessionTest::armFailsWithoutReady},
             {"armFailsWhenChildDiesBeforeReady", (Case) SessionTest::armFailsWhenChildDiesBeforeReady},
             {"armProceedsAfterReady", (Case) SessionTest::armProceedsAfterReady},
+            {"cleanupLeavesPanelTheSessionLeftOn", (Case) SessionTest::cleanupLeavesPanelTheSessionLeftOn},
+            {"cleanupRestoresPanelTheSessionTurnedOff", (Case) SessionTest::cleanupRestoresPanelTheSessionTurnedOff},
             {"changesAppliedInOrderAfterArm", (Case) SessionTest::changesAppliedInOrderAfterArm},
             {"closeLeavesValueChangedDuringSession", (Case) SessionTest::closeLeavesValueChangedDuringSession},
         };
