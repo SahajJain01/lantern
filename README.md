@@ -359,8 +359,8 @@ reinstall or remove the companion with `adb uninstall dev.lantern.companion`).
 ## Acceptance test (real phone + KDE desktop)
 
 ```sh
-python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, 22–25, unattended
-python3 tools/device_test.py --manual                            # adds 8, 14, 21, 26: USB unplug, PIN, a Connect click
+python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, 22–23, unattended
+python3 tools/device_test.py --manual                            # adds 8, 14, 21, 24, 25, 26: cable pulls, PIN, a Connect click
 python3 tools/device_test.py --only 12 13                        # some items, by number or name
 python3 tools/device_test.py --nested                            # windows in a headless nested KWin
 python3 tools/device_test.py --signal=KILL                       # item 7 with SIGKILL

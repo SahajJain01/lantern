@@ -896,7 +896,7 @@ Test commands:
 - [ ] **Step 2: Acceptance run.** On the real desktop, unlocked, with the Xiaomi (two phones
   attached is fine; the preflight pins `LANTERN_SERIAL`):
   `python3 tools/build.py install && python3 tools/device_test.py`.
-  - Expected: all automatic items PASS: 1–7, 9–13, 15–20, 22–25.
+  - Expected: all automatic items PASS: 1–7, 9–13, 15–20, 22–23 (24 and 25 need a cable pull: `--manual --only 24 25`, Xiaomi only).
   - Then `python3 tools/device_test.py --manual --only 26`. Give Sahaj the step ("click Connect on
     the notification") in chat before starting it.
   - Record the summary line and timings in HANDOFF.
@@ -911,7 +911,7 @@ Test commands:
   - The Xiaomi's apps are `…-p20e9318.desktop`.
   - No `X-Lantern-Serials=` line is left.
   - `dev.lantern.Lantern.desktop` is unchanged.
-  - Kickoff shows Phone → "Xiaomi 11T Pro" and Phone → "edge 50 pro". Ask Sahaj to look, and take
+  - Kickoff shows top-level "Xiaomi 11T Pro" and "edge 50 pro" categories (no "Phone" parent; R9). Ask Sahaj to look, and take
     a screenshot.
   - List which Xiaomi pins need re-pinning (none were pinned on 2026-11-14).
 - [ ] **Step 4: Two-phone hand check** (both phones plugged in, `LANTERN_SERIAL` unset,
