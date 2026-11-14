@@ -1709,6 +1709,9 @@ struct Opts {
     timing: Option<Timing>,
     /// `$LANTERN_SERIAL`.
     configured: Option<String>,
+    /// The test reports adb's first device list itself ([`Ctl::listed`]); otherwise the online
+    /// phones are that list.
+    unlisted: bool,
 }
 
 /// A 300 ms unplug grace and a 2 s connect-and-open window.
@@ -1768,6 +1771,9 @@ fn start_ctl_opts(port: u16, online: &[&str], opts: Opts, more: impl FnOnce(&mut
     let (events, events_rx) = mpsc::unbounded_channel();
     for serial in online {
         events.send(DeviceEvent::Online((*serial).into())).unwrap();
+    }
+    if !opts.unlisted {
+        events.send(DeviceEvent::Listed).unwrap();
     }
     let events_rx = futures_util::stream::unfold(events_rx, |mut rx| async move {
         rx.recv().await.map(|event| (event, rx))
@@ -1896,6 +1902,11 @@ impl Ctl {
         self.events
             .send(DeviceEvent::Offline(serial.into()))
             .unwrap();
+    }
+
+    /// adb's device list is complete (its phones were reported with [`Ctl::online`]).
+    fn listed(&self) {
+        self.events.send(DeviceEvent::Listed).unwrap();
     }
 
     /// The view's entry for `serial` now.
@@ -2751,6 +2762,32 @@ async fn stale_live_flag_cleared_when_absent_at_start() {
     assert_eq!(ctl.event().await, plugged_in("dev", "Pixel"));
     assert_no_session(&mut helper).await;
     assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Waiting);
+    ctl.shutdown().await;
+}
+
+/// The start-up stale-`live` check waits for adb's first device list: with a zero grace, a
+/// live phone in that list (delivered after the grace has already passed) reconnects without
+/// asking.
+#[tokio::test]
+async fn live_phone_in_first_device_list_reconnects_with_zero_grace() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let state = scratch_state();
+    companion::set_live(&state, "dev", true).unwrap();
+    let mut opts = rules(&state, false);
+    opts.timing = Some(Timing {
+        unplug_grace: Duration::ZERO,
+        pending_for: Duration::from_secs(2),
+    });
+    opts.unlisted = true;
+    let mut ctl = start_ctl_opts(port, &[], opts, |_| {});
+    // adb track-devices answers a little after lanternd starts.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ctl.online("dev");
+    ctl.listed();
+    assert_eq!(helper.next_session().await, 0);
+    ctl.ready("dev").await;
+    ctl.assert_no_prompt().await;
+    assert_eq!(flags(&state, "dev"), (false, true));
     ctl.shutdown().await;
 }
 

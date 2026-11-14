@@ -256,6 +256,8 @@ pub fn stale_lantern_forwards(list: &str, serial: &str) -> Vec<String> {
 pub enum DeviceEvent {
     Online(String),
     Offline(String),
+    /// A full device list from adb has been reported (its edges come first).
+    Listed,
 }
 
 /// One `serial\tstate` entry of a track-devices device list.
@@ -400,6 +402,7 @@ pub fn track_devices_with(program: impl Into<OsString>) -> impl Stream<Item = De
                                 for event in tracker.update(&list) {
                                     yield event;
                                 }
+                                yield DeviceEvent::Listed;
                             }
                         }
                     }

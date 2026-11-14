@@ -532,7 +532,10 @@ where
     };
     hub.set_configured(configured.clone());
     let configured = configured.as_deref();
-    // Records with a stale `live` flag are cleared once the grace after start has passed.
+    // Records with a stale `live` flag are cleared once the grace after start has passed, but
+    // never before adb's first device list has been handled (`listed`): a phone that list
+    // reports must not lose its flag to a slow adb.
+    let mut listed = false;
     let mut startup = state_dir
         .as_ref()
         .map(|_| Instant::now() + timing.unplug_grace);
@@ -801,6 +804,12 @@ where
                             leaving.insert(serial, Instant::now() + timing.unplug_grace);
                         }
                     }
+                    DeviceEvent::Listed => {
+                        if !listed {
+                            tracing::debug!("first device list handled");
+                            listed = true;
+                        }
+                    }
                 }
             }
             _ = tokio::time::sleep_until(wake), if idle && retry_at.is_some() => {
@@ -833,7 +842,7 @@ where
                     prompts.send(ConnectEvent::Gone { serial });
                 }
             }
-            _ = tokio::time::sleep_until(startup_end), if startup.is_some() => {
+            _ = tokio::time::sleep_until(startup_end), if listed && startup.is_some() => {
                 startup = None;
                 for serial in table.known.clone() {
                     if table.plugged(&serial) || wanted.as_deref() == Some(serial.as_str()) {

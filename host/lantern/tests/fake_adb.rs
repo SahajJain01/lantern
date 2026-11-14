@@ -368,6 +368,27 @@ async fn flapping_track_devices_backs_off() {
     );
 }
 
+/// Each full device list ends with `Listed`, after its edges: lanternd's start-up check waits
+/// for the first one.
+#[tokio::test]
+async fn track_devices_marks_each_list() {
+    use futures_util::StreamExt;
+    use lantern::adb::{track_devices_with, DeviceEvent};
+
+    let fake = FakeAdb::with_script("flap", "adb-flap", "0");
+    let events = track_devices_with(&fake.program);
+    tokio::pin!(events);
+    let first: Vec<DeviceEvent> = tokio::time::timeout(Duration::from_secs(5), async {
+        vec![events.next().await.unwrap(), events.next().await.unwrap()]
+    })
+    .await
+    .expect("track-devices events");
+    assert_eq!(
+        first,
+        [DeviceEvent::Online("dev".into()), DeviceEvent::Listed]
+    );
+}
+
 fn position(calls: &[String], pred: impl Fn(&str) -> bool) -> Option<usize> {
     calls.iter().position(|c| pred(c))
 }

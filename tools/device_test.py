@@ -196,6 +196,18 @@ def systemctl(*args, check_rc=True):
     return sh("systemctl", "--user", *args, timeout=60, check_rc=check_rc)
 
 
+def wait_daemon(timeout=10):
+    """Waits until lanternd answers `lantern status` (its socket is up), whatever it serves."""
+    st, _ = wait_until("lanternd answering", timeout, status)
+    return st
+
+
+def lantern_connect_when_up(serial=None):
+    """`lantern connect` once lanternd answers: a cleanup step right after a restart."""
+    wait_daemon(10)
+    return lantern_cmd("connect", serial or SERIAL)
+
+
 def wait_ready(timeout=10):
     """Waits until lanternd serves SERIAL's phone."""
     st, secs = wait_until("daemon ready", timeout,
@@ -519,13 +531,20 @@ def read_stay_on_baseline():
 
 
 def baseline():
-    """The phone's own values a session must restore: {stay_on, ime, imes}."""
+    """The phone's own values a session must restore: {stay_on, ime, imes}. Read once, with
+    lanternd stopped (then started again); take it at an item's start, while the suite's phone
+    is served. lanternd must answer again; a phone it doesn't serve (switched off, waiting, a
+    lifted LANTERN_SERIAL) is noted, not a failure: the item checks what it needs."""
     if STAY_ON_RESTORED is None or IME_RESTORED is None:
         try:
             read_stay_on_baseline()
         finally:
             systemctl("start", UNIT)
-        wait_ready(15)
+        wait_daemon(15)
+        try:
+            wait_ready(15)
+        except Fail as e:
+            note(f"after the baseline lanternd answers but does not serve {SERIAL}: {e}")
     return {"stay_on": str(STAY_ON_RESTORED), "ime": IME_RESTORED, "imes": IMES_RESTORED}
 
 
@@ -1563,7 +1582,7 @@ class Suite:
         finally:
             # 4. Leave lanternd ready, whatever failed.
             if not connected:
-                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect", SERIAL)),
+                cleanup(False, ("lantern connect", lambda: lantern_connect_when_up()),
                         ("lanternd ready", lambda: wait_ready(15)))
 
 
@@ -1619,7 +1638,7 @@ class Suite:
             note(f"ready {secs:.1f} s after the tray's second click")
         finally:
             if not connected:
-                cleanup(False, ("lantern connect", lambda: lantern_cmd("connect", SERIAL)),
+                cleanup(False, ("lantern connect", lambda: lantern_connect_when_up()),
                         ("lanternd ready", lambda: wait_ready(15)))
         shot = LOG_DIR / "tray.png"
         r = subprocess.run(["spectacle", "-b", "-n", "-o", str(shot)], capture_output=True,
@@ -1874,6 +1893,9 @@ class Suite:
         it back on, and a replug then reconnects it by itself. Refused while another phone is
         attached."""
         only_this_phone("24")
+        # The originals now, while the suite's phone is served: read later (inside restored())
+        # it would stop and start lanternd with the phone switched off.
+        baseline()
         path = settings_file()
         saved_file = path.read_bytes() if path.exists() else None
         note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
@@ -1931,14 +1953,15 @@ class Suite:
             ok = True
         finally:
             # 7. The file, then the environment (restarts lanternd); lanternd left ready. A
-            # failure in 3-5 may have left the phone off: connect it again (wait_ready alone
-            # passes through LANTERN_SERIAL, which ignores the off flag).
+            # failure in 3-5 may have left the phone off: connect it again once the restarted
+            # lanternd answers (wait_ready alone passes through LANTERN_SERIAL, which ignores
+            # the off flag).
             steps = [("restore settings.toml", restore_file)]
             if entered:
                 steps.append(("restore lanternd's environment",
                               lambda: env.__exit__(None if ok else Fail, None, None)))
             if not ok:
-                steps.append(("lantern connect", lambda: lantern_cmd("connect", SERIAL)))
+                steps.append(("lantern connect", lambda: lantern_connect_when_up()))
             steps.append(("lanternd ready", lambda: wait_ready(20)))
             cleanup(ok, *steps)
 
@@ -1949,6 +1972,7 @@ class Suite:
         replug then asks: a Notify "<phone> is plugged in" within 5 s, the phone waiting and
         restored; clicking its tray row connects it. Refused while another phone is attached."""
         only_this_phone("25")
+        baseline()  # the originals now, while the suite's phone is served (see item 24)
         path = settings_file()
         saved_file = path.read_bytes() if path.exists() else None
         note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
@@ -2006,7 +2030,7 @@ class Suite:
                     steps.append(("restore lanternd's environment",
                                   lambda: env.__exit__(None if ok else Fail, None, None)))
                 if not ok:
-                    steps.append(("lantern connect", lambda: lantern_cmd("connect", SERIAL)))
+                    steps.append(("lantern connect", lambda: lantern_connect_when_up()))
                 steps.append(("lanternd ready", lambda: wait_ready(20)))
                 cleanup(ok, *steps)
 
@@ -2020,6 +2044,7 @@ class Suite:
         window is closed through KWin. Refused while another phone is attached."""
         check(not NESTED, "item 26 needs the real desktop: lanternd opens the window there")
         only_this_phone("26")
+        baseline()  # the originals now, while the suite's phone is served (see item 24)
         path = settings_file()
         saved_file = path.read_bytes() if path.exists() else None
         note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
@@ -2095,7 +2120,7 @@ class Suite:
                     steps.append(("restore lanternd's environment",
                                   lambda: env.__exit__(None if ok else Fail, None, None)))
                 if not ok:
-                    steps.append(("lantern connect", lambda: lantern_cmd("connect", SERIAL)))
+                    steps.append(("lantern connect", lambda: lantern_connect_when_up()))
                 steps.append(("lanternd ready", lambda: wait_ready(20)))
                 cleanup(ok, *steps)
 
