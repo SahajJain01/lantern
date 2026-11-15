@@ -18,7 +18,8 @@ use tokio::time::Instant;
 
 /// The main fake. Per-test files (all in the symlink's directory): `calls.log` (every
 /// invocation's args), `helper.pid` (pid of the fake helper), `forwards` (`forward --list`
-/// output), `forward_delay` (seconds `forward` sleeps), `helpers` (pids `pgrep` reports) and
+/// output), `forward_delay` (seconds `forward` sleeps), `forward_port` (the port `forward tcp:0`
+/// prints, as adb does; a free port by default), `helpers` (pids `pgrep` reports) and
 /// `polls` (after that many `pgrep`s the helpers are gone; absent = never).
 ///
 /// Phone name files: `device_name` (`settings get global device_name`; absent = `null`) and
@@ -88,6 +89,7 @@ case "$1" in
   forward)
     if [ "$2" = --list ]; then cat "$d/forwards" 2>/dev/null; exit 0; fi
     if [ "$2" != --remove ]; then sleep "$(cat "$d/forward_delay" 2>/dev/null || echo 0)"; fi
+    if [ "$2" = tcp:0 ]; then cat "$d/forward_port"; echo; fi
     exit 0 ;;
 esac
 exit 0
@@ -151,6 +153,11 @@ impl FakeAdb {
         let program = dir.join("adb");
         std::os::unix::fs::symlink(shared.join(script), &program).unwrap();
         std::fs::write(dir.join("forward_delay"), forward_delay).unwrap();
+        // A port nothing listens on (as adb's choice would be, with no helper behind it).
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        std::fs::write(dir.join("forward_port"), port.to_string()).unwrap();
         Self {
             log: dir.join("calls.log"),
             pidfile: dir.join("helper.pid"),
@@ -205,12 +212,19 @@ async fn wait_dead(pid: u32) {
     }
 }
 
-fn forward_port(calls: &[String]) -> String {
-    let line = calls
-        .iter()
-        .find(|c| c.starts_with("-s fake-serial forward tcp:"))
-        .expect("forward was never created");
-    line.split_whitespace().nth(3).unwrap().to_owned()
+impl FakeAdb {
+    /// `tcp:<port>` of the forward adb reported creating (`forward tcp:0`); panics if `start`
+    /// never asked for one.
+    fn forward_port(&self, calls: &[String]) -> String {
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("-s fake-serial forward tcp:0 ")),
+            "forward was never created: {calls:#?}"
+        );
+        let port = std::fs::read_to_string(self.dir.join("forward_port")).unwrap();
+        format!("tcp:{}", port.trim())
+    }
 }
 
 fn has_forward(calls: &[String]) -> bool {
@@ -250,7 +264,7 @@ async fn cancelled_start_removes_forward_and_kills_helper() {
     // cancel it there (shortly after the forward call), as SIGINT would.
     cancel_start_after_forward(&fake, Duration::from_millis(200)).await;
     let calls = fake.calls();
-    let port = forward_port(&calls);
+    let port = fake.forward_port(&calls);
     assert!(
         calls.contains(&format!("-s fake-serial forward --remove {port}")),
         "forward not removed after cancel: {calls:#?}"
@@ -258,16 +272,17 @@ async fn cancelled_start_removes_forward_and_kills_helper() {
     wait_dead(fake.helper_pid()).await;
 }
 
+/// Cancelled mid-`adb forward tcp:0`, the port adb chose is unknown: nothing is removed by
+/// port (the next start's stale-forward sweep takes it), and the helper still dies.
 #[tokio::test]
-async fn cancel_while_adb_forward_runs_still_removes_it() {
+async fn cancel_while_adb_forward_runs_kills_the_helper() {
     let fake = FakeAdb::new("forwarding", "30");
     // The fake logs the call before sleeping 30 s, so this cancels mid-`adb forward`.
     cancel_start_after_forward(&fake, Duration::ZERO).await;
     let calls = fake.calls();
-    let port = forward_port(&calls);
     assert!(
-        calls.contains(&format!("-s fake-serial forward --remove {port}")),
-        "in-flight forward not removed after cancel: {calls:#?}"
+        !calls.iter().any(|c| c.contains("forward --remove tcp:")),
+        "removed a port adb never reported: {calls:#?}"
     );
     wait_dead(fake.helper_pid()).await;
 }
@@ -286,7 +301,7 @@ async fn failed_start_cleans_up_too() {
     );
     assert!(t0.elapsed() < Duration::from_secs(5));
     let calls = fake.calls();
-    let port = forward_port(&calls);
+    let port = fake.forward_port(&calls);
     assert!(calls.contains(&format!("-s fake-serial forward --remove {port}")));
     wait_dead(fake.helper_pid()).await;
 }
@@ -328,6 +343,38 @@ async fn start_removes_stale_lantern_forwards_of_its_serial() {
     assert!(
         stale_1.unwrap() < created && stale_4.unwrap() < created,
         "{calls:#?}"
+    );
+    wait_dead(fake.helper_pid()).await;
+}
+
+/// adb picks the local port (`forward tcp:0`, printing it): the session connects to that port,
+/// not one it guessed. The fake answers with the port of a listener this test holds.
+#[tokio::test]
+async fn start_uses_the_port_adb_chose() {
+    let fake = FakeAdb::new("chosen", "0");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::fs::write(fake.dir.join("forward_port"), port.to_string()).unwrap();
+    let accepted = tokio::spawn(async move { listener.accept().await.is_ok() });
+    // No helper speaks behind the listener, so the handshake fails; the connect is the point.
+    let _ = tokio::time::timeout(Duration::from_secs(10), start(&fake.adb(), true, true)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), accepted)
+            .await
+            .expect("the session never connected to adb's port")
+            .unwrap(),
+        "accept failed"
+    );
+    let calls = fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("-s fake-serial forward tcp:0 localabstract:lantern-")),
+        "{calls:#?}"
+    );
+    assert!(
+        calls.contains(&format!("-s fake-serial forward --remove tcp:{port}")),
+        "adb's port not removed: {calls:#?}"
     );
     wait_dead(fake.helper_pid()).await;
 }

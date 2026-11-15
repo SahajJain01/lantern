@@ -677,10 +677,11 @@ impl Hub {
         }
     }
 
-    /// `app`/`apps_end`/`app_removed` from the helper. Catalogue file writes are small and
-    /// synchronous; kbuildsycoca6 runs off this loop.
+    /// `app`/`apps_end`/`app_removed` from the helper of the session's phone. Catalogue file
+    /// writes are small and synchronous; kbuildsycoca6 runs off this loop.
     fn on_catalogue(&mut self, c: Control) {
-        let Some(catalog) = self.catalog.as_mut() else {
+        let (Some(catalog), Some(serial)) = (self.catalog.as_mut(), self.session.1.as_deref())
+        else {
             return;
         };
         match c {
@@ -692,7 +693,7 @@ impl Hub {
                 icon,
             } => {
                 let entry = AppEntry::from_message(pkg, user, label, work, &icon);
-                if let Err(error) = catalog.upsert(&entry) {
+                if let Err(error) = catalog.upsert(serial, &entry) {
                     tracing::warn!(
                         pkg = entry.pkg,
                         user,
@@ -702,7 +703,7 @@ impl Hub {
                 }
             }
             Control::AppRemoved { pkg, user } => {
-                if let Err(error) = catalog.remove(&pkg, user) {
+                if let Err(error) = catalog.remove(serial, &pkg, user) {
                     tracing::warn!(
                         pkg,
                         user,
@@ -712,7 +713,7 @@ impl Hub {
                 }
             }
             // `end_sync` also opens the next window (a companion relink, a profile change).
-            Control::AppsEnd { count } => match catalog.end_sync(count) {
+            Control::AppsEnd { count } => match catalog.end_sync(serial, count) {
                 Ok(removed) => tracing::info!(count, removed, "catalogue synced"),
                 Err(error) => {
                     tracing::warn!(error = format!("{error:#}"), "catalogue prune failed")
@@ -1130,7 +1131,7 @@ impl Hub {
         let (Some(catalog), Some(serial)) = (&self.catalog, &self.session.1) else {
             return false;
         };
-        if !catalog.synced() {
+        if !catalog.synced(serial) {
             return false;
         }
         let phones = catalog.phones(pkg, user);
@@ -1284,6 +1285,10 @@ impl Hub {
         self.opened.clear();
         // The blocked opens of this phone wait for its next unlock; any other phone's go.
         let serial = self.serial().map(str::to_owned);
+        // Its catalogue sync window closes with the session.
+        if let (Some(catalog), Some(serial)) = (self.catalog.as_mut(), serial.as_deref()) {
+            catalog.end_session(serial);
+        }
         self.reopens.retain(|(s, ..)| Some(s) == serial.as_ref());
         // The stretch ends with the session.
         if std::mem::take(&mut self.locked) {

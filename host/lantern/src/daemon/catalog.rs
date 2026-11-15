@@ -363,6 +363,8 @@ struct Owned {
     name: Option<String>,
     /// `Name=` as written.
     raw_name: Option<String>,
+    /// `Categories=` as written.
+    categories: Option<String>,
 }
 
 impl Owned {
@@ -421,6 +423,7 @@ fn read_owned(path: &Path) -> Result<Option<Owned>> {
         user: value(&text, "X-Lantern-User").and_then(|u| u.parse().ok()),
         name: raw_name.as_deref().map(unescape_value),
         raw_name,
+        categories: value(&text, "Categories").map(str::to_owned),
     }))
 }
 
@@ -778,18 +781,13 @@ pub fn run_kbuildsycoca() {
 
 const REBUILD_DELAY: Duration = Duration::from_secs(1);
 
-/// The menu entries of the phones' launcher apps. See the module docs.
-pub struct Catalog {
-    dirs: Dirs,
-    /// Which phone keeps the legacy names (from `menu.json`).
-    naming: Naming,
-    /// Folder names (else each folder keeps its own, else the serial).
-    names: Option<Names>,
-    /// The phone of the live session; the sync window belongs to it.
-    serial: Option<String>,
-    /// The session's phone shares its tag with another phone that has entries: it gets none.
+/// One phone's catalogue sync window: the state between its `start_session` (or its last
+/// `end_sync`) and the next `end_sync`.
+#[derive(Debug, Default)]
+struct PhoneSync {
+    /// The phone shares its tag with another phone that has entries: it gets none.
     blocked: bool,
-    /// The menu has been brought up to date since the session's first entry was written.
+    /// The menu has been brought up to date since this phone's first entry was written.
     menu_ok: bool,
     /// A full sync whose count matched has ended since `start_session`.
     synced: bool,
@@ -799,6 +797,17 @@ pub struct Catalog {
     users: HashSet<u32>,
     /// (pkg, user) upserted in this window.
     keep: HashSet<(String, u32)>,
+}
+
+/// The menu entries of the phones' launcher apps. See the module docs.
+pub struct Catalog {
+    dirs: Dirs,
+    /// Which phone keeps the legacy names (from `menu.json`).
+    naming: Naming,
+    /// Folder names (else each folder keeps its own, else the serial).
+    names: Option<Names>,
+    /// One sync window per phone with a live session.
+    phones: HashMap<String, PhoneSync>,
     rebuild: Rebuilder,
 }
 
@@ -815,13 +824,7 @@ impl Catalog {
             naming: Naming::load(&dirs.state),
             dirs,
             names: None,
-            serial: None,
-            blocked: false,
-            menu_ok: false,
-            synced: false,
-            seen: 0,
-            users: HashSet::new(),
-            keep: HashSet::new(),
+            phones: HashMap::new(),
             rebuild: Rebuilder::spawn(rebuild, REBUILD_DELAY),
         }
     }
@@ -836,8 +839,9 @@ impl Catalog {
     }
 
     /// A session with `serial` is up: it becomes the primary phone if there is none yet
-    /// (recorded in `menu.json`), its first sync window opens, [`Self::synced`] is false until a
-    /// full catalogue from it arrives, and the menu is rewritten (its name may have changed).
+    /// (recorded in `menu.json`), its sync window opens (a fresh one if it was open), its
+    /// [`Self::synced`] is false until a full catalogue from it arrives, and the menu is
+    /// rewritten (its name may have changed). Other phones' windows go on.
     pub fn start_session(&mut self, serial: &str) {
         if self.naming.primary.is_none() {
             self.naming.primary = Some(serial.to_owned());
@@ -850,21 +854,30 @@ impl Catalog {
                 ),
             }
         }
-        self.serial = Some(serial.to_owned());
-        self.synced = false;
-        self.seen = 0;
-        self.users.clear();
-        self.keep.clear();
-        self.menu_ok = false;
-        self.blocked = self.tag_taken(serial);
-        if self.blocked {
+        let blocked = self.tag_taken(serial);
+        if blocked {
             tracing::warn!(
                 serial,
                 tag = naming::tag(serial),
                 "another phone's menu entries use this phone's tag; its apps get no menu entries"
             );
         }
+        self.phones.insert(
+            serial.to_owned(),
+            PhoneSync {
+                blocked,
+                ..PhoneSync::default()
+            },
+        );
         self.refresh_menu();
+    }
+
+    /// `serial`'s session ended: its sync window goes (its entries stay). Later catalogue
+    /// messages for it are ignored until its next [`Self::start_session`].
+    pub fn end_session(&mut self, serial: &str) {
+        if self.phones.remove(serial).is_some() {
+            tracing::debug!(serial, "catalogue sync window closed");
+        }
     }
 
     /// Whether another phone that has entries (or a folder) uses `serial`'s tag.
@@ -915,9 +928,10 @@ impl Catalog {
         }
     }
 
-    /// True once an `end_sync` whose count matched has run since [`Self::start_session`].
-    pub fn synced(&self) -> bool {
-        self.synced
+    /// True once an `end_sync` of `serial` whose count matched has run since its
+    /// [`Self::start_session`].
+    pub fn synced(&self, serial: &str) -> bool {
+        self.phones.get(serial).is_some_and(|p| p.synced)
     }
 
     /// The phones that have `pkg` for `user`; see [`phones_with`].
@@ -925,31 +939,41 @@ impl Catalog {
         phones_with(&self.dirs, pkg, user)
     }
 
-    fn session_serial(&self) -> Result<String> {
-        self.serial
-            .clone()
-            .context("no phone session (start_session first)")
-    }
-
-    /// Writes (or refreshes) `e`'s icon and the session phone's menu entry, then the menu.
-    /// Counts toward the sync window even when it fails, since the phone counted it.
-    pub fn upsert(&mut self, e: &AppEntry) -> Result<()> {
-        self.seen = self.seen.saturating_add(1);
-        check_pkg(&e.pkg)?;
-        check_user(e.user)?;
-        self.users.insert(e.user);
-        self.keep.insert((e.pkg.clone(), e.user));
-        let serial = self.session_serial()?;
-        if self.blocked {
-            bail!(
-                "phone {serial:?} shares the menu tag {:?} with another phone; no entry",
-                naming::tag(&serial)
+    /// `serial`'s open sync window; `None` (logged) when it has none.
+    fn window(&mut self, serial: &str, what: &str) -> Option<&mut PhoneSync> {
+        let window = self.phones.get_mut(serial);
+        if window.is_none() {
+            tracing::info!(
+                serial,
+                what,
+                "no catalogue sync open for this phone; ignored"
             );
         }
-        let stem = self.naming.app_id(&e.pkg, e.user, &serial);
+        window
+    }
+
+    /// Writes (or refreshes) `e`'s icon and `serial`'s menu entry, then the menu. Counts
+    /// toward the phone's sync window even when it fails, since the phone counted it. A phone
+    /// with no open window is ignored (`Ok`).
+    pub fn upsert(&mut self, serial: &str, e: &AppEntry) -> Result<()> {
+        let Some(window) = self.window(serial, "app") else {
+            return Ok(());
+        };
+        window.seen = window.seen.saturating_add(1);
+        check_pkg(&e.pkg)?;
+        check_user(e.user)?;
+        window.users.insert(e.user);
+        window.keep.insert((e.pkg.clone(), e.user));
+        if window.blocked {
+            bail!(
+                "phone {serial:?} shares the menu tag {:?} with another phone; no entry",
+                naming::tag(serial)
+            );
+        }
+        let stem = self.naming.app_id(&e.pkg, e.user, serial);
         let path = self.dirs.entry_path(&stem);
         match read_owned(&path)? {
-            Some(owned) if !owned.is_only(&serial) => bail!(
+            Some(owned) if !owned.is_only(serial) => bail!(
                 "{} is another phone's entry; leaving it alone",
                 path.display()
             ),
@@ -968,13 +992,16 @@ impl Catalog {
             changed |= remove_file(&icon_path)?;
             None
         };
-        let text = desktop_file(e, &serial, &self.naming, &self.dirs.exe, icon);
+        let text = desktop_file(e, serial, &self.naming, &self.dirs.exe, icon);
         changed |= write_if_changed(&path, text.as_bytes())?;
         // The entry first, then the menu that shows it.
-        if !self.menu_ok {
+        let menu_ok = self.phones.get(serial).is_some_and(|p| p.menu_ok);
+        if !menu_ok {
             if let Some(menu) = self.update_menu() {
                 changed |= menu;
-                self.menu_ok = true;
+                if let Some(window) = self.phones.get_mut(serial) {
+                    window.menu_ok = true;
+                }
             }
         }
         if changed {
@@ -983,18 +1010,19 @@ impl Catalog {
         Ok(())
     }
 
-    /// The session's phone no longer has `pkg` for `user`: its entry and icon go (a no-op if
-    /// there is none or it is not that phone's own), and with it the phone's folder once empty.
-    pub fn remove(&mut self, pkg: &str, user: u32) -> Result<()> {
-        self.seen = self.seen.saturating_add(1);
+    /// `serial` no longer has `pkg` for `user`: its entry and icon go (a no-op if there is
+    /// none or it is not that phone's own), and with it the phone's folder once empty. A phone
+    /// with no open window is ignored (`Ok`).
+    pub fn remove(&mut self, serial: &str, pkg: &str, user: u32) -> Result<()> {
+        let Some(window) = self.window(serial, "app_removed") else {
+            return Ok(());
+        };
+        window.seen = window.seen.saturating_add(1);
         check_pkg(pkg)?;
         check_user(user)?;
-        self.keep.remove(&(pkg.to_owned(), user));
-        let serial = self.session_serial()?;
-        let path = self
-            .dirs
-            .entry_path(&self.naming.app_id(pkg, user, &serial));
-        if read_owned(&path)?.is_some_and(|o| o.is_only(&serial)) {
+        window.keep.remove(&(pkg.to_owned(), user));
+        let path = self.dirs.entry_path(&self.naming.app_id(pkg, user, serial));
+        if read_owned(&path)?.is_some_and(|o| o.is_only(serial)) {
             remove_entry(&self.dirs, &path)?;
             self.update_menu();
             self.rebuild.changed();
@@ -1002,26 +1030,29 @@ impl Catalog {
         Ok(())
     }
 
-    /// Ends the sync window and opens the next one (a companion relink or a profile change
-    /// sends another full catalogue). If `count` matches what arrived, every entry of the
-    /// session's phone for a user that appeared but did not send that app goes. Returns how
-    /// many entries went.
-    pub fn end_sync(&mut self, count: u32) -> Result<usize> {
-        let seen = self.seen;
-        let users = std::mem::take(&mut self.users);
-        let keep = std::mem::take(&mut self.keep);
-        self.seen = 0;
-        let Some(serial) = self.serial.clone() else {
+    /// Ends `serial`'s sync window and opens its next one (a companion relink or a profile
+    /// change sends another full catalogue). If `count` matches what arrived from that phone,
+    /// every entry of it for a user that appeared but did not send that app goes; no other
+    /// phone's entry is touched. Returns how many entries went. A phone with no open window is
+    /// ignored (`Ok(0)`).
+    pub fn end_sync(&mut self, serial: &str, count: u32) -> Result<usize> {
+        let Some(window) = self.window(serial, "apps_end") else {
             return Ok(0);
         };
+        let seen = std::mem::take(&mut window.seen);
+        let users = std::mem::take(&mut window.users);
+        let keep = std::mem::take(&mut window.keep);
         if count != seen {
-            tracing::info!("partial catalogue (got {seen} of {count}); not pruning");
+            tracing::info!(
+                serial,
+                "partial catalogue (got {seen} of {count}); not pruning"
+            );
             return Ok(0);
         }
-        self.synced = true;
+        window.synced = true;
         let mut removed = 0;
         for (path, owned) in owned_entries(&self.dirs)? {
-            if !owned.is_only(&serial) {
+            if !owned.is_only(serial) {
                 continue;
             }
             let stale = owned.app().is_some_and(|(pkg, user)| {
@@ -1091,11 +1122,29 @@ pub struct Migration {
     pub removed: usize,
 }
 
-/// The phone that keeps the legacy names (decision 1): the most legacy entries pinned in
-/// Plasma (`pins`: the `launchers=` lines of `plasma-org.kde.plasma.desktop-appletsrc`, each
+/// The phone that keeps the legacy names (decision 1). `owners` are (stem, serial) of the files
+/// already in the per-phone format at an unsuffixed (primary) name: when there are any, the
+/// phone with the most of them is the primary already (a rerun after `menu.json` was lost),
+/// ties to the smallest serial. Otherwise: the most legacy entries pinned in Plasma (`pins`:
+/// the `launchers=` lines of `plasma-org.kde.plasma.desktop-appletsrc`, each
 /// `applications:<stem>.desktop` counting for every phone of that entry), then the most
 /// entries, then the smallest serial. `legacy` is (stem, phones) per entry.
-pub fn choose_primary(legacy: &[(String, Vec<String>)], pins: Option<&str>) -> Option<String> {
+pub fn choose_primary(
+    legacy: &[(String, Vec<String>)],
+    pins: Option<&str>,
+    owners: &[(String, String)],
+) -> Option<String> {
+    let mut owned: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, serial) in owners {
+        *owned.entry(serial.as_str()).or_default() += 1;
+    }
+    // Most owned files; on a tie the smallest serial (the first of the sorted map).
+    if let Some((serial, _)) = owned
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+    {
+        return Some(serial.to_owned());
+    }
     let mut pinned: HashMap<&str, usize> = HashMap::new();
     for item in pins
         .unwrap_or("")
@@ -1132,7 +1181,8 @@ pub fn choose_primary(legacy: &[(String, Vec<String>)], pins: Option<&str>) -> O
 /// 1. Lantern's `lantern.*.desktop` files (with `X-Lantern-Serial=`) are listed; their phones
 ///    are `X-Lantern-Serials`, else `[X-Lantern-Serial]`. One without a valid package/user is
 ///    left as it is.
-/// 2. The primary is [`choose_primary`] over them.
+/// 2. The primary is [`choose_primary`] over them; files already in the per-phone format at an
+///    unsuffixed name (a run whose `menu.json` was lost) name it first.
 /// 3. For each file and each of its phones the per-phone entry is written (`Name` verbatim, the
 ///    icon copied to the new name), the old file itself last when it is a target; then the old
 ///    file and icon go unless one is a target. A target that is someone else's file keeps the
@@ -1173,7 +1223,19 @@ pub fn migrate(dirs: &Dirs, pins: Option<&str>) -> Result<Migration> {
         .iter()
         .map(|((pkg, user), serials)| (app_id(pkg, *user), serials.iter().cloned().collect()))
         .collect();
-    let primary = choose_primary(&legacy, pins);
+    // Files a run already wrote at the primary's (unsuffixed) names: they name the primary even
+    // when `menu.json` (and the pins) are gone.
+    let owners: Vec<(String, String)> = files
+        .iter()
+        .filter(|(path, owned, pkg, user)| {
+            !owned.shared
+                && stem_of(path) == app_id(pkg, *user)
+                && owned.categories.as_deref()
+                    == Some(format!("{};", naming::category(&owned.serial)).as_str())
+        })
+        .map(|(path, owned, _, _)| (stem_of(path), owned.serial.clone()))
+        .collect();
+    let primary = choose_primary(&legacy, pins, &owners);
     let naming = Naming {
         primary: primary.clone(),
     };
@@ -1467,9 +1529,9 @@ mod tests {
     fn full_sync(cat: &mut Catalog, serial: &str, apps: &[(&str, u32)]) -> usize {
         cat.start_session(serial);
         for (pkg, user) in apps {
-            cat.upsert(&entry(pkg, *user)).unwrap();
+            cat.upsert(serial, &entry(pkg, *user)).unwrap();
         }
-        cat.end_sync(apps.len() as u32).unwrap()
+        cat.end_sync(serial, apps.len() as u32).unwrap()
     }
 
     fn set_mtime(path: &Path, t: SystemTime) {
@@ -1669,16 +1731,16 @@ mod tests {
         let sb = file(&dirs, "lantern.com.s-pB");
         let (mut cat, _) = quiet(dirs.clone());
         cat.start_session("A");
-        cat.upsert(&entry("com.s", 0)).unwrap();
+        cat.upsert("A", &entry("com.s", 0)).unwrap();
         cat.start_session("B");
-        cat.upsert(&entry("com.s", 0)).unwrap();
-        cat.remove("com.s", 0).unwrap();
+        cat.upsert("B", &entry("com.s", 0)).unwrap();
+        cat.remove("B", "com.s", 0).unwrap();
         assert!(s.exists() && s_icon.exists() && !sb.exists());
         // B no longer has it: removing it again changes nothing.
-        cat.remove("com.s", 0).unwrap();
+        cat.remove("B", "com.s", 0).unwrap();
         assert_eq!(cat.phones("com.s", 0), ["A"]);
         cat.start_session("A");
-        cat.remove("com.s", 0).unwrap();
+        cat.remove("A", "com.s", 0).unwrap();
         assert!(!s.exists() && !s_icon.exists());
     }
 
@@ -1723,21 +1785,21 @@ mod tests {
         cat.start_session("B");
         assert_eq!(Naming::load(&dirs.state).primary.as_deref(), Some("B"));
         assert!(Naming::migrated(&dirs.state));
-        cat.upsert(&entry("com.s", 0)).unwrap();
+        cat.upsert("B", &entry("com.s", 0)).unwrap();
         assert!(
             file(&dirs, "lantern.com.s").exists(),
             "the primary keeps legacy names"
         );
         // A later phone does not take it over.
         cat.start_session("A");
-        cat.upsert(&entry("com.s", 0)).unwrap();
+        cat.upsert("A", &entry("com.s", 0)).unwrap();
         assert_eq!(Naming::load(&dirs.state).primary.as_deref(), Some("B"));
         assert!(file(&dirs, "lantern.com.s-pA").exists());
         // A new catalogue reads it back.
         drop(cat);
         let (mut cat, _) = quiet(dirs.clone());
         cat.start_session("A");
-        cat.upsert(&entry("com.t", 0)).unwrap();
+        cat.upsert("A", &entry("com.t", 0)).unwrap();
         assert!(file(&dirs, "lantern.com.t-pA").exists());
     }
 
@@ -1750,10 +1812,10 @@ mod tests {
         full_sync(&mut cat, "B", &[("com.b", 0), ("com.c", 0)]);
         assert!(folder(&dirs, "B").exists());
         cat.start_session("B");
-        cat.remove("com.b", 0).unwrap();
+        cat.remove("B", "com.b", 0).unwrap();
         assert!(folder(&dirs, "B").exists());
         assert!(read(&menu(&dirs)).contains(&submenu("B")));
-        cat.remove("com.c", 0).unwrap();
+        cat.remove("B", "com.c", 0).unwrap();
         assert!(!folder(&dirs, "B").exists());
         let m = read(&menu(&dirs));
         assert!(
@@ -1768,7 +1830,7 @@ mod tests {
             "an empty sync names no user"
         );
         cat.start_session("A");
-        cat.remove("com.a", 0).unwrap();
+        cat.remove("A", "com.a", 0).unwrap();
         assert!(!folder(&dirs, "A").exists());
         assert!(!menu(&dirs).exists());
         assert!(!dirs.directories.join("lantern-phone.directory").exists());
@@ -1789,13 +1851,13 @@ mod tests {
         assert_eq!(line(&folder_bytes, "X-Lantern-Serial"), ["a:b"]);
 
         cat.start_session("a_b");
-        assert!(cat.upsert(&entry("com.s", 0)).is_err());
+        assert!(cat.upsert("a_b", &entry("com.s", 0)).is_err());
         assert!(
-            cat.upsert(&entry("com.t", 0)).is_err(),
+            cat.upsert("a_b", &entry("com.t", 0)).is_err(),
             "any app of that phone"
         );
-        assert_eq!(cat.end_sync(2).unwrap(), 0);
-        cat.remove("com.s", 0).unwrap();
+        assert_eq!(cat.end_sync("a_b", 2).unwrap(), 0);
+        cat.remove("a_b", "com.s", 0).unwrap();
         assert_eq!(cat.remove_serial("a_b").unwrap(), 0);
         assert_eq!(std::fs::read(&first).unwrap(), bytes);
         assert_eq!(mtime(&first), old);
@@ -1809,17 +1871,80 @@ mod tests {
     fn synced_after_matching_end_sync_only() {
         let (_t, dirs) = tmp();
         let (mut cat, _) = quiet(dirs);
-        assert!(!cat.synced());
+        assert!(!cat.synced("A"));
         cat.start_session("A");
-        assert!(!cat.synced());
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.end_sync(2).unwrap();
-        assert!(!cat.synced(), "mismatched end_sync");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.end_sync(1).unwrap();
-        assert!(cat.synced());
+        assert!(!cat.synced("A"));
+        cat.upsert("A", &entry("com.a", 0)).unwrap();
+        cat.end_sync("A", 2).unwrap();
+        assert!(!cat.synced("A"), "mismatched end_sync");
+        cat.upsert("A", &entry("com.a", 0)).unwrap();
+        cat.end_sync("A", 1).unwrap();
+        assert!(cat.synced("A"));
         cat.start_session("B");
-        assert!(!cat.synced());
+        assert!(!cat.synced("B"));
+        assert!(cat.synced("A"), "B's window leaves A's alone");
+    }
+
+    /// Two phones' sync windows are open at once: each `end_sync` prunes only its own phone's
+    /// entries, counting only its own upserts.
+    #[test]
+    fn two_phones_sync_at_once() {
+        let (_t, dirs) = tmp();
+        set_primary(&dirs, "A");
+        let mut cat = named(dirs.clone());
+        // Before: A has a stale com.z, B has com.y (not resent in this test).
+        full_sync(&mut cat, "A", &[("com.z", 0)]);
+        full_sync(&mut cat, "B", &[("com.y", 0)]);
+        let b_before = std::fs::read(file(&dirs, "lantern.com.y-pB")).unwrap();
+
+        cat.start_session("A");
+        cat.start_session("B");
+        cat.upsert("A", &entry("com.a", 0)).unwrap();
+        cat.upsert("B", &entry("com.b", 0)).unwrap();
+        cat.upsert("A", &entry("com.c", 0)).unwrap();
+        assert_eq!(cat.end_sync("A", 2).unwrap(), 1, "A's stale com.z only");
+        assert!(cat.synced("A"));
+        assert!(!cat.synced("B"));
+        assert!(!file(&dirs, "lantern.com.z").exists());
+        assert!(file(&dirs, "lantern.com.a").exists());
+        assert!(file(&dirs, "lantern.com.c").exists());
+        assert!(file(&dirs, "lantern.com.b-pB").exists());
+        assert_eq!(
+            std::fs::read(file(&dirs, "lantern.com.y-pB")).unwrap(),
+            b_before
+        );
+
+        assert_eq!(cat.end_sync("B", 1).unwrap(), 1, "B's stale com.y only");
+        assert!(cat.synced("B"));
+        assert!(!file(&dirs, "lantern.com.y-pB").exists());
+        assert!(file(&dirs, "lantern.com.b-pB").exists());
+        for stem in ["lantern.com.a", "lantern.com.c"] {
+            assert!(file(&dirs, stem).exists(), "{stem}");
+        }
+    }
+
+    /// `end_session` closes that phone's window only: later messages for it write nothing.
+    #[test]
+    fn end_session_forgets_only_that_phone() {
+        let (_t, dirs) = tmp();
+        set_primary(&dirs, "A");
+        let mut cat = named(dirs.clone());
+        cat.start_session("A");
+        cat.start_session("B");
+        cat.upsert("B", &entry("com.b", 0)).unwrap();
+        cat.end_session("A");
+        assert!(
+            cat.upsert("A", &entry("com.a", 0)).is_ok(),
+            "ignored, not an error"
+        );
+        assert!(!file(&dirs, "lantern.com.a").exists());
+        assert_eq!(cat.end_sync("A", 1).unwrap(), 0);
+        assert!(!cat.synced("A"));
+        cat.upsert("B", &entry("com.c", 0)).unwrap();
+        assert_eq!(cat.end_sync("B", 2).unwrap(), 0);
+        assert!(cat.synced("B"));
+        assert!(file(&dirs, "lantern.com.b-pB").exists());
+        assert!(file(&dirs, "lantern.com.c-pB").exists());
     }
 
     fn primary_s() -> Naming {
@@ -2020,8 +2145,8 @@ mod tests {
         let (mut cat, _) = quiet(dirs);
         cat.start_session("s");
         for bad in ["com.x;rm -rf", "", "../x", "com/x", "com.x-u1"] {
-            assert!(cat.upsert(&entry(bad, 0)).is_err(), "{bad:?} accepted");
-            assert!(cat.remove(bad, 0).is_err(), "{bad:?} remove accepted");
+            assert!(cat.upsert("s", &entry(bad, 0)).is_err(), "{bad:?} accepted");
+            assert!(cat.remove("s", bad, 0).is_err(), "{bad:?} remove accepted");
         }
         let count = |d: &Path| std::fs::read_dir(d).map(|r| r.count()).unwrap_or(0);
         assert_eq!(count(&apps), 0);
@@ -2036,7 +2161,7 @@ mod tests {
         let apps = dirs.applications.clone();
         let (mut cat, _) = quiet(dirs);
         cat.start_session("ser");
-        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.upsert("ser", &entry("com.a", 0)).unwrap();
         assert_eq!(std::fs::read(&ic).unwrap(), PNG);
         let f = read(&path);
         assert_eq!(line(&f, "Icon"), [ic.to_str().unwrap()]);
@@ -2044,10 +2169,13 @@ mod tests {
         // No temp files are left behind.
         assert_eq!(std::fs::read_dir(&apps).unwrap().count(), 1);
         // A non-PNG icon means no icon: the old one is removed and Icon= dropped.
-        cat.upsert(&AppEntry {
-            icon_png: b"GIF89a".to_vec(),
-            ..entry("com.a", 0)
-        })
+        cat.upsert(
+            "ser",
+            &AppEntry {
+                icon_png: b"GIF89a".to_vec(),
+                ..entry("com.a", 0)
+            },
+        )
         .unwrap();
         assert!(!ic.exists());
         assert!(!read(&path).contains("Icon="));
@@ -2060,19 +2188,22 @@ mod tests {
         let ic = icon(&dirs, "lantern.com.a");
         let (mut cat, _) = quiet(dirs);
         cat.start_session("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
         let old = SystemTime::now() - Duration::from_secs(3600);
         for p in [&path, &ic] {
             set_mtime(p, old);
         }
-        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
         for p in [&path, &ic] {
             assert_eq!(mtime(p), old, "{p:?}");
         }
-        cat.upsert(&AppEntry {
-            label: "New".into(),
-            ..entry("com.a", 0)
-        })
+        cat.upsert(
+            "s",
+            &AppEntry {
+                label: "New".into(),
+                ..entry("com.a", 0)
+            },
+        )
         .unwrap();
         assert_ne!(mtime(&path), old);
         assert_eq!(mtime(&ic), old);
@@ -2085,12 +2216,12 @@ mod tests {
         let b_icon = icon(&dirs, "lantern.com.b");
         let (mut cat, _) = quiet(dirs);
         cat.start_session("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.upsert(&entry("com.b", 0)).unwrap();
-        assert_eq!(cat.end_sync(2).unwrap(), 0);
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.b", 0)).unwrap();
+        assert_eq!(cat.end_sync("s", 2).unwrap(), 0);
         cat.start_session("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        assert_eq!(cat.end_sync(1).unwrap(), 1);
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
+        assert_eq!(cat.end_sync("s", 1).unwrap(), 1);
         assert!(a.exists());
         assert!(!b.exists());
         assert!(!b_icon.exists());
@@ -2126,15 +2257,15 @@ mod tests {
         full_sync(&mut cat, "A", &[("com.a", 0), ("com.b", 0)]);
         full_sync(&mut cat, "B", &[("com.a", 0), ("com.b", 0)]);
         cat.start_session("B");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        assert_eq!(cat.end_sync(5).unwrap(), 0);
+        cat.upsert("B", &entry("com.a", 0)).unwrap();
+        assert_eq!(cat.end_sync("B", 5).unwrap(), 0);
         assert!(b.exists());
         assert_eq!(cat.phones("com.b", 0), ["A", "B"]);
         // A live removal counts toward the window, so the sync no longer matches.
         cat.start_session("A");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.remove("com.zz", 0).unwrap();
-        assert_eq!(cat.end_sync(1).unwrap(), 0);
+        cat.upsert("A", &entry("com.a", 0)).unwrap();
+        cat.remove("A", "com.zz", 0).unwrap();
+        assert_eq!(cat.end_sync("A", 1).unwrap(), 0);
         assert_eq!(cat.phones("com.b", 0), ["A", "B"]);
     }
 
@@ -2145,10 +2276,10 @@ mod tests {
         let ic = icon(&dirs, "lantern.com.a-u10");
         let (mut cat, _) = quiet(dirs);
         cat.start_session("s");
-        cat.upsert(&entry("com.a", 10)).unwrap();
-        cat.remove("com.a", 10).unwrap();
+        cat.upsert("s", &entry("com.a", 10)).unwrap();
+        cat.remove("s", "com.a", 10).unwrap();
         assert!(!a.exists() && !ic.exists());
-        cat.remove("com.a", 10).unwrap();
+        cat.remove("s", "com.a", 10).unwrap();
     }
 
     #[test]
@@ -2162,12 +2293,12 @@ mod tests {
         std::fs::write(&other, "[Desktop Entry]\nX-Lantern-Serial=s\n").unwrap();
         let (mut cat, _) = quiet(dirs);
         cat.start_session("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
         // Same app_id as the hand-made file: refused, file untouched.
-        assert!(cat.upsert(&entry("foo", 0)).is_err());
+        assert!(cat.upsert("s", &entry("foo", 0)).is_err());
         // A full sync (the refused app counts: the phone sent it) prunes nothing foreign.
-        assert_eq!(cat.end_sync(2).unwrap(), 0);
-        assert!(cat.remove("foo", 0).is_ok());
+        assert_eq!(cat.end_sync("s", 2).unwrap(), 0);
+        assert!(cat.remove("s", "foo", 0).is_ok());
         assert_eq!(cat.remove_serial("s").unwrap(), 1);
         assert_eq!(read(&foo), mine);
         assert!(other.exists());
@@ -2281,7 +2412,7 @@ mod tests {
         let (mut cat, _) = quiet(dirs.clone());
         cat.start_session("s");
         assert!(!menu(&dirs).exists(), "no entry yet: no menu");
-        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
         let m = read(&menu(&dirs));
         assert_eq!(m, menu_of(&[&submenu("s")]));
         assert!(!m.contains("<Name>Phone</Name>"), "{m}");
@@ -2336,16 +2467,16 @@ mod tests {
         std::fs::write(&parent, mine).unwrap();
         let (mut cat, _) = quiet(dirs.clone());
         cat.start_session("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
         assert_eq!(read(&parent), mine, "not exactly what Lantern wrote: kept");
         // With no entry left the menu goes, but the foreign file stays.
-        cat.remove("com.a", 0).unwrap();
+        cat.remove("s", "com.a", 0).unwrap();
         assert!(!menu(&dirs).exists());
         assert_eq!(read(&parent), mine);
         // Lantern's own one goes with the last entry too.
         std::fs::write(&parent, LEGACY_DIRECTORY).unwrap();
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.remove("com.a", 0).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
+        cat.remove("s", "com.a", 0).unwrap();
         assert!(!parent.exists());
     }
 
@@ -2383,18 +2514,18 @@ mod tests {
         let (mut cat, runs) = quiet(dirs);
         // Writing the menu files is a change too.
         cat.start_session("s");
-        cat.upsert(&entry("com.a", 0)).unwrap();
-        cat.upsert(&entry("com.b", 0)).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.b", 0)).unwrap();
         std::thread::sleep(Duration::from_millis(400));
         assert_eq!(runs.load(Ordering::SeqCst), 0, "ran before the debounce");
         std::thread::sleep(Duration::from_millis(1100));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         // Unchanged bytes are not a change.
-        cat.upsert(&entry("com.a", 0)).unwrap();
+        cat.upsert("s", &entry("com.a", 0)).unwrap();
         std::thread::sleep(Duration::from_millis(1300));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         // A pending rebuild runs on drop (e.g. undo-setup exiting).
-        cat.remove("com.a", 0).unwrap();
+        cat.remove("s", "com.a", 0).unwrap();
         drop(cat);
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
@@ -2554,10 +2685,13 @@ mod tests {
         set_primary(&dirs, "P");
         let (mut cat, _) = quiet(dirs.clone());
         cat.start_session("s");
-        cat.upsert(&AppEntry {
-            label: "Sett\\ings".into(),
-            ..entry("com.a", 0)
-        })
+        cat.upsert(
+            "s",
+            &AppEntry {
+                label: "Sett\\ings".into(),
+                ..entry("com.a", 0)
+            },
+        )
         .unwrap();
         let (_, body, ic) = connect_notice(&dirs, &|_| None, "com.a", 0, None);
         assert_eq!(body, "Sett\\ings opens when your s is connected by USB.");
@@ -2593,10 +2727,13 @@ mod tests {
         assert_eq!(ic, None);
         let (mut cat, _) = quiet(dirs.clone());
         cat.start_session("s");
-        cat.upsert(&AppEntry {
-            label: "Settings".into(),
-            ..entry("com.a", 0)
-        })
+        cat.upsert(
+            "s",
+            &AppEntry {
+                label: "Settings".into(),
+                ..entry("com.a", 0)
+            },
+        )
         .unwrap();
         let (_, body, ic) = paused_notice(&dirs, "com.a", 0);
         assert_eq!(
@@ -3020,29 +3157,32 @@ mod tests {
         let pins = "[Containments][2][Applets][5][Configuration][General]\n\
                     launchers=applications:lantern.com.b.desktop,preferred://browser\n";
         assert_eq!(
-            choose_primary(&legacy_list, Some(pins)).as_deref(),
+            choose_primary(&legacy_list, Some(pins), &[]).as_deref(),
             Some("B")
         );
-        assert_eq!(choose_primary(&legacy_list, None).as_deref(), Some("A"));
+        assert_eq!(
+            choose_primary(&legacy_list, None, &[]).as_deref(),
+            Some("A")
+        );
         // Pins of other apps (or other files) do not count.
         let other =
             "launchers=applications:org.kde.dolphin.desktop,file:///lantern.com.b.desktop\n";
         assert_eq!(
-            choose_primary(&legacy_list, Some(other)).as_deref(),
+            choose_primary(&legacy_list, Some(other), &[]).as_deref(),
             Some("A")
         );
         // A tie goes to the smallest serial.
         let tie = l(&[("x", &["B"]), ("y", &["A"])]);
-        assert_eq!(choose_primary(&tie, None).as_deref(), Some("A"));
+        assert_eq!(choose_primary(&tie, None, &[]).as_deref(), Some("A"));
         // Pins in several task managers add up.
         let two = "launchers=applications:lantern.com.b.desktop\n\
                    launchers=applications:lantern.com.a.desktop,applications:lantern.com.a2.desktop\n\
                    launchers=applications:lantern.com.b.desktop\n";
         assert_eq!(
-            choose_primary(&legacy_list, Some(two)).as_deref(),
+            choose_primary(&legacy_list, Some(two), &[]).as_deref(),
             Some("A")
         );
-        assert_eq!(choose_primary(&[], Some(pins)), None);
+        assert_eq!(choose_primary(&[], Some(pins), &[]), None);
 
         // The migration follows it: B keeps the old names.
         let (_t, dirs) = tmp();
@@ -3059,5 +3199,63 @@ mod tests {
                 "lantern.com.b.desktop"
             ]
         );
+    }
+
+    #[test]
+    fn choose_primary_prefers_existing_owners() {
+        let legacy_list = vec![
+            ("lantern.com.a".to_owned(), vec!["A".to_owned()]),
+            ("lantern.com.a2".to_owned(), vec!["A".to_owned()]),
+        ];
+        let pins = "launchers=applications:lantern.com.a.desktop\n";
+        let owners = [("lantern.com.a".to_owned(), "B".to_owned())];
+        assert_eq!(
+            choose_primary(&legacy_list, Some(pins), &owners).as_deref(),
+            Some("B")
+        );
+        // Most owned files wins; a tie goes to the smallest serial.
+        let owners = [
+            ("lantern.com.a".to_owned(), "C".to_owned()),
+            ("lantern.com.b".to_owned(), "B".to_owned()),
+            ("lantern.com.c".to_owned(), "C".to_owned()),
+        ];
+        assert_eq!(choose_primary(&[], None, &owners).as_deref(), Some("C"));
+        let tie = [
+            ("lantern.com.a".to_owned(), "C".to_owned()),
+            ("lantern.com.b".to_owned(), "B".to_owned()),
+        ];
+        assert_eq!(choose_primary(&[], None, &tie).as_deref(), Some("B"));
+    }
+
+    /// `menu.json` lost after a finished migration, and the pins gone too: the rerun finds the
+    /// primary from the files it already owns at the unsuffixed names, and changes nothing.
+    #[test]
+    fn rerun_after_lost_menu_json_keeps_the_primary() {
+        let (_t, dirs) = tmp();
+        legacy(&dirs, "com.a", 0, "A", Some("A;B;"), "Alpha");
+        legacy(&dirs, "com.a2", 0, "A", Some("A;"), "Alpha 2");
+        legacy(&dirs, "com.b", 0, "B", Some("B;"), "Beta");
+        // Two entries each; B's pin makes it primary.
+        let pins = "launchers=applications:lantern.com.b.desktop\n";
+        let m = migrate(&dirs, Some(pins)).unwrap();
+        assert_eq!(m.primary.as_deref(), Some("B"));
+        let after = snapshot(&dirs);
+        let names = stems(&dirs);
+        assert_eq!(
+            names,
+            [
+                "lantern.com.a-pA.desktop",
+                "lantern.com.a.desktop",
+                "lantern.com.a2-pA.desktop",
+                "lantern.com.b.desktop"
+            ]
+        );
+        std::fs::remove_file(dirs.state.join("menu.json")).unwrap();
+        let m = migrate(&dirs, None).unwrap();
+        assert_eq!(m.primary.as_deref(), Some("B"));
+        assert_eq!(Naming::load(&dirs.state).primary.as_deref(), Some("B"));
+        assert_eq!(stems(&dirs), names);
+        assert_eq!(snapshot(&dirs), after);
+        assert!(!stems(&dirs).iter().any(|n| n.contains("-pB")));
     }
 }

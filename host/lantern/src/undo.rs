@@ -225,13 +225,16 @@ mod tests {
             ("other", "com.c"),
         ] {
             cat.start_session(serial);
-            cat.upsert(&AppEntry {
-                pkg: pkg.into(),
-                user: 0,
-                label: pkg.into(),
-                work: false,
-                icon_png: Vec::new(),
-            })
+            cat.upsert(
+                serial,
+                &AppEntry {
+                    pkg: pkg.into(),
+                    user: 0,
+                    label: pkg.into(),
+                    work: false,
+                    icon_png: Vec::new(),
+                },
+            )
             .unwrap();
         }
         drop(cat);

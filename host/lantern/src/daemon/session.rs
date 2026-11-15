@@ -5,7 +5,7 @@ use lantern_proto::{read_frame_async, write_frame_async, Control, Frame, Kind};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -406,15 +406,10 @@ pub async fn start(adb: &Adb, keyboard: bool, screen_off: bool) -> Result<Sessio
     }
     tracing::debug!(name, "helper listening");
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("allocate local port")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    // Recorded before the call: if this future is cancelled mid-`adb forward`, the forward may
-    // already exist server-side, and removing a missing forward is harmless.
+    // adb picks the port. Recorded as soon as the call returns; a start cancelled mid-call
+    // knows no port to remove, and the next start's stale-forward sweep removes that forward.
+    let port = adb.forward_any(&name).await?;
     pending.forward = Some(port);
-    adb.forward(port, &name).await?;
     tracing::debug!(port, name, "forward created");
 
     let deadline = Instant::now() + Duration::from_secs(3);

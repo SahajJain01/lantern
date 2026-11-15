@@ -2,9 +2,10 @@
 //! phone at exactly the build embedded in `lantern`, and tells the user the first time Lantern
 //! installs something on a phone.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -480,7 +481,8 @@ type Notifier = Box<dyn Fn(&str, &str) + Send + Sync>;
 pub struct Setup {
     state_dir: Option<PathBuf>,
     notify: Notifier,
-    failure_notified: AtomicBool,
+    /// Phones whose companion failure has been notified this run (once per phone).
+    failure_notified: Mutex<HashSet<String>>,
 }
 
 impl Setup {
@@ -492,7 +494,7 @@ impl Setup {
         Self {
             state_dir,
             notify: Box::new(notify),
-            failure_notified: AtomicBool::new(false),
+            failure_notified: Mutex::new(HashSet::new()),
         }
     }
 
@@ -522,8 +524,9 @@ impl Setup {
     }
 
     /// Runs [`ensure`] and records the device and its name; never fails the session start. The
-    /// first record for a serial notifies the user. A failure is logged in full and notified (first line)
-    /// once per daemon run; the session then starts without the companion.
+    /// first record for a serial notifies the user. A failure is logged in full and notified
+    /// (first line) once per phone per daemon run; the session then starts without the
+    /// companion.
     pub async fn prepare(&self, adb: &Adb) -> Option<Install> {
         let serial = adb.serial();
         match ensure(adb).await {
@@ -557,7 +560,12 @@ impl Setup {
                     error = full,
                     "could not install the companion; starting without it"
                 );
-                if !self.failure_notified.swap(true, Ordering::SeqCst) {
+                let first_for_phone = self
+                    .failure_notified
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(serial.to_owned());
+                if first_for_phone {
                     let first = full.lines().next().unwrap_or_default();
                     (self.notify)(FAILURE_SUMMARY, first);
                 }
@@ -580,6 +588,35 @@ mod tests {
             "lantern-companion-{tag}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    /// The failure notice comes once per phone per run: a second failing phone gets its own.
+    #[tokio::test]
+    async fn failure_notice_once_per_phone() {
+        let notes: Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+        let sink = notes.clone();
+        let setup = Setup::new(None, move |summary: &str, body: &str| {
+            sink.lock()
+                .unwrap()
+                .push((summary.to_owned(), body.to_owned()));
+        });
+        // No such program: every adb call fails to spawn, so `ensure` fails.
+        let missing = scratch("no-adb").join("adb");
+        let a = Adb::with_program(&missing, "a");
+        let b = Adb::with_program(&missing, "b");
+        assert!(setup.prepare(&a).await.is_none());
+        assert!(setup.prepare(&a).await.is_none());
+        assert_eq!(
+            notes.lock().unwrap().len(),
+            1,
+            "{:?}",
+            notes.lock().unwrap()
+        );
+        assert!(setup.prepare(&b).await.is_none());
+        assert!(setup.prepare(&a).await.is_none());
+        let notes = notes.lock().unwrap().clone();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().all(|(summary, _)| summary == FAILURE_SUMMARY));
     }
 
     #[test]

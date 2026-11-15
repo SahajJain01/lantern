@@ -179,3 +179,31 @@ fn non_hex_length_is_an_error() {
     let mut decoder = TrackDevicesDecoder::default();
     assert!(decoder.push(b"* daemon not running\n").is_err());
 }
+
+#[test]
+fn parse_forward_port_reads_adbs_chosen_port() {
+    assert_eq!(parse_forward_port("41234\n"), Some(41234));
+    assert_eq!(parse_forward_port(" 41234 \r\nignored\n"), Some(41234));
+    assert_eq!(parse_forward_port("65535"), Some(65535));
+    for bad in ["", "0", "x", "65536", "\n41234", "-1"] {
+        assert_eq!(parse_forward_port(bad), None, "{bad:?}");
+    }
+}
+
+/// Two phones' daemons share one adb server: one start's cleanup must not take the other
+/// phone's live forward.
+#[test]
+fn stale_forwards_are_per_serial() {
+    let list = "phoneA tcp:41000 localabstract:lantern-aaaa0001\n\
+phoneB tcp:41001 localabstract:lantern-bbbb0001\n\
+phoneA tcp:41002 localabstract:lantern-aaaa0002\n\
+phoneB tcp:41003 localabstract:lantern-bbbb0002\n";
+    assert_eq!(
+        stale_lantern_forwards(list, "phoneA"),
+        ["tcp:41000", "tcp:41002"]
+    );
+    assert_eq!(
+        stale_lantern_forwards(list, "phoneB"),
+        ["tcp:41001", "tcp:41003"]
+    );
+}

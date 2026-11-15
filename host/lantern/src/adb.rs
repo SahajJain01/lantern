@@ -114,13 +114,23 @@ impl Adb {
         self.run(command, ADB_PUSH_TIMEOUT).await.map(|_| ())
     }
 
-    pub async fn forward(&self, local_tcp: u16, abstract_name: &str) -> Result<()> {
+    /// `adb forward tcp:0 localabstract:<name>`: adb picks a free local port and prints it, so
+    /// no port is guessed (a port freed by a probe listener can be taken by another phone's
+    /// start before adb binds it). Returns that port.
+    pub async fn forward_any(&self, abstract_name: &str) -> Result<u16> {
         let mut command = self.command();
         command
             .arg("forward")
-            .arg(format!("tcp:{local_tcp}"))
+            .arg("tcp:0")
             .arg(format!("localabstract:{abstract_name}"));
-        self.run(command, ADB_CALL_TIMEOUT).await.map(|_| ())
+        let out = self.run(command, ADB_CALL_TIMEOUT).await?;
+        parse_forward_port(&out).with_context(|| {
+            format!(
+                "adb -s {} forward tcp:0 printed no port: {:?}",
+                self.serial,
+                out.trim()
+            )
+        })
     }
 
     pub async fn remove_forward(&self, local_tcp: u16) -> Result<()> {
@@ -232,6 +242,16 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// The port `adb forward tcp:0 …` printed: its first line, trimmed, a number in `1..=65535`.
+pub fn parse_forward_port(out: &str) -> Option<u16> {
+    out.lines()
+        .next()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
 }
 
 /// The local specs (`tcp:<port>`) of `serial`'s forwards to a `localabstract:lantern-*` socket in
