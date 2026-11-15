@@ -551,6 +551,61 @@ async fn unlock_row_click_prompts() {
     task.abort();
 }
 
+/// Two phones, only `b` locked: the Unlock row in b's slot (202) asks for b's dialog, and the
+/// PIN comes back tagged `b`.
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_row_click_names_its_phone() {
+    let (request, requests) = unlock::Request::channel();
+    let mut view = ready();
+    let mut b = view.phones[0].clone();
+    b.serial = "b".into();
+    b.name = Some("Other".into());
+    b.locked = true;
+    view.phones.push(b);
+    let tray = Tray::start_with(view, Some(request)).await;
+    let (events, events_rx) = mpsc::channel(8);
+    let (pins_tx, mut pins) = mpsc::channel::<(String, Pin)>(1);
+    let prompt = Prompt {
+        program: "/bin/echo".into(),
+        args: vec!["1234".into()],
+    };
+    let conn = tray._bus.connect().await;
+    let task = tokio::spawn(unlock::run(
+        conn,
+        events_rx,
+        requests,
+        tray.view.subscribe(),
+        pins_tx,
+        PathBuf::from("/bin/false"),
+        prompt,
+    ));
+    events
+        .send(LockEvent::Locked {
+            serial: "b".into(),
+            reason: LockReason::Session,
+        })
+        .await
+        .unwrap();
+    let (_, rows) = tray.layout().await;
+    assert_eq!(
+        &rows[..4],
+        owned(&[
+            (100, "Test Phone"),
+            (200, "Other"),
+            (201, "Locked"),
+            (202, "Unlock Other…"),
+        ])
+    );
+    tray.click(202).await;
+    let (serial, pin) = tokio::time::timeout(Duration::from_secs(5), pins.recv())
+        .await
+        .expect("no PIN within 5 s")
+        .unwrap();
+    assert_eq!(serial, "b");
+    assert_eq!(pin, Pin::parse("1234".into()).unwrap());
+    task.abort();
+}
+
 const CHILD: &str = "LANTERN_TRAY_TEST_CHILD";
 
 /// Whether this process is a child [`run_child`] started.

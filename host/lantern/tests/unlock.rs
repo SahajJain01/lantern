@@ -74,6 +74,15 @@ fn echo_prompt(text: &str) -> Prompt {
 
 impl Rig {
     async fn start(with_server: bool, prompt: Prompt) -> Self {
+        Self::start_full(with_server, locked_view(), prompt).await
+    }
+
+    /// With a notification server, showing `view`.
+    async fn start_view(view: View, prompt: Prompt) -> Self {
+        Self::start_full(true, view, prompt).await
+    }
+
+    async fn start_full(with_server: bool, view: View, prompt: Prompt) -> Self {
         let bus = Bus::start();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let server = if with_server {
@@ -83,7 +92,7 @@ impl Rig {
         };
         let (exe, reopened) = fake_exe(&bus.dir);
         let (events, events_rx) = mpsc::channel(32);
-        let (view, view_rx) = watch::channel(locked_view());
+        let (view, view_rx) = watch::channel(view);
         let (pins_tx, pins) = mpsc::channel(1);
         let conn = bus.connect().await;
         let (request, requests) = unlock::Request::channel();
@@ -608,51 +617,236 @@ async fn names_are_escaped() {
     );
 }
 
-/// One stretch at a time (this task): a stretch for `s1`, then `s2` locks. `s2`'s events are
-/// ignored while `s1`'s stretch is open (no second notice, `s1`'s notice stays), and the answer
-/// to `s1`'s notice carries `s1`.
-#[tokio::test]
-async fn events_for_another_phone_wait_for_the_stretch() {
-    let mut rig = Rig::start(true, echo_prompt("1234")).await;
-    rig.view.send_modify(|view| {
-        let mut other = view.phones[0].clone();
-        other.serial = "s2".into();
-        other.name = Some("Other".into());
-        view.phones.push(other);
-    });
-    rig.send(LockEvent::Locked {
-        serial: "s1".into(),
-        reason: LockReason::Clipboard,
-    })
-    .await;
-    let id = rig.notify_id(1).await;
-    rig.send(LockEvent::Locked {
-        serial: "s2".into(),
-        reason: LockReason::Session,
-    })
-    .await;
-    rig.send(LockEvent::Result {
-        serial: "s2".into(),
-        ok: false,
-        reason: Some("wrong PIN".into()),
-    })
-    .await;
-    rig.send(LockEvent::Unlocked {
-        serial: "s2".into(),
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(rig.notifies().len(), 1, "{:?}", rig.calls());
-    assert!(!rig.calls().contains(&Call::Close(id)), "{:?}", rig.calls());
-    // A tray request for s2 opens nothing; s1's notice prompts for s1.
-    rig.request.ask("s2".into());
-    rig.assert_no_pin().await;
-    rig.click(id, "unlock").await;
-    let (serial, got) = rig.next_tagged_pin().await;
-    assert_eq!(serial, "s1");
-    assert_eq!(got, pin("1234"));
-    match &rig.notifies()[0] {
-        Call::Notify { summary, .. } => assert_eq!(summary, "Unlock your Test Phone"),
-        other => panic!("{other:?}"),
+/// Phones `a` ("Pixel") and `b` ("Other"), both live.
+fn two_view() -> View {
+    let mut a = locked_view().phones.remove(0);
+    a.serial = "a".into();
+    a.name = Some("Pixel".into());
+    let mut b = a.clone();
+    b.serial = "b".into();
+    b.name = Some("Other".into());
+    View { phones: vec![a, b] }
+}
+
+/// A PIN dialog that appends the phone's name to `log`, then answers 1234 after `secs`.
+fn naming_prompt(log: &Path, secs: &str) -> Prompt {
+    Prompt {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "printf '%s\\n' \"$1\" >> '{}'; sleep {secs}; echo 1234",
+                log.display()
+            ),
+            "sh".into(),
+            "{name}".into(),
+        ],
     }
+}
+
+fn locked(serial: &str) -> LockEvent {
+    LockEvent::Locked {
+        serial: serial.into(),
+        reason: LockReason::Clipboard,
+    }
+}
+
+fn unlocked(serial: &str) -> LockEvent {
+    LockEvent::Unlocked {
+        serial: serial.into(),
+    }
+}
+
+/// The names the dialog was run for, in order.
+fn asked(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Each phone's stretch has its own notice; neither replaces the other.
+#[tokio::test]
+async fn two_phones_two_notices() {
+    let rig = Rig::start_view(two_view(), echo_prompt("1234")).await;
+    rig.send(locked("a")).await;
+    rig.notify_id(1).await;
+    rig.send(locked("b")).await;
+    rig.notify_id(2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got: Vec<(u32, String)> = rig
+        .notifies()
+        .into_iter()
+        .map(|call| match call {
+            Call::Notify {
+                replaces, summary, ..
+            } => (replaces, summary),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (0, "Unlock your Pixel".to_owned()),
+            (0, "Unlock your Other".to_owned())
+        ]
+    );
+    assert!(!rig.calls().iter().any(|c| matches!(c, Call::Close(_))));
+}
+
+/// Review Focus 3: b locks while a's dialog is open; the answer goes to a, never to b.
+#[tokio::test]
+async fn answer_goes_to_the_phone_asked_for() {
+    let mut rig = Rig::start_view(two_view(), slow_prompt("0.5", "1234")).await;
+    rig.send(locked("a")).await;
+    let id = rig.notify_id(1).await;
+    rig.click(id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.send(locked("b")).await;
+    let (serial, got) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "a");
+    assert_eq!(got, pin("1234"));
+    rig.assert_no_pin_within(Duration::from_millis(1000)).await;
+}
+
+/// Decision 10: b's click during a's dialog is queued and opens b's dialog after a's answer;
+/// if b unlocked meanwhile, it opens nothing.
+#[tokio::test]
+async fn click_for_b_while_a_asks_is_queued() {
+    let log = std::env::temp_dir().join(format!(
+        "lantern-unlock-asked-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&log);
+    let mut rig = Rig::start_view(two_view(), naming_prompt(&log, "0.5")).await;
+    rig.send(locked("a")).await;
+    let a_id = rig.notify_id(1).await;
+    rig.send(locked("b")).await;
+    let b_id = rig.notify_id(2).await;
+    rig.click(a_id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.click(b_id, "unlock").await;
+    // Twice is still one queued dialog.
+    rig.request.ask("b".into());
+    let (serial, _) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "a");
+    let (serial, got) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "b");
+    assert_eq!(got, pin("1234"));
+    rig.assert_no_pin_within(Duration::from_millis(1000)).await;
+    assert_eq!(asked(&log), ["Pixel", "Other"]);
+
+    // b unlocks before a's dialog answers: b's queued click opens nothing.
+    let _ = std::fs::remove_file(&log);
+    rig.send(unlocked("a")).await;
+    rig.send(unlocked("b")).await;
+    rig.send(locked("a")).await;
+    let a_id = rig.notify_id(3).await;
+    rig.send(locked("b")).await;
+    let b_id = rig.notify_id(4).await;
+    rig.click(a_id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.click(b_id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rig.send(unlocked("b")).await;
+    let (serial, _) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "a");
+    rig.assert_no_pin_within(Duration::from_millis(1000)).await;
+    assert_eq!(asked(&log), ["Pixel"]);
+    let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn unlock_of_one_closes_only_its_notice() {
+    let mut rig = Rig::start_view(two_view(), echo_prompt("1234")).await;
+    rig.send(locked("a")).await;
+    let a_id = rig.notify_id(1).await;
+    rig.send(locked("b")).await;
+    let b_id = rig.notify_id(2).await;
+    rig.send(LockEvent::Result {
+        serial: "a".into(),
+        ok: true,
+        reason: None,
+    })
+    .await;
+    let calls = rig.calls.clone();
+    wait_for("a's notice closed", Duration::from_secs(5), || {
+        calls
+            .lock()
+            .unwrap()
+            .contains(&Call::Close(a_id))
+            .then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !rig.calls().contains(&Call::Close(b_id)),
+        "{:?}",
+        rig.calls()
+    );
+    // b's notice still prompts, for b.
+    rig.click(b_id, "unlock").await;
+    let (serial, _) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "b");
+    // a's old notice id does nothing now.
+    rig.click(a_id, "unlock").await;
+    rig.assert_no_pin().await;
+}
+
+/// a's stretch ends during a's dialog while b stays locked: the answer is wiped, and goes to
+/// nobody.
+#[tokio::test]
+async fn answer_after_its_stretch_ended_is_wiped() {
+    let mut rig = Rig::start_view(two_view(), slow_prompt("0.5", "1234")).await;
+    rig.send(locked("a")).await;
+    let id = rig.notify_id(1).await;
+    rig.send(locked("b")).await;
+    rig.notify_id(2).await;
+    rig.click(id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.send(unlocked("a")).await;
+    rig.assert_no_pin_within(Duration::from_millis(1500)).await;
+}
+
+#[tokio::test]
+async fn tray_request_needs_that_phones_stretch() {
+    let mut rig = Rig::start_view(two_view(), echo_prompt("1234")).await;
+    rig.send(locked("a")).await;
+    rig.notify_id(1).await;
+    rig.request.ask("b".into());
+    rig.assert_no_pin().await;
+    rig.request.ask("a".into());
+    assert_eq!(rig.next_tagged_pin().await.0, "a");
+    rig.send(locked("b")).await;
+    rig.notify_id(2).await;
+    rig.request.ask("b".into());
+    assert_eq!(rig.next_tagged_pin().await.0, "b");
+    rig.assert_no_pin().await;
+}
+
+/// Task 4 note: b locks while a's stretch is open (the hub forwards only that first edge). b
+/// gets its notice at once, and it still prompts after a's stretch ended.
+#[tokio::test]
+async fn second_phone_locked_during_a_stretch_still_prompts() {
+    let mut rig = Rig::start_view(two_view(), slow_prompt("0.3", "1234")).await;
+    rig.send(locked("a")).await;
+    let a_id = rig.notify_id(1).await;
+    rig.click(a_id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rig.send(locked("b")).await;
+    let b_id = rig.notify_id(2).await;
+    rig.send(unlocked("a")).await;
+    // a's answer is wiped (its stretch ended); b's notice is still there and prompts for b.
+    rig.assert_no_pin_within(Duration::from_millis(800)).await;
+    assert!(
+        !rig.calls().contains(&Call::Close(b_id)),
+        "{:?}",
+        rig.calls()
+    );
+    rig.click(b_id, "unlock").await;
+    let (serial, got) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "b");
+    assert_eq!(got, pin("1234"));
 }

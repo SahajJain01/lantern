@@ -74,12 +74,6 @@ pub struct View {
 }
 
 impl View {
-    /// The first phone being served, started, retried or reconnected (Task 6 replaces its
-    /// users with [`Self::live_phones`]).
-    pub fn live(&self) -> Option<&PhoneView> {
-        self.phones.iter().find(|p| p.state.is_live())
-    }
-
     /// Every phone being served, started, retried or reconnected, in view order.
     pub fn live_phones(&self) -> impl Iterator<Item = &PhoneView> {
         self.phones.iter().filter(|p| p.state.is_live())
@@ -165,14 +159,14 @@ mod tests {
     }
 
     #[test]
-    fn view_live_and_phone() {
+    fn view_live_phones_and_phone() {
         let mut a = phone("a", PhoneState::Waiting);
         a.name = Some("Pixel".into());
         let b = phone("b", PhoneState::Reconnecting);
         let view = View {
             phones: vec![a.clone(), b.clone()],
         };
-        assert_eq!(view.live(), Some(&b));
+        assert_eq!(view.live_phones().collect::<Vec<_>>(), [&b]);
         let c = phone("c", PhoneState::Ready);
         let two = View {
             phones: vec![a.clone(), b.clone(), c.clone()],
@@ -183,7 +177,6 @@ mod tests {
         assert_eq!(view.phone("c"), None);
         assert_eq!(a.display_name(), "Pixel");
         assert_eq!(b.display_name(), "b");
-        assert_eq!(View::default().live(), None);
         let mut off = phone("c", PhoneState::Off);
         off.off = true;
         assert_eq!(

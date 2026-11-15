@@ -159,33 +159,42 @@ fn phone_note(phone: &PhoneView) -> Option<String> {
     }
 }
 
-/// The tooltip: what Lantern is doing with which phone.
+/// The tooltip: what Lantern is doing with which phones. A live phone that isn't ready comes
+/// first (`Connecting to {name}…` / `Reconnecting to {name}…`); else the ready phones:
+/// `Connected to {a}`, `Connected to {a} and {b}`, or `Connected to {n} phones` for three or
+/// more.
 pub fn status_line(view: &View) -> String {
-    if let Some(live) = view.live() {
-        let name = live.display_name();
-        return match live.state {
+    if let Some(busy) = view.live_phones().find(|p| p.state != PhoneState::Ready) {
+        let name = busy.display_name();
+        return match busy.state {
             PhoneState::Starting => format!("Connecting to {name}…"),
-            PhoneState::Ready => format!("Connected to {name}"),
             _ => format!("Reconnecting to {name}…"),
         };
     }
-    match listed_phones(view).count() {
-        0 => "No phone plugged in".to_owned(),
-        1 => "1 phone plugged in, none connected".to_owned(),
-        n => format!("{n} phones plugged in, none connected"),
+    let live: Vec<&str> = view.live_phones().map(PhoneView::display_name).collect();
+    match live.as_slice() {
+        [] => match listed_phones(view).count() {
+            0 => "No phone plugged in".to_owned(),
+            1 => "1 phone plugged in, none connected".to_owned(),
+            n => format!("{n} phones plugged in, none connected"),
+        },
+        [a] => format!("Connected to {a}"),
+        [a, b] => format!("Connected to {a} and {b}"),
+        many => format!("Connected to {} phones", many.len()),
     }
 }
 
-/// The overlay icon name on the tray icon, or `""` for none.
+/// The overlay icon name on the tray icon, or `""` for none: busy while any live phone isn't
+/// ready or any phone is being undone, a warning while any ready phone has a companion `msg`,
+/// paused while no phone is live and one is listed.
 pub fn overlay(view: &View) -> &'static str {
-    let live = view.live();
-    let busy = live.is_some_and(|p| p.state != PhoneState::Ready)
+    let busy = view.live_phones().any(|p| p.state != PhoneState::Ready)
         || view.phones.iter().any(|p| p.state == PhoneState::Undoing);
     if busy {
         "view-refresh"
-    } else if live.and_then(companion_msg).is_some() {
+    } else if view.phones.iter().any(|p| companion_msg(p).is_some()) {
         "emblem-warning"
-    } else if live.is_none() && listed_phones(view).next().is_some() {
+    } else if view.live_phones().next().is_none() && listed_phones(view).next().is_some() {
         "media-playback-pause"
     } else {
         ""
@@ -240,16 +249,12 @@ pub fn items(
             });
         }
     }
-    match listed_phones(view).count() {
-        0 => rows.push(Item::Label {
+    // Row 15 ("Lantern connects one phone at a time") is retired; its id is never reused.
+    if listed_phones(view).next().is_none() {
+        rows.push(Item::Label {
             id: 1,
             text: "No phone plugged in".to_owned(),
-        }),
-        1 => {}
-        _ => rows.push(Item::Label {
-            id: 15,
-            text: "Lantern connects one phone at a time".to_owned(),
-        }),
+        });
     }
     if settings_error {
         rows.push(Item::Label {
@@ -668,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn two_phones_show_the_note_and_both_rows() {
+    fn two_phones_show_both_rows() {
         let v = View {
             phones: vec![
                 phone("s1", "Xiaomi 11T Pro", PhoneState::Ready),
@@ -678,7 +683,6 @@ mod tests {
         let mut want = vec![
             check(100, "Xiaomi 11T Pro", true, disconnect("s1")),
             check(200, "edge 50 pro", false, connect("s2")),
-            label(15, "Lantern connects one phone at a time"),
         ];
         want.extend(tail(vec![
             button(150, "Xiaomi 11T Pro", true, undo("s1")),
@@ -695,8 +699,134 @@ mod tests {
         };
         assert_eq!(status_line(&none), "2 phones plugged in, none connected");
         assert_eq!(overlay(&none), "media-playback-pause");
-        // One plugged phone: no note.
-        assert!(!rows(&one(PhoneState::Ready)).iter().any(|i| i.id() == 15));
+    }
+
+    /// Decision 4: row 15 ("Lantern connects one phone at a time") is retired; its id is never
+    /// used again.
+    #[test]
+    fn no_one_at_a_time_row() {
+        let views = [
+            View {
+                phones: vec![
+                    phone("a", "Pixel", PhoneState::Ready),
+                    phone("b", "b", PhoneState::Waiting),
+                ],
+            },
+            View {
+                phones: vec![
+                    phone("a", "Pixel", PhoneState::Ready),
+                    phone("b", "b", PhoneState::Ready),
+                    phone("c", "c", PhoneState::Off),
+                ],
+            },
+            one(PhoneState::Ready),
+        ];
+        for v in views {
+            let got = rows(&v);
+            assert!(flatten(&got).iter().all(|i| i.id() != 15), "{got:?}");
+        }
+    }
+
+    /// Decision 19: two live phones, both ready.
+    #[test]
+    fn two_live_phones_tooltip() {
+        let v = View {
+            phones: vec![
+                phone("dev", "Pixel", PhoneState::Ready),
+                phone("b", "b", PhoneState::Ready),
+            ],
+        };
+        assert_eq!(status_line(&v), "Connected to Pixel and b");
+        assert_eq!(overlay(&v), "");
+        // A phone that isn't live doesn't count.
+        let mut more = v.clone();
+        more.phones.push(phone("c", "c", PhoneState::Waiting));
+        assert_eq!(status_line(&more), "Connected to Pixel and b");
+    }
+
+    #[test]
+    fn three_live_phones_tooltip() {
+        let v = View {
+            phones: vec![
+                phone("a", "Pixel", PhoneState::Ready),
+                phone("b", "b", PhoneState::Ready),
+                phone("c", "c", PhoneState::Ready),
+            ],
+        };
+        assert_eq!(status_line(&v), "Connected to 3 phones");
+        assert_eq!(overlay(&v), "");
+    }
+
+    /// Decision 19: a live phone that isn't ready shows first, whatever its place in the view.
+    #[test]
+    fn connecting_phone_shows_first() {
+        let v = View {
+            phones: vec![
+                phone("a", "Pixel", PhoneState::Ready),
+                phone("b", "edge", PhoneState::Starting),
+            ],
+        };
+        assert_eq!(status_line(&v), "Connecting to edge…");
+        assert_eq!(overlay(&v), "view-refresh");
+        let v = View {
+            phones: vec![
+                phone("a", "Pixel", PhoneState::Ready),
+                phone("b", "edge", PhoneState::Retrying),
+                phone("c", "c", PhoneState::Starting),
+            ],
+        };
+        assert_eq!(status_line(&v), "Reconnecting to edge…");
+        assert_eq!(overlay(&v), "view-refresh");
+        let v = View {
+            phones: vec![
+                phone("a", "Pixel", PhoneState::Reconnecting),
+                phone("b", "edge", PhoneState::Ready),
+            ],
+        };
+        assert_eq!(status_line(&v), "Reconnecting to Pixel…");
+    }
+
+    /// The overlay looks at every phone: a companion msg on any ready phone warns, an undo of
+    /// any phone is busy.
+    #[test]
+    fn overlay_of_several_phones() {
+        let mut v = View {
+            phones: vec![
+                phone("a", "Pixel", PhoneState::Ready),
+                phone("b", "b", PhoneState::Ready),
+            ],
+        };
+        v.phones[1].companion = Some((CompanionState::Unavailable, Some("x".to_owned())));
+        assert_eq!(overlay(&v), "emblem-warning");
+        v.phones.push(phone("c", "c", PhoneState::Undoing));
+        assert_eq!(overlay(&v), "view-refresh");
+    }
+
+    /// Each phone's Locked/Unlock rows sit in its own slot.
+    #[test]
+    fn locked_rows_per_phone() {
+        let mut v = View {
+            phones: vec![
+                phone("a", "Pixel", PhoneState::Ready),
+                phone("b", "b", PhoneState::Ready),
+            ],
+        };
+        v.phones[1].locked = true;
+        let got = rows(&v);
+        let ids: Vec<i32> = got.iter().map(Item::id).take(4).collect();
+        assert_eq!(ids, [100, 200, 201, 202]);
+        assert_eq!(got[2], label(201, "Locked"));
+        assert_eq!(
+            got[3],
+            button(
+                202,
+                "Unlock b…",
+                true,
+                Action::Unlock { serial: "b".into() }
+            )
+        );
+        assert_eq!(action(&got, 102), None);
+        assert!(find(&got, 101).is_none());
     }
 
     #[test]
@@ -791,7 +921,7 @@ mod tests {
         assert_eq!(action(&third, 100), Some(disconnect("a")));
         assert_eq!(action(&third, 350), Some(undo("c")));
         let ids: Vec<i32> = third.iter().map(Item::id).take(4).collect();
-        assert_eq!(ids, [300, 200, 100, 15]);
+        assert_eq!(ids, [300, 200, 100, 4]);
     }
 
     #[test]

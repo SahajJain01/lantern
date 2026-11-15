@@ -8,10 +8,10 @@
     python3 tools/device_test.py --state                             # print phone state
     python3 tools/device_test.py --manual --only 26                  # Plan 4b: Connect from a notice
     python3 tools/device_test.py --pair                              # Plan 4c: two phones (28-30)
-    python3 tools/device_test.py --pair --manual                     # also 31 (cable pull)
+    python3 tools/device_test.py --pair --manual                     # also 31 (cable pull), 32 (PIN)
 
-Items (31; 20 automatic, 8, 14, 21 and 24-27 only with --manual; 28-31 only with --pair,
-31 also with --manual):
+Items (32; 20 automatic, 8, 14, 21 and 24-27 only with --manual; 28-32 only with --pair,
+31 and 32 also with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -33,6 +33,7 @@ Items (31; 20 automatic, 8, 14, 21 and 24-27 only with --manual; 28-31 only with
                                            29 clipboard_fans_out (--pair, both unlocked)
                                            30 one_phone_failure_isolated (--pair)
                                            31 unplug_one_keeps_other (--pair --manual, cable pull)
+                                           32 lock_one_keeps_other (--pair --manual, O = Motorola, PIN)
 A full automatic run prints `20/20 PASS` when everything passes.
 
 Manual items never read stdin. Before any item runs, the suite prints every selected manual
@@ -45,7 +46,7 @@ released (`wakefulness` from `dumpsys power`), so a slow answer never fails a re
 replug is always his: `adb reconnect` once left the Xiaomi in a non-adb USB mode (18d1:4e11)
 until a physical replug, so the suite never uses it.
 
---pair (Plan 4c) runs only the two-phone items (the PAIR set: 28-31), each inside
+--pair (Plan 4c) runs only the two-phone items (the PAIR set: 28-32), each inside
 `two_phones`: exactly SERIAL and OTHER attached, where OTHER is
 LANTERN_OTHER_SERIAL, else the only other attached `device`. It saves the PC clipboard,
 settings.toml (then `autoconnect = false`) and both device records' `off`/`live`, reads both
@@ -2961,6 +2962,94 @@ class Suite:
                              lambda: self._close_pair_settings(windows)))
 
 
+    def lock_one_keeps_other(self):
+        """Item 32 (--pair --manual; O is the PIN-locked Motorola): O locks while an S Settings
+        window is open. A PC copy reaches S at once and O shows its own "Unlock your <name>"
+        (tray rows only under O's slot); S's helper and window stay as they are. After Sahaj types
+        O's PIN, O gets the held PC copy."""
+        check(OTHER == "ZD222LMDFV",
+              f"item 32 needs the PIN-locked Motorola as the other phone: "
+              f"LANTERN_OTHER_SERIAL=ZD222LMDFV (got {OTHER})")
+        windows = []
+        ok = False
+        with two_phones():
+            saved = klipper("getClipboardContents")
+            saved = saved[:-1] if saved.endswith("\n") else saved
+            note(f"saved the PC clipboard text ({len(saved)} chars)")
+            try:
+                name = device_name(OTHER)
+                note(f"{OTHER}'s name: {name}")
+                # 1. An S Settings window.
+                windows.append((SERIAL, self._pair_settings(SERIAL, "s-settings")))
+                s_pids = phone_state(SERIAL)["helper_pids"]
+                since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # 2. Lock O.
+                adb("shell", "input", "keyevent", "KEYCODE_SLEEP", serial=OTHER)
+                _, secs = wait_until(f"{OTHER} deviceLocked=1", 15,
+                                     lambda: device_locked(OTHER) is True, interval=0.3)
+                note(f"{OTHER} locked {secs:.1f} s after KEYCODE_SLEEP")
+                with NotifyMonitor("32") as mon:
+                    # 3. A PC copy of its own length.
+                    text = f"lock-one-{os.getpid()}{int(time.time()) % 100000}"
+                    t0 = {p: phone_now(p) for p in (SERIAL, OTHER)}
+                    klipper("setClipboardContents", text)
+                    # 4. Within 10 s: O's notice and journal line, S's copy; S untouched.
+                    want = f"Unlock your {name}"
+                    _, nsecs = wait_until(f"Notify {want!r}", 10, lambda: mon.matching(want),
+                                          interval=0.2)
+                    note(f"Notify {want!r} {nsecs:.1f} s after the copy")
+
+                    def o_locked_line():
+                        out = sh("journalctl", "--user", "-u", UNIT, "--since", since,
+                                 "--no-pager", "-o", "cat", timeout=30)
+                        return [l for l in out.splitlines() if "phone locked" in l
+                                and re.search(rf'serial="?{re.escape(OTHER)}"?(\s|$)',
+                                              ANSI.sub("", l))]
+                    wait_until(f"journal: phone locked for {OTHER}", 10, o_locked_line)
+                    note(f"journal: phone locked for {OTHER}")
+                    s_want = f"clip: PC clipboard ({len(text)} chars) set on the phone"
+                    _, secs = wait_until(f"the copy set on {SERIAL}", 10, lambda: [
+                        m for _, m in logcat_since(t0[SERIAL], ["lantern"], SERIAL)
+                        if m == s_want], interval=0.3)
+                    note(f"{SERIAL}: {s_want!r} within {secs:.1f} s")
+                    now = phone_state(SERIAL)["helper_pids"]
+                    check(set(now) == set(s_pids),
+                          f"{SERIAL}'s helper pids {sorted(s_pids)} -> {sorted(now)}")
+                    check(windows[0][1].p.poll() is None, f"{SERIAL}'s Settings window exited")
+                    tray = tray_name()
+                    o_row = tray_phone_row(tray, name)
+                    check(o_row, f"no tray row for {name}")
+                    base, rows = o_row
+                    unlock_label = f"Unlock {name}…".replace("_", "__")
+                    check(rows.get(base + 1, ("",))[0] == "Locked"
+                          and rows.get(base + 2, ("",))[0] == unlock_label,
+                          f"{name}'s slot {base}: rows {rows}")
+                    stray = [cid for cid, (label, _) in rows.items()
+                             if cid // 100 != base // 100
+                             and (label == "Locked" or label.startswith("Unlock "))]
+                    check(not stray, f"lock rows outside {name}'s slot: {stray}")
+                    note(f"tray: Locked / {unlock_label!r} under {name}'s slot only; "
+                         f"{SERIAL}: same helper, window open")
+                    # 5. Sahaj types O's PIN; O then gets the held copy.
+                    ask(f"Click 'Enter PIN…' on 'Unlock your {name}' and type its PIN "
+                        f"(waiting up to {MANUAL_WAIT} s).")
+                    _, secs = wait_journal(r"unlock result.*ok=true", since, MANUAL_WAIT)
+                    note(f"journal: unlock result ok=true after {secs:.1f} s")
+                    o_want = f"clip: held PC copy ({len(text)} chars) set on the phone"
+                    _, secs = wait_until(f"the held copy set on {OTHER}", 30, lambda: [
+                        m for _, m in logcat_since(t0[OTHER], ["lantern"], OTHER)
+                        if m == o_want], interval=0.5)
+                    note(f"{OTHER}: {o_want!r} {secs:.1f} s after the unlock result")
+                ok = True
+            finally:
+                # 6. The user's clipboard first.
+                def restore():
+                    klipper("setClipboardContents", saved)
+                    note("restored the PC clipboard text")
+                cleanup(ok, ("restore the PC clipboard", restore),
+                        ("close S's Settings window", lambda: self._close_pair_settings(windows)))
+
+
 ITEMS = [
     "session_starts_on_plug",
     "open_settings_creates_one_display",
@@ -2993,15 +3082,17 @@ ITEMS = [
     "clipboard_fans_out",
     "one_phone_failure_isolated",
     "unplug_one_keeps_other",
+    "lock_one_keeps_other",
 ]
-# Need a person: pull the cable (8, 14, 24, 25, 31), type the phone's PIN (21, 27) or click
+# Need a person: pull the cable (8, 14, 24, 25, 31), type the phone's PIN (21, 27, 32) or click
 # Connect (26).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt",
           "autoconnect_on_remembers_off", "autoconnect_off_asks_on_plug",
-          "connect_from_entry_opens_app", "unlock_prompt_at_connect", "unplug_one_keeps_other"}
+          "connect_from_entry_opens_app", "unlock_prompt_at_connect", "unplug_one_keeps_other",
+          "lock_one_keeps_other"}
 # Run only with --pair (inside `two_phones`); a --pair run selects only these.
 PAIR = {"two_phones_live", "clipboard_fans_out", "one_phone_failure_isolated",
-        "unplug_one_keeps_other"}
+        "unplug_one_keeps_other", "lock_one_keeps_other"}
 # The person's steps for every manual item, in order: printed for every selected manual item
 # before any item runs, and again (`>>>`) when the item starts. He does them at his pace; every
 # wait observes its edge for up to MANUAL_WAIT.
@@ -3044,6 +3135,9 @@ STEPS = {
     "unplug_one_keeps_other": [
         "Pull the Xiaomi's cable and keep it out for at least 15 s.",
         "Plug it back in.",
+    ],
+    "lock_one_keeps_other": [
+        "When 'Unlock your edge 50 pro' shows, click Enter PIN… and type the PIN.",
     ],
 }
 
@@ -3133,7 +3227,7 @@ def main():
             print(f"  {line}", flush=True)
     if not args.nested and desktop_locked():
         print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
-              "(4-6, 12, 13, 17, 22, 28-31) cannot pass. Unlock it or use --nested.", flush=True)
+              "(4-6, 12, 13, 17, 22, 28-32) cannot pass. Unlock it or use --nested.", flush=True)
     results = []
     # Preflight: lanternd serves only this phone for the run (other phones plugged in are
     # ignored); the previous value is put back at the end.

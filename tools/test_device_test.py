@@ -228,12 +228,16 @@ class DeviceTestSelfTests(unittest.TestCase):
     def test_pair_items_need_pair(self):
         self.assertTrue(set(dt.PAIR) <= set(dt.ITEMS))
 
-    def test_items_28_to_31_are_pair_items(self):
-        names = dt.ITEMS[27:31]
+    def test_items_28_to_32_are_pair_items(self):
+        names = dt.ITEMS[27:32]
         self.assertEqual(names, ["two_phones_live", "clipboard_fans_out",
-                                 "one_phone_failure_isolated", "unplug_one_keeps_other"])
+                                 "one_phone_failure_isolated", "unplug_one_keeps_other",
+                                 "lock_one_keeps_other"])
         self.assertEqual(set(names), dt.PAIR)
-        self.assertEqual(dt.MANUAL & dt.PAIR, {"unplug_one_keeps_other"})
+        self.assertEqual(dt.MANUAL & dt.PAIR, {"unplug_one_keeps_other", "lock_one_keeps_other"})
+        self.assertEqual(dt.STEPS["lock_one_keeps_other"],
+                         ["When 'Unlock your edge 50 pro' shows, click Enter PIN… and type "
+                          "the PIN."])
         for name in dt.ITEMS:
             self.assertTrue(callable(getattr(dt.Suite, name, None)), name)
 

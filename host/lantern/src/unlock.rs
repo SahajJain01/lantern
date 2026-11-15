@@ -1,11 +1,13 @@
-//! Unlocking a PIN-locked phone from the PC: one "Unlock your <phone>" notification per locked
-//! stretch, a KDE password dialog behind its action, and the PIN handed to the run loop, which
-//! sends it to the helper as one `unlock{pin}` frame. After the unlock, apps whose open the lock
-//! blocked are opened again.
+//! Unlocking a PIN-locked phone from the PC: one "Unlock your <phone>" notification per phone
+//! per locked stretch, a KDE password dialog behind its action (one dialog at a time across
+//! phones), and the PIN handed to the run loop with its phone's serial, which sends it to that
+//! phone's helper as one `unlock{pin}` frame. After the unlock, apps whose open the lock blocked
+//! are opened again.
 //!
 //! The PIN never reaches a log line, an error string, `Debug` output or a process argument: it
 //! lives in a [`Pin`] (overwritten when dropped) from the dialog's stdout to the frame.
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
@@ -131,8 +133,8 @@ pub enum LockEvent {
 
 /// A cheap, cloneable handle that asks the unlock prompt for its PIN dialog for one phone: the
 /// tray's Unlock row. It takes the notification action's path (one dialog at a time, the
-/// answer pinned to the phone), and opens nothing unless the phone it names is the one whose
-/// locked stretch is open; the holder never runs the dialog and never sees the PIN.
+/// answer pinned to the phone), and opens nothing unless the phone it names has its locked
+/// stretch open; the holder never runs the dialog and never sees the PIN.
 #[derive(Debug, Clone)]
 pub struct Request(mpsc::Sender<String>);
 
@@ -143,13 +145,13 @@ pub struct Requests(mpsc::Receiver<String>);
 impl Request {
     /// A handle and the receiving end [`run`] takes.
     pub fn channel() -> (Request, Requests) {
-        // One pending ask is enough: more clicks before the prompt looks are the same ask.
-        let (tx, rx) = mpsc::channel(1);
+        // A few pending asks (one per phone clicked before the prompt looks); more are dropped.
+        let (tx, rx) = mpsc::channel(4);
         (Request(tx), Requests(rx))
     }
 
-    /// Asks for the PIN dialog for phone `serial` without waiting. A click while one is
-    /// pending is dropped.
+    /// Asks for the PIN dialog for phone `serial` without waiting. A click while the channel is
+    /// full is dropped.
     pub fn ask(&self, serial: String) {
         match self.0.try_send(serial) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
@@ -287,45 +289,73 @@ fn ask(prompt: &Prompt, name: &str) -> Result<Option<Pin>, String> {
     Pin::parse(raw).map(Some).map_err(str::to_owned)
 }
 
-/// Starts the PIN dialog for the phone whose stretch is open (its serial pinned to the
-/// answer), unless one is already open. `wanted` is the phone a tray request named: the dialog
-/// opens only if that is the stretch's phone. `None` if a dialog is open, no stretch is open or
-/// another phone was named.
+/// One phone's lock as the prompt sees it.
+#[derive(Debug, Default)]
+struct PhoneLock {
+    /// Its locked stretch is open: from its first `Locked` until `Unlocked` or a successful
+    /// `unlock_result`.
+    stretch: bool,
+    /// Its stretches ended so far: a dialog answer is only good for the stretch it was asked in.
+    ended: u64,
+    /// Its notification on screen (0: none).
+    shown: u32,
+}
+
+/// Starts the PIN dialog for phone `serial` (its serial pinned to the answer), if its stretch
+/// is open. The caller makes sure no other dialog is open.
 fn begin_asking(
-    asking: &Option<Asking>,
+    locks: &HashMap<String, PhoneLock>,
     view: &watch::Receiver<View>,
     prompt: &Prompt,
-    stretch: (Option<&str>, u64),
+    serial: &str,
     from: &str,
-    wanted: Option<&str>,
 ) -> Option<Asking> {
-    if asking.is_some() {
-        tracing::debug!(from, "PIN dialog already open");
-        return None;
-    }
-    let (open, ended) = stretch;
-    // The PIN is pinned to the stretch's phone now.
-    let Some(serial) = open.map(str::to_owned) else {
-        tracing::info!(from, "unlock clicked with no phone locked; no PIN dialog");
-        return None;
-    };
-    if let Some(wanted) = wanted.filter(|wanted| *wanted != serial) {
+    let Some(lock) = locks.get(serial).filter(|lock| lock.stretch) else {
         tracing::info!(
+            serial,
             from,
-            wanted,
-            locked = serial,
-            "unlock asked for a phone whose stretch isn't the open one; no PIN dialog"
+            "unlock asked for a phone that isn't locked; no PIN dialog"
         );
         return None;
-    }
-    let name = phone_name(view, &serial);
+    };
+    let name = phone_name(view, serial);
     let prompt = prompt.clone();
     tracing::info!(serial, from, "asking for the PIN");
     Some(Asking {
         task: tokio::task::spawn_blocking(move || ask(&prompt, &name)),
-        serial,
-        stretch: ended,
+        serial: serial.to_owned(),
+        stretch: lock.ended,
     })
+}
+
+/// A click (notification or tray) for phone `serial`: its dialog opens now, or after the open
+/// one is answered (queued at most once; a click for the phone already asked does nothing).
+fn want_dialog(
+    asking: &mut Option<Asking>,
+    queued: &mut VecDeque<String>,
+    locks: &HashMap<String, PhoneLock>,
+    view: &watch::Receiver<View>,
+    prompt: &Prompt,
+    serial: &str,
+    from: &str,
+) {
+    match asking {
+        Some(open) if open.serial == serial => {
+            tracing::debug!(serial, from, "its PIN dialog is already open");
+        }
+        Some(open) => {
+            if !queued.iter().any(|s| s == serial) {
+                tracing::info!(
+                    serial,
+                    from,
+                    asking = open.serial,
+                    "another PIN dialog is open; this one waits"
+                );
+                queued.push_back(serial.to_owned());
+            }
+        }
+        None => *asking = begin_asking(locks, view, prompt, serial, from),
+    }
 }
 
 /// A PIN dialog in flight.
@@ -333,17 +363,21 @@ struct Asking {
     task: JoinHandle<Result<Option<Pin>, String>>,
     /// The serial of the phone whose notification was clicked: the PIN goes only to it.
     serial: String,
-    /// [`run`]'s stretch count at the click: an answer after the stretch ended is wiped.
+    /// That phone's `ended` count at the click: an answer after its stretch ended is wiped.
     stretch: u64,
 }
 
-/// Shows the unlock notification and the PIN dialog, hands valid PINs to `pins` with the serial
-/// of the phone they were asked for (the run loop sends each as one `unlock` frame, only to that
-/// phone) and reopens blocked apps after an unlock, until `events` closes. One stretch at a
-/// time: it belongs to the phone whose `Locked` opened it, and other phones' lock events are
-/// ignored until it ends. The dialog opens on the notification's action or on a [`Request`]
-/// (the tray's Unlock row) naming that phone, one at a time, and its answer is pinned to that
-/// phone. Without a notification server it logs one warning and carries on.
+/// Shows the unlock notifications and the PIN dialog, hands valid PINs to `pins` with the
+/// serial of the phone they were asked for (the run loop sends each as one `unlock` frame,
+/// only to that phone) and reopens blocked apps after an unlock, until `events` closes.
+///
+/// Every phone has its own lock stretch and its own notice: a phone's events never touch
+/// another phone's notice. The dialog opens on a notice's action or on a [`Request`] (the
+/// tray's Unlock row), only for a phone whose stretch is open, and one at a time across
+/// phones: a click for another phone while a dialog is open waits (once per phone) and its
+/// dialog opens after the answer if that phone is still locked. The answer goes only to the
+/// phone it was asked for, and only in the stretch it was asked in. Without a notification
+/// server it logs one warning and carries on.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     conn: Connection,
@@ -355,13 +389,10 @@ pub async fn run(
     prompt: Prompt,
 ) -> Result<()> {
     let (mut notices, mut actions) = Notices::new(conn).await?;
-    // The locked stretch: the phone whose first `Locked` opened it, until it ends.
-    let mut stretch: Option<String> = None;
-    // Stretches ended so far: a dialog answer is only good for the stretch it was asked in.
-    let mut ended: u64 = 0;
-    // The notification on screen (0: none).
-    let mut shown: u32 = 0;
+    let mut locks: HashMap<String, PhoneLock> = HashMap::new();
     let mut asking: Option<Asking> = None;
+    // Phones clicked while another phone's dialog was open, in click order.
+    let mut queued: VecDeque<String> = VecDeque::new();
     let mut requests = requests.0;
     // Whether `requests` can still deliver (every Request dropped: stop polling it).
     let mut requestable = true;
@@ -369,39 +400,32 @@ pub async fn run(
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
-                // Another phone's event while a stretch is open waits until it ends.
-                let other = |serial: &str| stretch.as_deref().is_some_and(|s| s != serial);
                 match event {
                     LockEvent::Locked { serial, reason } => {
-                        if stretch.is_some() {
-                            if other(&serial) {
-                                tracing::info!(serial, ?reason, "another phone is locked; its prompt waits");
-                            }
+                        let lock = locks.entry(serial.clone()).or_default();
+                        if lock.stretch {
                             continue;
                         }
                         tracing::info!(serial, ?reason, "phone locked: asking for its PIN");
+                        lock.stretch = true;
                         let name = phone_name(&view, &serial);
-                        stretch = Some(serial);
-                        shown = show(&mut notices, 0, locked_notice(&name), "Enter PIN…").await;
-                    }
-                    LockEvent::Result { serial, .. } | LockEvent::Unlocked { serial }
-                        if other(&serial) =>
-                    {
-                        tracing::debug!(serial, "lock event for another phone than the stretch's; ignored");
+                        lock.shown = show(&mut notices, lock.shown, locked_notice(&name), "Enter PIN…").await;
                     }
                     LockEvent::Result { serial, ok: false, reason } => {
                         tracing::info!(serial, reason = reason.as_deref().unwrap_or(""), "unlock failed");
                         let name = phone_name(&view, &serial);
                         let notice = failed_notice(&name, reason.as_deref());
-                        shown = show(&mut notices, shown, notice, "Try again").await;
+                        let lock = locks.entry(serial).or_default();
+                        lock.shown = show(&mut notices, lock.shown, notice, "Try again").await;
                     }
                     LockEvent::Result { serial, ok: true, .. } | LockEvent::Unlocked { serial } => {
-                        if stretch.is_some() || shown != 0 {
+                        let lock = locks.entry(serial.clone()).or_default();
+                        if lock.stretch || lock.shown != 0 {
                             tracing::info!(serial, "phone unlocked");
                         }
-                        stretch = None;
-                        ended += 1;
-                        notices.close(std::mem::take(&mut shown)).await;
+                        lock.stretch = false;
+                        lock.ended += 1;
+                        notices.close(std::mem::take(&mut lock.shown)).await;
                     }
                     LockEvent::Reopen { serial, apps } => reopen(&exe, &serial, apps),
                 }
@@ -410,30 +434,30 @@ pub async fn run(
                 let Some(Ok(message)) = message else { continue };
                 // Only the notification server's own signal counts, for a notification of ours.
                 let Some((id, action)) = notices.action(&message) else { continue };
-                if id == 0 || id != shown || action != ACTION {
+                if id == 0 || action != ACTION {
                     continue;
                 }
-                if let Some(started) = begin_asking(&asking, &view, &prompt, (stretch.as_deref(), ended), "notification", None) {
-                    asking = Some(started);
-                }
+                let Some(serial) = locks.iter().find(|(_, lock)| lock.shown == id).map(|(s, _)| s.clone()) else {
+                    continue;
+                };
+                want_dialog(&mut asking, &mut queued, &locks, &view, &prompt, &serial, "notification");
             }
             request = requests.recv(), if requestable => {
-                let Some(wanted) = request else {
+                let Some(serial) = request else {
                     requestable = false;
                     continue;
                 };
-                // The tray shows its row only while locked; a click that raced the unlock
-                // opens nothing.
-                if stretch.is_none() {
-                    tracing::info!(wanted, "unlock requested while not locked; no PIN dialog");
+                // The tray shows its row only while that phone is locked; a click that raced
+                // the unlock opens nothing.
+                if !locks.get(&serial).is_some_and(|lock| lock.stretch) {
+                    tracing::info!(serial, "unlock requested while that phone isn't locked; no PIN dialog");
                     continue;
                 }
-                if let Some(started) = begin_asking(&asking, &view, &prompt, (stretch.as_deref(), ended), "tray", Some(&wanted)) {
-                    asking = Some(started);
-                }
+                want_dialog(&mut asking, &mut queued, &locks, &view, &prompt, &serial, "tray");
             }
             answer = async { (&mut asking.as_mut().expect("guarded").task).await }, if asking.is_some() => {
                 let Asking { serial, stretch: asked_in, .. } = asking.take().expect("guarded");
+                let ended = locks.get(&serial).map_or(0, |lock| lock.ended);
                 match answer {
                     Ok(Ok(Some(pin))) if asked_in != ended => {
                         drop(pin);
@@ -442,16 +466,22 @@ pub async fn run(
                     Ok(Ok(Some(pin))) => match pins.try_send((serial.clone(), pin)) {
                         Ok(()) => tracing::info!(serial, "PIN handed to the session"),
                         // The Pin inside the error is dropped (wiped) here.
-                        Err(_) => tracing::warn!("PIN not sent: an unlock is already pending"),
+                        Err(_) => tracing::warn!(serial, "PIN not sent: an unlock is already pending"),
                     },
                     Ok(Ok(None)) => {}
                     Ok(Err(message)) => {
                         tracing::warn!(serial, message, "PIN not sent");
                         let name = phone_name(&view, &serial);
                         let notice = (format!("Couldn't unlock {name}"), escape_markup(&message));
-                        shown = show(&mut notices, shown, notice, "Try again").await;
+                        let lock = locks.entry(serial).or_default();
+                        lock.shown = show(&mut notices, lock.shown, notice, "Try again").await;
                     }
                     Err(error) => tracing::warn!(%error, "PIN dialog task failed"),
+                }
+                // The next phone clicked meanwhile that is still locked gets its dialog.
+                while asking.is_none() {
+                    let Some(next) = queued.pop_front() else { break };
+                    asking = begin_asking(&locks, &view, &prompt, &next, "queued");
                 }
             }
         }

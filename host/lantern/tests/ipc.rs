@@ -1716,6 +1716,9 @@ struct Opts {
     /// The test reports adb's first device list itself ([`Ctl::listed`]); otherwise the online
     /// phones are that list.
     unlisted: bool,
+    /// R8: this serial's sessions own an adb forward that `close` removes through this fake adb,
+    /// and each of its starts appends `start` to the fake's `order` log.
+    slow_close: Option<(String, SlowAdb)>,
 }
 
 /// A 300 ms unplug grace and a 2 s connect-and-open window.
@@ -1866,13 +1869,27 @@ fn start_ctl_ports(
         ..Default::default()
     };
     more(&mut parts);
+    let slow_close = opts.slow_close;
     let starter = move |serial: String| {
         let port = port_of(&serial);
+        let slow = slow_close
+            .as_ref()
+            .filter(|(slow, _)| *slow == serial)
+            .map(|(_, adb)| {
+                adb.note("start");
+                adb.program.clone()
+            });
         async move {
             let port = port.ok_or_else(|| anyhow::anyhow!("no fake helper for {serial}"))?;
             let stream = TcpStream::connect(("127.0.0.1", port)).await?;
             let stream = handshake(stream, TOKEN, true, true).await?;
-            Ok(SessionConn::attach(stream, Adb::new(serial), "sha"))
+            Ok(match slow {
+                Some(program) => {
+                    SessionConn::attach(stream, Adb::with_program(program, serial), "sha")
+                        .with_forward(45999)
+                }
+                None => SessionConn::attach(stream, Adb::new(serial), "sha"),
+            })
         }
     };
     let (stop, stop_rx) = oneshot::channel::<()>();
@@ -3454,7 +3471,7 @@ impl Locky {
         timeout(
             STEP,
             self.view
-                .wait_for(|v| v.live().is_some_and(|p| p.locked == locked)),
+                .wait_for(|v| v.live_phones().next().is_some_and(|p| p.locked == locked)),
         )
         .await
         .unwrap_or_else(|_| panic!("view.locked never became {locked}"))
@@ -3622,7 +3639,7 @@ async fn unlock_frame_not_logged() {
 async fn locked_sets_view_and_unlocked_clears() {
     let (helper, port) = FakeHelper::spawn().await;
     let mut locky = start_locky(port).await;
-    assert!(!locky.view.borrow().live().unwrap().locked);
+    assert!(!locky.view.borrow().live_phones().next().unwrap().locked);
     helper.send(control(
         0,
         Control::Locked {
@@ -3674,7 +3691,7 @@ async fn locked_sets_view_and_unlocked_clears() {
         },
     ));
     assert_eq!(locky.event().await, failed);
-    assert!(locky.view.borrow().live().unwrap().locked);
+    assert!(locky.view.borrow().live_phones().next().unwrap().locked);
     helper.send(control(
         0,
         Control::UnlockResult {
@@ -3937,10 +3954,13 @@ async fn without_unlock_prompt_open_errors_are_kept() {
             reason: LockReason::Open,
         },
     ));
-    timeout(STEP, view.wait_for(|v| v.live().is_some_and(|p| p.locked)))
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        STEP,
+        view.wait_for(|v| v.live_phones().next().is_some_and(|p| p.locked)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let mut client = UnixStream::connect(&daemon.sock).await.unwrap();
     send(&mut client, &open("com.foo", 0, None)).await;
     let win = helper.next().await.stream;
@@ -4623,5 +4643,261 @@ async fn status_top_level_is_the_latest_ready_phone() {
     expect_bye(&mut b).await;
     let report = status_until(&ctl.sock, |r| r.serial.as_deref() == Some("dev")).await;
     assert_eq!(report.state, SessionState::Ready);
+    ctl.shutdown().await;
+}
+
+/// A fake adb whose `forward --remove` takes 600 ms and then appends `removed` to `order`; the
+/// test's starter appends `start` there too. Every other call succeeds at once.
+#[derive(Clone)]
+struct SlowAdb {
+    program: PathBuf,
+    order: PathBuf,
+}
+
+impl SlowAdb {
+    fn new() -> Self {
+        let n = DIRS.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("lantern-ipc-slow-adb-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("adb");
+        let tmp = dir.join("adb.tmp");
+        std::fs::write(
+            &tmp,
+            "#!/bin/sh\ncase \"$*\" in\n  *'forward --remove'*) sleep 0.6; echo removed >> \"$(dirname \"$0\")/order\" ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &program).unwrap();
+        // A fork in another test's thread while the script was open for writing can hold its
+        // write fd until that child execs (ETXTBSY): run it once until it execs cleanly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(&program).arg("probe").status() {
+                Ok(status) => {
+                    assert!(status.success());
+                    break;
+                }
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fake adb busy: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake adb: {error}"),
+            }
+        }
+        Self {
+            order: dir.join("order"),
+            program,
+        }
+    }
+
+    fn note(&self, what: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.order)
+            .unwrap();
+        writeln!(file, "{what}").unwrap();
+    }
+
+    fn order(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.order)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Drop for SlowAdb {
+    fn drop(&mut self) {
+        if let Some(dir) = self.order.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// R8 (1): a phone's restart waits for its own previous session's close, so that close can't
+/// remove the forward (same port) the new session made. b's helper dies; its close removes
+/// the forward slowly (600 ms) while the retry (50 ms) is due long before.
+#[tokio::test]
+async fn restart_waits_for_its_own_close() {
+    let (mut dev, dev_port) = FakeHelper::spawn().await;
+    let (mut b, b_port) = FakeHelper::spawn().await;
+    let adb = SlowAdb::new();
+    let ports: std::collections::HashMap<String, u16> =
+        [("dev".to_owned(), dev_port), ("b".to_owned(), b_port)].into();
+    let mut ctl = start_ctl_ports(
+        Arc::new(move |serial: &str| ports.get(serial).copied()),
+        &["dev", "b"],
+        Opts {
+            slow_close: Some(("b".into(), adb.clone())),
+            ..Default::default()
+        },
+        |_| {},
+    );
+    assert_eq!(dev.next_session().await, 0);
+    assert_eq!(b.next_session().await, 0);
+    ctl.ready("dev").await;
+    ctl.ready("b").await;
+    b.die();
+    assert_eq!(b.next_session().await, 1);
+    ctl.ready("b").await;
+    assert_eq!(adb.order(), ["start", "removed", "start"]);
+    dev.assert_quiet().await;
+    assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Ready);
+    ctl.shutdown().await;
+}
+
+/// R8 (2): b blips (back within its grace) while dev is live: b restarts at once with no
+/// prompt, and dev is never touched.
+#[tokio::test]
+async fn blip_of_one_phone_restarts_it_and_keeps_the_other() {
+    let (mut ctl, mut dev, mut b) = two_live(Opts {
+        timing: Some(fast_timing()),
+        ..Default::default()
+    })
+    .await;
+    let (mut on_dev, win_dev) = open_window_on(&ctl.sock, &mut dev, "com.x", "dev").await;
+    let mut view = ctl.view.clone();
+    view.borrow_and_update();
+    let watch_dev = tokio::spawn(async move {
+        while view.changed().await.is_ok() {
+            let now = view.borrow_and_update().clone();
+            assert_eq!(
+                now.phone("dev").unwrap().state,
+                PhoneState::Ready,
+                "dev changed: {now:?}"
+            );
+        }
+    });
+    ctl.offline("b");
+    expect_bye(&mut b).await;
+    ctl.state_until("b", PhoneState::Reconnecting).await;
+    ctl.online("b");
+    assert_eq!(b.next_session().await, 1);
+    ctl.ready("b").await;
+    ctl.assert_no_prompt().await;
+    assert_client_open(&mut on_dev).await;
+    dev.assert_quiet().await;
+    routes_both_ways(&mut on_dev, &mut dev, win_dev, 7).await;
+    assert!(!watch_dev.is_finished(), "dev's watcher failed");
+    watch_dev.abort();
+    ctl.shutdown().await;
+}
+
+/// A helper that answers the hello and then never reads another byte: its queue fills.
+struct DeafHelper {
+    sessions: mpsc::UnboundedReceiver<usize>,
+}
+
+impl DeafHelper {
+    async fn spawn() -> (Self, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sessions_tx, sessions) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            for n in 0.. {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let hello = read_frame_async(&mut socket).await.unwrap().unwrap();
+                assert!(matches!(decode(&hello), Control::Hello { .. }));
+                let reply = control(
+                    0,
+                    Control::Hello {
+                        version: 1,
+                        token: String::new(),
+                        keyboard: true,
+                        screen_off: true,
+                    },
+                );
+                write_frame_async(&mut socket, &reply).await.unwrap();
+                let _ = sessions_tx.send(n);
+                held.push(socket);
+            }
+        });
+        (Self { sessions }, port)
+    }
+}
+
+/// R8 (3): b's helper stops reading, so the PC clipboard fan-out can't reach it: only b's
+/// session ends (and restarts); dev stays Ready and gets nothing but the clips.
+#[tokio::test]
+async fn wedged_helper_ends_only_its_own_session() {
+    let (mut dev, dev_port) = FakeHelper::spawn().await;
+    let (mut b, b_port) = DeafHelper::spawn().await;
+    let (handle, _pc_sets) = ClipHandle::test_pair();
+    let (offers, offers_rx) = mpsc::channel(8);
+    let mut ctl = start_ctl_ports(
+        Arc::new(move |serial: &str| match serial {
+            "dev" => Some(dev_port),
+            "b" => Some(b_port),
+            _ => None,
+        }),
+        &["dev", "b"],
+        Opts::default(),
+        |parts| {
+            parts.clipboard = Some(PcClipboard {
+                handle,
+                offers: offers_rx,
+            })
+        },
+    );
+    assert_eq!(dev.next_session().await, 0);
+    assert_eq!(timeout(STEP, b.sessions.recv()).await.unwrap(), Some(0));
+    ctl.ready("dev").await;
+    ctl.ready("b").await;
+    let mut view = ctl.view.clone();
+    view.borrow_and_update();
+    let watch_dev = tokio::spawn(async move {
+        while view.changed().await.is_ok() {
+            let now = view.borrow_and_update().clone();
+            assert_eq!(
+                now.phone("dev").unwrap().state,
+                PhoneState::Ready,
+                "dev changed: {now:?}"
+            );
+        }
+    });
+    let big = "x".repeat(256 * 1024);
+    let mut sent = 0;
+    for n in 0..400 {
+        if ctl.phone("b").unwrap().state != PhoneState::Ready {
+            break;
+        }
+        let offer = pc_offer(&format!("{n:04}{big}"), false);
+        timeout(Duration::from_secs(5), offers.send(offer))
+            .await
+            .expect("the daemon stopped taking PC offers")
+            .unwrap();
+        sent += 1;
+    }
+    // b's session ended (helper stopped reading) and a new one starts.
+    assert_eq!(
+        timeout(Duration::from_secs(5), b.sessions.recv())
+            .await
+            .expect("b never restarted"),
+        Some(1)
+    );
+    ctl.ready("b").await;
+    // dev got every clip and nothing else, on its first session.
+    for _ in 0..sent {
+        assert!(matches!(decode(&dev.next().await), Control::Clip { .. }));
+    }
+    dev.assert_quiet().await;
+    assert_eq!(dev.eofs.load(Ordering::SeqCst), 0);
+    assert!(
+        dev.sessions.try_recv().is_err(),
+        "dev must keep its session"
+    );
+    assert!(!watch_dev.is_finished(), "dev's watcher failed");
+    watch_dev.abort();
     ctl.shutdown().await;
 }

@@ -354,7 +354,8 @@ pub(crate) fn perform(shared: &Arc<Shared>, action: Action) {
             tokio::spawn(async move { confirm_undo(&shared, serial).await });
         }
         // The same request as the notification's action: the prompt opens a dialog only for
-        // the live, locked phone, pins the answer to it and opens one dialog at a time.
+        // a phone whose lock stretch is open, pins the answer to that phone and opens one
+        // dialog at a time across phones (a click during another phone's dialog waits).
         Action::Unlock { serial } => match &shared.unlock {
             Some(request) => request.ask(serial),
             None => tracing::warn!("tray: no unlock prompt (no notification bus); click dropped"),

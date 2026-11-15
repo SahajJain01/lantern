@@ -56,6 +56,14 @@ impl SessionConn {
         Self::from_parts(stream, adb, None, None, None, helper_sha.into())
     }
 
+    /// Test hook: this session owns adb forward `port`, which [`Self::close`] removes (through
+    /// its `Adb`, so a test's fake adb sees the removal).
+    #[doc(hidden)]
+    pub fn with_forward(mut self, port: u16) -> Self {
+        self.forward = Some(port);
+        self
+    }
+
     fn from_parts(
         stream: TcpStream,
         adb: Adb,

@@ -7,7 +7,7 @@ pub mod registry;
 pub mod runs;
 pub mod session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,29 +105,125 @@ where
     close_run(serial, &mut run, hub)
 }
 
-/// Session closes running in the background; quitting waits for them.
+/// How long a phone's due start waits for its previous session's close to finish. A close is
+/// bounded (~5 s, `SessionConn::close`); one still running then is aborted first.
+const CLOSE_HOLD: Duration = Duration::from_secs(5);
+
+/// How long quitting waits for the closes still running; the rest are aborted.
+const CLOSE_CAP: Duration = Duration::from_secs(10);
+
+/// A session close running in the background.
+struct Close {
+    serial: String,
+    since: Instant,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Session closes running in the background, each with its phone; quitting waits for them.
+/// A phone's next start waits for its own close (R8): the old close removes the adb forward
+/// it made, and the new session's forward can have the same port once adb dropped the old one
+/// (Offline), so the close must be done before the start makes its forward.
 #[derive(Default)]
-struct Closing(Vec<tokio::task::JoinHandle<()>>);
+struct Closing {
+    closes: Vec<Close>,
+    /// Phones whose due start waits for their close: a start is due as soon as it ends.
+    held: HashSet<String>,
+}
 
 impl Closing {
-    fn spawn(&mut self, close: Option<BoxFuture<'static, ()>>) {
-        self.0.retain(|task| !task.is_finished());
+    fn spawn(&mut self, serial: &str, close: Option<BoxFuture<'static, ()>>) {
+        self.prune(None);
         if let Some(close) = close {
-            self.0.push(tokio::spawn(close));
+            self.closes.push(Close {
+                serial: serial.to_owned(),
+                since: Instant::now(),
+                task: tokio::spawn(close),
+            });
         }
     }
 
-    /// Waits for every close still running (each is bounded by `SessionConn::close`).
-    async fn finish(&mut self) {
-        let tasks = std::mem::take(&mut self.0);
-        if tokio::time::timeout(
-            Duration::from_secs(10),
-            futures_util::future::join_all(tasks),
-        )
+    /// Forgets ended closes, except a held phone's (other than `asking`'s), which stay until
+    /// [`Self::next_closed`] reports them.
+    fn prune(&mut self, asking: Option<&str>) {
+        let held = &self.held;
+        self.closes.retain(|close| {
+            !close.task.is_finished()
+                || (held.contains(&close.serial) && asking != Some(close.serial.as_str()))
+        });
+    }
+
+    /// Whether `serial`'s due start must wait for its close: `Some(until)` while one runs (the
+    /// start is due again when it ends, see [`Self::next_closed`], or at `until`). A close
+    /// older than [`CLOSE_HOLD`] is aborted; the start waits for the abort to land.
+    fn hold(&mut self, serial: &str) -> Option<Instant> {
+        self.prune(Some(serial));
+        let now = Instant::now();
+        let mut until: Option<Instant> = None;
+        for close in self.closes.iter().filter(|close| close.serial == serial) {
+            let end = if close.since + CLOSE_HOLD <= now {
+                tracing::warn!(serial, "previous session still closing; aborting its close");
+                close.task.abort();
+                now + Duration::from_secs(1)
+            } else {
+                close.since + CLOSE_HOLD
+            };
+            until = Some(until.map_or(end, |until| until.max(end)));
+        }
+        if until.is_some() {
+            self.held.insert(serial.to_owned());
+        } else {
+            self.held.remove(serial);
+        }
+        until
+    }
+
+    /// The next phone whose start was held and whose last close just ended. Cancel-safe;
+    /// pending while there is none.
+    async fn next_closed(&mut self) -> String {
+        std::future::poll_fn(|cx| {
+            let mut ended = Vec::new();
+            self.closes.retain_mut(|close| {
+                if std::pin::Pin::new(&mut close.task).poll(cx).is_ready() {
+                    ended.push(close.serial.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            for serial in ended {
+                if !self.closes.iter().any(|close| close.serial == serial)
+                    && self.held.remove(&serial)
+                {
+                    return std::task::Poll::Ready(serial);
+                }
+            }
+            std::task::Poll::Pending
+        })
         .await
-        .is_err()
-        {
-            tracing::warn!("session closes still running at exit");
+    }
+
+    /// Waits for every close still running (each is bounded by `SessionConn::close`), at most
+    /// [`CLOSE_CAP`].
+    async fn finish(&mut self) {
+        self.finish_within(CLOSE_CAP).await;
+    }
+
+    /// [`Self::finish`] with its cap; closes still running after it are aborted.
+    async fn finish_within(&mut self, cap: Duration) {
+        let mut closes = std::mem::take(&mut self.closes);
+        self.held.clear();
+        let all = futures_util::future::join_all(closes.iter_mut().map(|close| &mut close.task));
+        if tokio::time::timeout(cap, all).await.is_err() {
+            tracing::warn!("session closes still running at exit; aborting them");
+            for close in &closes {
+                close.task.abort();
+            }
+            // An aborted task ends at its next poll; let each one go (drop) before returning.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                futures_util::future::join_all(closes.iter_mut().map(|close| &mut close.task)),
+            )
+            .await;
         }
     }
 }
@@ -808,7 +904,7 @@ where
                         if let Some(run) = runs.get_mut(&serial) {
                             tracing::info!(serial, grace = ?timing.unplug_grace, "device offline; waiting for it to come back");
                             run.cancel_start(&serial, "device offline");
-                            closing.spawn(close_run(&serial, run, &mut hub));
+                            closing.spawn(&serial, close_run(&serial, run, &mut hub));
                             run.retry_at = None;
                             run.failures = 0;
                             run.grace = Some(Instant::now() + timing.unplug_grace);
@@ -843,6 +939,12 @@ where
                     if !due {
                         continue;
                     }
+                    // R8: not before this phone's previous session finished closing.
+                    if let Some(until) = closing.hold(&serial) {
+                        tracing::debug!(serial, "start waits for its previous session to close");
+                        run.retry_at = Some(until);
+                        continue;
+                    }
                     run.retry_at = None;
                     let undone = undoing.as_ref().is_some_and(|(s, _)| *s == serial);
                     if table.plugged(&serial) && !undone {
@@ -862,6 +964,14 @@ where
                     leaving.remove(&serial);
                     tracing::debug!(serial, "away past the grace; closing any notice");
                     prompts.send(ConnectEvent::Gone { serial });
+                }
+            }
+            serial = closing.next_closed() => {
+                // Its held start is due now.
+                if let Some(run) = runs.get_mut(&serial) {
+                    if run.active.is_none() && run.starting.is_none() && run.retry_at.is_some() {
+                        run.retry_at = Some(Instant::now());
+                    }
                 }
             }
             _ = tokio::time::sleep_until(startup_end), if startup => {
@@ -1012,7 +1122,7 @@ where
                 continue;
             };
             tracing::warn!(serial, why, ?lived, "helper session ended unexpectedly");
-            closing.spawn(close_run(&serial, run, &mut hub));
+            closing.spawn(&serial, close_run(&serial, run, &mut hub));
             if lived >= policy.stable_after {
                 run.failures = 0;
             }
@@ -1109,7 +1219,7 @@ where
                         &mut hub,
                         &mut leaving,
                     );
-                    closing.spawn(close);
+                    closing.spawn(&serial, close);
                 }
                 Command::UndoSetup { serial } if being_undone.as_ref() == Some(&serial) => {
                     tracing::info!(serial, "undo-setup is already running on it");
@@ -1445,6 +1555,76 @@ mod tests {
         let echo = anyhow::Error::new(HandshakeError::TokenEcho);
         assert_eq!(exit_code(&echo), 3);
         assert_eq!(exit_code(&anyhow::anyhow!("adb track-devices ended")), 1);
+    }
+
+    /// R8 (1): a phone's due start waits for its own close only; it is due again when that
+    /// close ends.
+    #[tokio::test]
+    async fn closing_holds_only_its_own_phone() {
+        let mut closing = Closing::default();
+        let (done, wait) = tokio::sync::oneshot::channel::<()>();
+        closing.spawn(
+            "b",
+            Some(Box::pin(async move {
+                let _ = wait.await;
+            })),
+        );
+        closing.spawn("dev", None);
+        assert!(closing.hold("dev").is_none());
+        let until = closing.hold("b").expect("b's close runs");
+        assert!(until > Instant::now() + Duration::from_secs(4), "{until:?}");
+        // Nothing has closed yet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), closing.next_closed())
+                .await
+                .is_err()
+        );
+        done.send(()).unwrap();
+        // Another phone's close or start meanwhile doesn't lose b's wake-up.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        closing.spawn("dev", None);
+        assert!(closing.hold("dev").is_none());
+        let serial = tokio::time::timeout(Duration::from_secs(2), closing.next_closed())
+            .await
+            .expect("b's close ended");
+        assert_eq!(serial, "b");
+        assert!(closing.hold("b").is_none());
+        // A close nobody waited for ends quietly.
+        closing.spawn("dev", Some(Box::pin(async {})));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), closing.next_closed())
+                .await
+                .is_err()
+        );
+    }
+
+    /// R8 (4): quitting waits for the closes at most its cap, then aborts the rest.
+    #[tokio::test]
+    async fn finish_aborts_closes_after_its_cap() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let mut closing = Closing::default();
+        closing.spawn(
+            "b",
+            Some(Box::pin(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })),
+        );
+        let started = Instant::now();
+        closing.finish_within(Duration::from_millis(200)).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "not aborted"
+        );
+        assert!(closing.closes.is_empty());
     }
 
     #[test]
