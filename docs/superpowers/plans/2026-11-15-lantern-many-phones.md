@@ -988,7 +988,7 @@ Test commands:
     "no prompt after a restart" (G9 on a swipe phone).
   - Record the summary line in HANDOFF.
 - [ ] **Step 5: Pass B** (both phones attached):
-  `python3 tools/device_test.py --pair --only 28 29 30`.
+  `python3 tools/device_test.py --pair --manual --only 28 29 30` (`--manual`: the Motorola may lock between items and G9 asks for its PIN).
   - Expected: 3/3 PASS. The harness unlocked the Motorola through the G9 notice when it was
     locked.
   - Afterwards: both phones `restored`, both records' `off`/`live` as before, `LANTERN_SERIAL`
@@ -998,7 +998,7 @@ Test commands:
   1. `--manual --only 8`, then `--manual --only 14` (Xiaomi). Item 8's panel restore is read from
      logcat (`cleanup: panel on` since the yank) and SurfaceFlinger power mode 2.
   2. `--pair --manual --only 31 32`.
-  3. `LANTERN_SERIAL=ZD222LMDFV python3 tools/device_test.py --manual --only 27 21` (Motorola).
+  3. `LANTERN_SERIAL=ZD222LMDFV python3 tools/device_test.py --manual --only 27 21` (Motorola; `--only` runs in item order, so 21 runs first).
   4. With the Motorola unplugged: `--manual --only 24 25 26 33`.
 - [ ] **Step 7: Hand checks.**
   - The tray with both phones live shows two checked rows and no one-at-a-time row. Take a

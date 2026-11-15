@@ -64,7 +64,7 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   were deferred by Sahaj's instruction to one acceptance run at the end (Task 8 Steps 2–8, see
   "Plan 4c device acceptance"). Task 1 passed review after one fix round; Tasks 2–7 passed
   without one, with binding follow-ups (rulings R6–R10) folded into the next task each time.
-  Ruling R10's four fixes and these docs are Task 8's code part.
+  Ruling R10's fixes (1), (3), (4) — (2) deferred, see Known minor issues — and these docs are Task 8's code part.
   - Host: `cargo test --workspace --offline` 547 passed (2026-11-15); clippy `-D warnings` and
     `cargo fmt --check` clean; `tools/test_device_test.py` 28 passed.
   - The SDD ledger and per-task reports are in the worktree's gitignored
@@ -83,7 +83,7 @@ category in the launcher, named after the phone.
 
 _Placeholder: the controller fills this in after the run (Task 8 Steps 2–8): Pass A (`build.py
 install && device_test.py`, expected 21/21: items 1–7, 9–13, 15–20, 22, 23, 34), Pass B
-(`--pair --only 28 29 30`, expected 3/3), the manual items (8, 14; `--pair` 31, 32; the
+(`--pair --manual --only 28 29 30`, expected 3/3), the manual items (8, 14; `--pair` 31, 32; the
 Motorola's 27, 21; with the Motorola unplugged 24, 25, 26, 33) and the hand checks (two checked
 tray rows, the Remove dialog's escaped name, two taskbar groups, both phones' settings
 restored)._
@@ -879,6 +879,15 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
       (`NotificationClosed` isn't subscribed; `notices.rs` matches `ActionInvoked` only): a later
       replug's notice still names the offered app. R10 (2), deferred because it needs new D-Bus
       plumbing.
+    - An offered app is lost when the phone connects without asking: with autoconnect on (or a
+      `live` phone), a replug while "Connect your X" shows connects X and closes the offer without
+      opening the app; an open during a live phone's reconnect grace gets an offer that the
+      grace end or the reconnect closes (fix: keep the refused open as that phone's pending
+      request).
+    - The tray's Remove-confirm kdialog is a plain child: it stays on screen after Quit (doesn't
+      hold shutdown).
+    - The PIN dialog's stdout buffer reallocates past 64 bytes (a pasted long password), leaving
+      an unwiped copy; a real PIN never gets there (fix: read in chunks capped at 64 bytes).
   - Suite (`device_test.py`):
     - Item 27 failing before the PIN leaves a fresh "Unlock your …" prompt after its cleanup
       restarts lanternd (tell Sahaj).
@@ -895,6 +904,8 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
     the AltGr test, `clipboard_offer_without_session_is_dropped`); untested: the preedit state
     machine in `App`, the helper's icon blanking, the clipboard reader's secret path, a stale
     socket in `check_daemon`.
+  - `cli.rs` tests fail under a long `TMPDIR`: the daemon socket path passes the 108-byte
+    limit (shorten `scratch()` names).
   - `cli.rs`'s status test has an ETXTBSY risk. The umask stress test is probabilistic.
   - A fresh checkout's `cargo test` needs the helper jar and companion APK built first.
   - `device_test.py` restores only the PC clipboard's text (Klipper's D-Bus), not other mime

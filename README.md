@@ -120,8 +120,8 @@ phone is unplugged or switched off, and syncing one phone never touches another 
 Opening an entry while its phone isn't connected shows a notification **"Connect your Xiaomi
 11T Pro"** (the phone's name from its settings) with a **Connect** button: it connects that phone
 (other connected phones stay connected) and opens the app once the phone is ready (within 2
-minutes). Plugging the phone in while that notification shows keeps the app: the new "… is
-plugged in" notification names it and its **Connect** opens it. If the
+minutes). With autoconnect off, plugging the phone in while that notification shows keeps the app: the new
+"… is plugged in" notification names it and its **Connect** opens it. If the
 phone isn't plugged in, Lantern says "Plug in your …" and opens the app when you plug it in
 within 2 minutes. Without `--phone`, `lantern open` picks the connected phone that has the app
 (the most recently connected one if several do), else the phone with the app you connected
@@ -374,7 +374,7 @@ reinstall or remove the companion with `adb uninstall dev.lantern.companion`).
 ```sh
 python3 tools/build.py install && python3 tools/device_test.py   # items 1–7, 9–13, 15–20, 22–23, 34, unattended
 python3 tools/device_test.py --manual                            # adds 8, 14, 21, 24–27, 33: cable pulls, PIN, Connect clicks
-python3 tools/device_test.py --pair                              # two phones at once: 28–30
+python3 tools/device_test.py --pair --manual --only 28 29 30      # two phones at once (type the Motorola PIN if asked)
 python3 tools/device_test.py --pair --manual                     # also 31 (cable pull), 32 (PIN)
 python3 tools/device_test.py --only 12 13                        # some items, by number or name
 python3 tools/device_test.py --nested                            # windows in a headless nested KWin
