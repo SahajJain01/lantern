@@ -240,6 +240,46 @@ public final class LockWatchTest {
         w.close();
     }
 
+    /** A sure read of locked at session-up opens one stretch; a second check inside it sends nothing. */
+    static void checkNowLockedStartsAStretch() throws Exception {
+        AtomicInteger reads = new AtomicInteger();
+        LockState lock = new LockState(() -> {
+            reads.incrementAndGet();
+            return dump(1);
+        }, s -> { });
+        Rec rec = new Rec();
+        LockWatch w = new LockWatch(lock, m -> rec.sent.add(m.toString()), rec.logs::add, 60_000);
+        w.checkNow("session");
+        eq(1, reads.get(), "one read");
+        eq(List.of("locked{reason=session}"), rec.sent, "locked{session} once");
+        eq(true, rec.logs.contains("lock: phone locked (session)"), "logged: " + rec.logs);
+        w.checkNow("session"); // inside the stretch: nothing more
+        eq(List.of("locked{reason=session}"), rec.sent, "nothing more inside the stretch");
+        w.close();
+    }
+
+    /** A read of unlocked, or an unknown read, sends nothing and starts no poller. */
+    static void checkNowUnlockedOrUnknownSendsNothing() {
+        for (String d : new String[] {dump(0), ""}) {
+            Rec rec = new Rec();
+            LockWatch w = rec.watch(new LockState(() -> d, s -> { }));
+            w.checkNow("session");
+            eq(List.of(), rec.sent, "nothing sent for " + d.trim());
+            eq(null, w.poller(), "no stretch for " + d.trim());
+            w.close();
+        }
+    }
+
+    /** After close (session end) a check never reports a lock. */
+    static void checkNowAfterCloseSendsNothing() {
+        Rec rec = new Rec();
+        LockWatch w = rec.watch(new LockState(() -> dump(1), s -> { }));
+        w.close();
+        w.checkNow("session");
+        eq(List.of(), rec.sent, "nothing after close");
+        eq(null, w.poller(), "no stretch after close");
+    }
+
     static void readIsTriState() {
         eq(Boolean.TRUE, new LockState(() -> dump(1), s -> { }).read(), "locked");
         eq(Boolean.FALSE, new LockState(() -> dump(0), s -> { }).read(), "unlocked");
@@ -268,6 +308,9 @@ public final class LockWatchTest {
             {"readIsTriState", (Case) LockWatchTest::readIsTriState},
             {"unlockConfirmedEndsTheStretchOnce", (Case) LockWatchTest::unlockConfirmedEndsTheStretchOnce},
             {"unlockConfirmedWithoutStretch", (Case) LockWatchTest::unlockConfirmedWithoutStretch},
+            {"checkNowLockedStartsAStretch", (Case) LockWatchTest::checkNowLockedStartsAStretch},
+            {"checkNowUnlockedOrUnknownSendsNothing", (Case) LockWatchTest::checkNowUnlockedOrUnknownSendsNothing},
+            {"checkNowAfterCloseSendsNothing", (Case) LockWatchTest::checkNowAfterCloseSendsNothing},
         };
         int failed = 0;
         for (Object[] c : cases) {

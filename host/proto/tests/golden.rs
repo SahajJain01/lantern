@@ -34,6 +34,8 @@
 //!                     (the default setting: the phone's screen stays on; screen_off: true is omitted)
 //! control_locked.bin : kind=Control(1), stream=0, Control::Locked { reason: Clipboard }
 //!                     payload = {"t":"locked","reason":"clipboard"}
+//! control_locked_session.bin : kind=Control(1), stream=0, Control::Locked { reason: Session }
+//!                     payload = {"t":"locked","reason":"session"}
 //! control_unlock_result.bin : kind=Control(1), stream=0,
 //!                     Control::UnlockResult { ok: false, reason: Some("lock screen not reached") }
 //!                     payload = {"t":"unlock_result","ok":false,"reason":"lock screen not reached"}
@@ -130,6 +132,10 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
             frame_bytes(Kind::Control, 0, locked().encode()),
         ),
         (
+            "control_locked_session",
+            frame_bytes(Kind::Control, 0, locked_session().encode()),
+        ),
+        (
             "control_unlock_result",
             frame_bytes(Kind::Control, 0, unlock_result().encode()),
         ),
@@ -139,6 +145,12 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
 fn locked() -> Control {
     Control::Locked {
         reason: LockReason::Clipboard,
+    }
+}
+
+fn locked_session() -> Control {
+    Control::Locked {
+        reason: LockReason::Session,
     }
 }
 
@@ -299,6 +311,10 @@ fn golden_files_decode() {
             "control_locked" => {
                 assert_eq!(f.payload, br#"{"t":"locked","reason":"clipboard"}"#);
                 assert_eq!(Control::decode(&f.payload).unwrap(), locked());
+            }
+            "control_locked_session" => {
+                assert_eq!(f.payload, br#"{"t":"locked","reason":"session"}"#);
+                assert_eq!(Control::decode(&f.payload).unwrap(), locked_session());
             }
             "control_unlock_result" => {
                 assert_eq!(

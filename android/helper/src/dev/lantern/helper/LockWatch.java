@@ -56,6 +56,23 @@ final class LockWatch implements AutoCloseable {
         t.start();
     }
 
+    /**
+     * Reads the lock once and opens a stretch with {@code reason} only on a sure read of locked
+     * ({@code deviceLocked=1}). An unknown or unlocked read does nothing, and so does a call inside
+     * a stretch or after {@link #close}. Blocks on {@code dumpsys}: never call it on the control
+     * thread.
+     */
+    void checkNow(String reason) {
+        synchronized (this) {
+            if (stretch || closed) {
+                return;
+            }
+        }
+        if (Boolean.TRUE.equals(lock.read())) {
+            onLocked(reason); // re-checks stretch/closed under the monitor
+        }
+    }
+
     /** Tests: the current (or last) stretch's poll thread, or null. */
     synchronized Thread poller() {
         return poller;

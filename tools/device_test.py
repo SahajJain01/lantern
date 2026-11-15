@@ -2,14 +2,14 @@
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
     python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-23
-    python3 tools/device_test.py --manual                            # also 8, 14, 21, 24-26 (a person)
+    python3 tools/device_test.py --manual                            # also 8, 14, 21, 24-27 (a person)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
     python3 tools/device_test.py --manual --only 26                  # Plan 4b: Connect from a notice
     python3 tools/device_test.py --pair                              # Plan 4c: two phones at once
 
-Items (26; 20 automatic, 8, 14, 21, 24, 25 and 26 only with --manual):
+Items (27; 20 automatic, 8, 14, 21 and 24-27 only with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -26,6 +26,7 @@ Items (26; 20 automatic, 8, 14, 21, 24, 25 and 26 only with --manual):
                                            24 autoconnect_on_remembers_off (manual, 2 replugs)
                                            25 autoconnect_off_asks_on_plug (manual, replug, tray)
                                            26 connect_from_entry_opens_app (manual, Sahaj clicks)
+                                           27 unlock_prompt_at_connect (manual, PIN phone, Sahaj types)
 A full automatic run prints `20/20 PASS` when everything passes.
 
 Manual items never read stdin. Before any item runs, the suite prints every selected manual
@@ -2219,7 +2220,9 @@ class Suite:
 
     def swipe_phone_never_prompts(self):
         """A phone without a PIN (the Xiaomi: swipe or no lock screen) never gets the unlock
-        prompt. Copies on the PC and on the phone as item 13 does, then checks: no `lock: phone
+        prompt. First restarts lanternd: for 10 s after ready (a fresh session reads the lock at
+        session-up) no `lock: phone locked` helper line and no "Unlock ..." Notify. Then copies on
+        the PC and on the phone as item 13 does, and checks: no `lock: phone
         locked` line in the helper log, no "phone locked" in lanternd's journal, the tray menu
         (lanternd's view) not locked (no row label starting with "Unlock", none equal to
         "Locked"), and no Notify
@@ -2238,7 +2241,20 @@ class Suite:
                                    stdout=mon_f, stderr=subprocess.STDOUT)
         try:
             time.sleep(1)  # the monitor is subscribed
-            # 1. Copy on the PC and on the phone (item 13's path; it restores the clipboard).
+            # 1. Session-up (Plan 4c): a fresh session reads the lock at once; a swipe phone
+            # never reads as locked, so nothing asks for a PIN in the 10 s after ready.
+            restarted = phone_now()
+            systemctl("restart", UNIT)
+            _, secs = wait_ready(15)
+            note(f"lanternd restarted; ready {secs:.1f} s after")
+            time.sleep(10)
+            at_up = [m for _, m in logcat_since(restarted, ["lantern"])
+                     if m.startswith("lock: phone locked")]
+            check(not at_up, f"helper lock lines at session-up on a swipe phone: {at_up}")
+            at_up_notes = re.findall(r'STRING "(Unlock [^"]*)";', mon_log.read_text(errors="replace"))
+            check(not at_up_notes, f"unlock notifications at session-up: {at_up_notes}")
+            note("session-up: no lock line, no Unlock notification for 10 s after ready")
+            # 2. Copy on the PC and on the phone (item 13's path; it restores the clipboard).
             self.clipboard_both_ways()
             time.sleep(5)
         finally:
@@ -2248,7 +2264,7 @@ class Suite:
             except subprocess.TimeoutExpired:
                 monitor.kill()
             mon_f.close()
-        # 2. Nothing saw a lock.
+        # 3. Nothing saw a lock.
         locked_lines = [m for _, m in logcat_since(since, ["lantern"]) if m.startswith("lock:")]
         check(not locked_lines, f"helper lock lines on a swipe phone: {locked_lines}")
         journal = [l for l in sh("journalctl", "--user", "-u", UNIT, "--since", journal_since,
@@ -2259,7 +2275,7 @@ class Suite:
                                   mon_log.read_text(errors="replace"))
         check(not unlock_notes, f"unlock notifications on a swipe phone: {unlock_notes}")
         note("no lock line, no 'phone locked', no Unlock notification")
-        # 3. lanternd's view: the tray (its bus name is taken now, after any restart).
+        # 4. lanternd's view: the tray (its bus name is taken now, after any restart).
         pid = systemctl("show", "-p", "MainPID", "--value", UNIT).strip()
         check(pid not in ("", "0"), f"{UNIT} is not running")
         out = sh("busctl", "--user", "--json=short", "call", f"org.kde.StatusNotifierItem-{pid}-1",
@@ -2612,6 +2628,91 @@ class Suite:
                 cleanup(ok, *steps)
 
 
+    def unlock_prompt_at_connect(self):
+        """Manual, PIN-locked phone (Motorola ZD222LMDFV, as item 21). With `screen_off = true`
+        and the phone locked, a lanternd restart alone (no copy, no open) gives "Unlock your
+        <name>" within 10 s of ready, and the helper logs `lock: phone locked (session)`. After
+        Sahaj types the PIN (the journal's `unlock result ok=true`), the phone stays unlocked
+        for 5 minutes with the same session (same helper sha) and the panel `Off`. settings.toml
+        is restored and lanternd restarted afterwards."""
+        check(SERIAL == "ZD222LMDFV",
+              f"item 27 needs the PIN-locked Motorola: LANTERN_SERIAL=ZD222LMDFV (got {SERIAL}), "
+              "and `systemctl --user set-environment LANTERN_SERIAL=ZD222LMDFV` + restart lanternd")
+        name = device_name()
+        note(f"phone name: {name}")
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+
+        def restore_file():
+            if saved_file is None:
+                path.unlink(missing_ok=True)
+                note(f"removed {path} (it was absent)")
+            else:
+                path.write_bytes(saved_file)
+                note(f"restored {path}")
+
+        def restart_ready():
+            systemctl("restart", UNIT)
+            _, secs = wait_ready(20)
+            note(f"lanternd restarted with the saved settings; ready {secs:.1f} s after")
+
+        ok = False
+        try:
+            # 1. The panel goes off with the session.
+            edit_settings(saved_file, "screen_off", "true")
+            # 2. Lock the phone.
+            adb("shell", "input", "keyevent", "KEYCODE_SLEEP")
+            _, secs = wait_until("deviceLocked=1", 15, lambda: device_locked() is True,
+                                 interval=0.3)
+            note(f"phone locked {secs:.1f} s after KEYCODE_SLEEP")
+            with NotifyMonitor("27") as mon:
+                # 3. A new session, nothing else.
+                t0 = phone_now()
+                journal_since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                systemctl("restart", UNIT)
+                st, secs = wait_ready(20)
+                sha = st.get("helper")
+                note(f"lanternd restarted; ready {secs:.1f} s after")
+                # 4. The prompt comes from the session-up read alone.
+                want = f"Unlock your {name}"
+                _, nsecs = wait_until(f"Notify {want!r}", 10,
+                                      lambda: mon.matching(want), interval=0.2)
+                note(f"Notify {want!r} {nsecs:.1f} s after ready")
+                lines = [m for _, m in logcat_since(t0, ["lantern"])
+                         if m.startswith("lock: phone locked")]
+                check("lock: phone locked (session)" in lines,
+                      f"no 'lock: phone locked (session)' in the helper log: {lines}")
+                note("helper: lock: phone locked (session)")
+                # 5. Sahaj types the PIN.
+                _, secs = wait_until("deviceLocked=0 after the PIN", MANUAL_WAIT,
+                                     lambda: device_locked() is False, interval=0.5)
+                note(f"deviceLocked=0 after {secs:.1f} s")
+                wait_journal(r"unlock result.*ok=true", journal_since, 30)
+                note("journal: unlock result ok=true")
+            # 6. Five quiet minutes: still unlocked, same session, panel off.
+            pids = set(phone_state()["helper_pids"])
+            for n in range(10):
+                time.sleep(30)
+                check(device_locked() is False, f"locked again after {30 * (n + 1)} s")
+                s = status()
+                check(s.get("state") == "ready" and s.get("serial") == SERIAL,
+                      f"not ready after {30 * (n + 1)} s: {s.get('state')}")
+                check(s.get("helper") == sha, f"helper changed after {30 * (n + 1)} s")
+                ph = phone_state()
+                check(set(ph["helper_pids"]) == pids,
+                      f"helper pids {sorted(pids)} -> {ph['helper_pids']} after {30 * (n + 1)} s")
+                panel = ph["panel"]
+                check(panel == "Off", f"panel {panel} after {30 * (n + 1)} s, want Off")
+            note("5 minutes: unlocked, same helper, panel Off")
+            ok = True
+        finally:
+            # 7. Back as before.
+            cleanup(ok, ("restore settings.toml", restore_file),
+                    ("restart lanternd", restart_ready))
+
+
 ITEMS = [
     "session_starts_on_plug",
     "open_settings_creates_one_display",
@@ -2639,11 +2740,12 @@ ITEMS = [
     "autoconnect_on_remembers_off",
     "autoconnect_off_asks_on_plug",
     "connect_from_entry_opens_app",
+    "unlock_prompt_at_connect",
 ]
-# Need a person: pull the cable (8, 14, 24, 25), type the phone's PIN (21) or click Connect (26).
+# Need a person: pull the cable (8, 14, 24, 25), type the phone's PIN (21, 27) or click Connect (26).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt",
           "autoconnect_on_remembers_off", "autoconnect_off_asks_on_plug",
-          "connect_from_entry_opens_app"}
+          "connect_from_entry_opens_app", "unlock_prompt_at_connect"}
 # Run only with --pair (inside `two_phones`); a --pair run selects only these.
 PAIR = set()
 # The person's steps for every manual item, in order: printed for every selected manual item
@@ -2680,6 +2782,11 @@ STEPS = {
         "When 'Connect your <phone>' shows, click Connect on it.",
         "Leave the Settings window that opens alone: the suite closes it.",
     ],
+    "unlock_prompt_at_connect": [
+        "Leave the Motorola locked (the suite locks it).",
+        "When 'Unlock your edge 50 pro' shows, click Enter PIN… and type the PIN.",
+        "Then leave the phone alone for 5 minutes.",
+    ],
 }
 
 
@@ -2713,7 +2820,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manual", action="store_true",
-                    help="also run items 8, 14, 21, 24, 25 and 26 (USB unplug/replug, typing "
+                    help="also run items 8, 14, 21 and 24-27 (USB unplug/replug, typing "
                          "the PIN, clicking Connect; prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
     ap.add_argument("--only", nargs="*", help="run only these items (numbers or names)")

@@ -51,7 +51,7 @@ JSON objects tagged by `"t"` (snake_case). Example:
 | `companion` | `state`: one of `"ready"`, `"unavailable"`; optional `msg: string`. Helper → daemon, stream 0 |
 | `clip` | `text: string`. Stream 0, both directions |
 | `ime` | `op`: one of `"commit"`, `"compose"`, `"finish"`; `text: string` (`""` for `finish`). Window stream `N`, window → daemon → helper |
-| `locked` | `reason`: one of `"clipboard"`, `"open"`. Helper → daemon, stream 0 |
+| `locked` | `reason`: one of `"clipboard"`, `"open"`, `"session"`. Helper → daemon, stream 0 |
 | `unlocked` | none. Helper → daemon, stream 0 |
 | `unlock` | `pin: string` (4–16 ASCII digits). Daemon → helper, stream 0. Never logged, no golden vector |
 | `unlock_result` | `ok: bool`, optional `reason: string` (values under "Lock rules"). Helper → daemon, stream 0 |
@@ -118,7 +118,9 @@ added is host-only (`daemon`, `status_report` state `paused`, the window-IPC err
 types `locked`, `unlocked`, `unlock` and `unlock_result` (all stream 0, see "Lock rules"), within
 v1. Plan 4b adds nothing on the helper side: only the host-only optional `open.phone`,
 `daemon.serial` and `status_report.phones`, each omitted when absent, so every existing message
-keeps its bytes (the golden vectors are unchanged).
+keeps its bytes (the golden vectors are unchanged). Plan 4c adds only the `locked.reason` value
+`"session"` (see "Lock rules"); every existing golden vector keeps its bytes, and
+`control_locked_session.bin` is the one new vector.
 
 ## Text, clipboard, catalogue rules
 
@@ -188,7 +190,11 @@ A work profile's own `deviceLocked` line is ignored.
 - `locked{reason}` is sent once per locked stretch, when the lock first gets in the way:
   `"clipboard"` when a PC `clip` arrives or a phone clipboard change reads back null while
   locked, `"open"` when a window's open fails while locked (sent before that window's
-  `error`/`closed`, which keep the helper's message; `locked` itself is stream 0 only).
+  `error`/`closed`, which keep the helper's message; `locked` itself is stream 0 only), and
+  `"session"` once per helper session at session-up (right after the hello reply) when a sure
+  read says locked; an unknown or unlocked read sends nothing then. lanternd treats it like any
+  other reason (one notice per stretch, so a PIN-locked phone asks for its PIN as soon as its
+  session is ready; a swipe-only phone never reads as locked and never prompts).
 - During a stretch the helper re-reads the lock every 2 s. Only a successful read of unlocked
   (`deviceLocked=0`) ends it: the helper sends `unlocked` (the next obstacle starts a new
   stretch). An unknown read mid-stretch keeps polling. A session that ends mid-stretch sends no

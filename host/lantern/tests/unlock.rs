@@ -197,6 +197,30 @@ async fn one_notice_per_locked_stretch() {
     assert!(rig.calls().contains(&Call::Close(1)));
 }
 
+/// The helper's lock read at session-up (`locked{reason:"session"}`) prompts at once, with the
+/// same notice as any other stretch.
+#[tokio::test]
+async fn session_lock_prompts_at_once() {
+    let rig = Rig::start(true, echo_prompt("1234")).await;
+    rig.view
+        .send_modify(|view| view.phones[0].name = Some("Pixel".into()));
+    rig.send(LockEvent::Locked(LockReason::Session)).await;
+    rig.notify_id(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.notifies(),
+        [Call::Notify {
+            id: 1,
+            replaces: 0,
+            icon: "smartphone".into(),
+            summary: "Unlock your Pixel".into(),
+            body: "Lantern can't paste or open apps while Pixel is locked.".into(),
+            actions: vec!["unlock".into(), "Enter PIN…".into()],
+            urgency: Some(1),
+        }]
+    );
+}
+
 #[tokio::test]
 async fn action_prompts_and_sends_pin() {
     let mut rig = Rig::start(true, echo_prompt("1234")).await;

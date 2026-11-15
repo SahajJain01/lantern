@@ -354,12 +354,14 @@ impl fmt::Debug for SecretPin {
 }
 
 /// Why the helper reported [`Control::Locked`]: a PC copy couldn't land / a phone copy read back
-/// empty (`clipboard`), or an app failed to open (`open`) while the phone was locked.
+/// empty (`clipboard`), an app failed to open (`open`) while the phone was locked, or the
+/// session came up with the phone surely locked (`session`, sent at most once per helper session).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LockReason {
     Clipboard,
     Open,
+    Session,
 }
 
 /// What `lantern connect|disconnect` asks lanternd to do.
@@ -1463,6 +1465,16 @@ mod tests {
         let s = String::from_utf8(unlock.encode()).unwrap();
         assert_eq!(s, r#"{"t":"unlock","pin":"1234"}"#);
         assert_eq!(Control::decode(s.as_bytes()).unwrap(), unlock);
+    }
+
+    #[test]
+    fn locked_session_json_shape() {
+        let c = Control::Locked {
+            reason: LockReason::Session,
+        };
+        let json = r#"{"t":"locked","reason":"session"}"#;
+        assert_eq!(String::from_utf8(c.encode()).unwrap(), json);
+        assert_eq!(Control::decode(json.as_bytes()).unwrap(), c);
     }
 
     #[test]

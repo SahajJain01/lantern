@@ -146,6 +146,17 @@ public final class ProtoTest {
             Msg.of("locked").put("reason", "clipboard")), StandardCharsets.UTF_8), "helper encoding");
     }
 
+    /** locked{reason:"session"} (the lock read at session-up) as the helper builds it is the Rust bytes. */
+    static void goldenLockedSessionMatchesRust() throws Exception {
+        Proto.Frame f = readOnly("control_locked_session");
+        eq(Proto.KIND_CONTROL, f.kind, "kind");
+        eq(0, f.stream, "stream");
+        eq("{\"t\":\"locked\",\"reason\":\"session\"}", new String(f.payload, StandardCharsets.UTF_8), "json");
+        eq("session", new TestCodec().decode(f.payload).str("reason"), "reason");
+        eq(new String(f.payload, StandardCharsets.UTF_8), new String(new TestCodec().encode(
+            Msg.of("locked").put("reason", "session")), StandardCharsets.UTF_8), "helper encoding");
+    }
+
     /** unlock_result{ok:false, reason} as the helper builds it is the Rust bytes. */
     static void goldenUnlockResultMatchesRust() throws Exception {
         Proto.Frame f = readOnly("control_unlock_result");
@@ -342,6 +353,7 @@ public final class ProtoTest {
             {"goldenHelloKeyboardOff", (Case) ProtoTest::goldenHelloKeyboardOff},
             {"goldenHelloScreenOn", (Case) ProtoTest::goldenHelloScreenOn},
             {"goldenLockedMatchesRust", (Case) ProtoTest::goldenLockedMatchesRust},
+            {"goldenLockedSessionMatchesRust", (Case) ProtoTest::goldenLockedSessionMatchesRust},
             {"goldenUnlockResultMatchesRust", (Case) ProtoTest::goldenUnlockResultMatchesRust},
             {"newTypesAndLimits", (Case) ProtoTest::newTypesAndLimits},
             {"goldenInputPointerMatchesRust", (Case) ProtoTest::goldenInputPointerMatchesRust},

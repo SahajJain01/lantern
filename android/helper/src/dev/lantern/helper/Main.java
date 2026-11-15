@@ -288,6 +288,9 @@ public final class Main {
                 }
                 // Only changes sync: nothing is pushed at session start.
                 phoneClip.start(clipSync);
+                // A PIN-locked phone asks for its PIN now rather than at the first copy or open.
+                // On lantern-clip, so dumpsys never runs on the control thread.
+                phoneClip.post(() -> lockWatch.checkNow("session"));
             });
             try {
                 router.run();
