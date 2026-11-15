@@ -432,10 +432,30 @@ def wait_off_and_back(serial=None):
     _, secs = wait_until(f"{serial} off adb (cable pulled)", MANUAL_WAIT,
                          lambda: adb_state(serial) != "device", interval=0.2)
     note(f"phone off adb after {secs:.1f} s")
-    _, secs = wait_until("lanternd idle", MANUAL_WAIT,
-                         lambda: status()["state"] == "idle", interval=0.5)
+    secs = wait_idle_unplugged(serial)
     note(f"lanternd idle {secs:.1f} s later")
     wait_back_on_adb(serial)
+
+
+def wait_idle_unplugged(serial=None):
+    """With `serial` unplugged, waits (MANUAL_WAIT) until lanternd is idle; returns the seconds.
+    A replug inside lanternd's unplug grace (10 s) keeps it from ever going idle, so the phone
+    back on adb as `device` first fails at once instead of waiting out MANUAL_WAIT."""
+    serial = serial or SERIAL
+
+    def idle_or_back():
+        try:
+            if status()["state"] == "idle":
+                return "idle"
+        except Fail:
+            if adb_state(serial) == "device":
+                return "back"
+            raise
+        return "back" if adb_state(serial) == "device" else None
+    got, secs = wait_until("lanternd idle", MANUAL_WAIT, idle_or_back, interval=0.5)
+    check(got == "idle", f"{serial} plugged back within the unplug grace; redo with the cable "
+                         "out at least 15 s")
+    return secs
 
 
 def wait_back_on_adb(serial=None):
@@ -640,16 +660,57 @@ def phone_state(serial=None):
     }
 
 
+SLEEPING = ("Asleep", "Dozing", "Dreaming")  # `mWakefulness` values of a phone gone to sleep
+
+
 def panel_released(st):
     """The panel as no session leaves it: on, or off because the phone went to sleep on its
-    own (its screen timeout can pass while Sahaj answers through chat)."""
-    return st["panel"] == "On" or st.get("wakefulness") != "Awake"
+    own (its screen timeout can pass while Sahaj answers through chat). An unread or unknown
+    wakefulness with the panel off is not released."""
+    return st["panel"] == "On" or st.get("wakefulness") in SLEEPING
+
+
+def held_by(st):
+    """Why `st` is not released (empty when it is): one reason per check, with the raw values."""
+    why = []
+    if not panel_released(st):
+        why.append(f"panel {st['panel']} with wakefulness {st.get('wakefulness')!r} "
+                   f"(released only when On, or Off and {'/'.join(SLEEPING)})")
+    if st["displays"] != ["0"]:
+        why.append(f"displays {st['displays']}")
+    if st["forwards"]:
+        why.append(f"forwards {st['forwards']}")
+    if st["helper_pids"]:
+        why.append(f"helper pids {st['helper_pids']}")
+    return why
 
 
 def released(st):
     """No session on the phone (the guard, which restores the setting, has exited too)."""
-    return (panel_released(st) and st["displays"] == ["0"] and not st["forwards"]
-            and not st["helper_pids"])
+    return not held_by(st)
+
+
+def asleep_note(st):
+    """For an item log: says so when `st` counts as released only because the phone sleeps."""
+    if st["panel"] != "On" and st.get("wakefulness") in SLEEPING:
+        return f" (released only because the phone is {st['wakefulness']}: panel {st['panel']})"
+    return ""
+
+
+def wait_phone(what, timeout, want, serial=None):
+    """Polls `phone_state(serial)` until `want(state)`; returns (state, seconds). A timeout
+    names why the last state was not released (`held_by`), with its raw values."""
+    seen = {}
+
+    def poll():
+        st = seen["st"] = phone_state(serial)
+        return want(st) and st
+    try:
+        return wait_until(what, timeout, poll, interval=0.2)
+    except Fail as e:
+        st = seen.get("st")
+        why = held_by(st) if st else []
+        raise Fail(f"{e}; last state: {'; '.join(why) or st}") from None
 
 
 def restored(st, serial=None):
@@ -667,8 +728,8 @@ def read_baseline(serial=None):
     stopped = serves(serial)
     if stopped:
         systemctl("stop", UNIT)
-    st, _ = wait_until(f"{serial} released" + (" after stop" if stopped else ""), 20,
-                       lambda: released(s := phone_state(serial)) and s, interval=0.2)
+    st, _ = wait_phone(f"{serial} released" + (" after stop" if stopped else ""), 20, released,
+                       serial)
     stay_on = st["stay_on"]
     if serial == SERIAL and os.environ.get("LANTERN_STAY_ON_RESTORED"):
         stay_on = os.environ["LANTERN_STAY_ON_RESTORED"]
@@ -676,7 +737,7 @@ def read_baseline(serial=None):
                                          "imes": st["imes"]})
     note(f"baseline of {serial}" + (" with lanternd stopped" if stopped else "") +
          f": stay_on={st['stay_on']} ime={st['ime']} imes={st['imes']} (restore targets: "
-         f"{base['stay_on']}, {base['ime']}, {base['imes']})")
+         f"{base['stay_on']}, {base['ime']}, {base['imes']})" + asleep_note(st))
     check(LANTERN_IME not in str(base["ime"]) and LANTERN_IME not in str(base["imes"]),
           f"the Lantern keyboard is still selected or enabled on {serial} with no session: {st}")
     return stopped
@@ -890,12 +951,19 @@ def armed(st):
 
 def write_record_flags(serial, saved):
     """Puts `saved` ({key: value, or ABSENT}) back into `serial`'s device record under
-    `devices/.lock` (lanternd's own record lock), through a temp file and a rename; a key saved
-    as ABSENT is deleted."""
+    `devices/.lock` (lanternd's own record lock), through an fsynced temp file and a rename; a
+    key saved as ABSENT is deleted. A record that is absent and had only ABSENT keys stays
+    absent (no `{}` file is created)."""
     path = record_path(serial)
+    if not path.exists() and all(v is ABSENT for v in saved.values()):
+        note(f"{path.name}: absent before and after, nothing to put back")
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path.parent / ".lock", "a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not path.exists() and all(v is ABSENT for v in saved.values()):
+            note(f"{path.name}: absent before and after, nothing to put back")
+            return
         try:
             rec = json.loads(path.read_text())
         except (OSError, ValueError):
@@ -907,7 +975,10 @@ def write_record_flags(serial, saved):
                 rec[k] = v
         tmp = path.parent / f".{path.name}.tmp-suite-{os.getpid()}"
         try:
-            tmp.write_text(json.dumps(rec))
+            with open(tmp, "w") as f:
+                f.write(json.dumps(rec))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
@@ -1015,15 +1086,12 @@ class two_phones:
         def wait_released():
             for s in self.phones:
                 if s in BASELINES:
-                    st, secs = wait_until(f"{s} released and restored", 20,
-                                          lambda s=s: restored(p := phone_state(s), s) and p,
-                                          interval=0.2)
+                    st, secs = wait_phone(f"{s} released and restored", 20,
+                                          lambda p, s=s: restored(p, s), s)
                 else:
-                    st, secs = wait_until(f"{s} released", 20,
-                                          lambda s=s: released(p := phone_state(s)) and p,
-                                          interval=0.2)
+                    st, secs = wait_phone(f"{s} released", 20, released, s)
                 note(f"{s} released after {secs:.1f} s (panel {st['panel']}, "
-                     f"{st['wakefulness']})")
+                     f"{st['wakefulness']})" + asleep_note(st))
 
         def restore_records():
             for s, saved in self.records.items():
@@ -1032,6 +1100,10 @@ class two_phones:
         def restore_env():
             if self.entered:
                 self.env.__exit__(*exc)
+            else:
+                # The environment was never changed (or manager_env put it back itself), but
+                # lanternd was stopped above: start it so it serves SERIAL as before.
+                systemctl("start", UNIT)
 
         def wait_back():
             wait_daemon(15)
@@ -1656,8 +1728,7 @@ class Suite:
             _, secs = wait_until(f"{SERIAL} off adb (cable pulled)", MANUAL_WAIT,
                                  lambda: adb_state() != "device", interval=0.2)
             note(f"phone off adb after {secs:.1f} s")
-            _, secs = wait_until("lanternd idle", MANUAL_WAIT,
-                                 lambda: status()["state"] == "idle", interval=0.5)
+            secs = wait_idle_unplugged()
             systemctl("stop", UNIT)
             note(f"lanternd idle {secs:.1f} s later; stopped it")
             wait_back_on_adb()
@@ -2674,10 +2745,19 @@ def main():
         if unknown:
             ap.error(f"unknown items {unknown}; items: " +
                      ", ".join(f"{n} {i}" for n, i in enumerate(ITEMS, 1)))
-        items = [i for n, i in enumerate(ITEMS, 1) if (i in args.only or str(n) in args.only)
-                 and (i in PAIR) == args.pair]
+        chosen = [i for n, i in enumerate(ITEMS, 1) if i in args.only or str(n) in args.only]
+        dropped = [i for i in chosen if (i in PAIR) != args.pair]
+        if dropped:
+            ap.error(f"--only {', '.join(dropped)}: " +
+                     ("not a two-phone item; run it without --pair" if args.pair else
+                      "a two-phone item; run it with --pair"))
+        items = chosen
     if args.pair:
-        OTHER = OTHER or pick_other(sh("adb", "devices", timeout=10), SERIAL)
+        try:
+            OTHER = OTHER or pick_other(sh("adb", "devices", timeout=10), SERIAL)
+        except Fail as e:
+            print(f"device_test: {e}", file=sys.stderr)
+            return 2
     print(f"lantern device test: serial={SERIAL}" + (f" other={OTHER}" if args.pair else "") +
           f" binary={LANTERN} logs={LOG_DIR}", flush=True)
     plan = manual_plan(items)
