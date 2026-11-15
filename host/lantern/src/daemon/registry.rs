@@ -58,6 +58,15 @@ mod tests {
         assert_eq!(registry.route(1), Some(ClientHandle { win_id: 1 }));
     }
 
+    /// The hub keys windows by `serial|pkg:user`: the same app on two phones is two windows.
+    #[test]
+    fn registry_same_app_on_two_phones() {
+        let mut registry = Registry::default();
+        assert_eq!(registry.claim("A|com.x:0"), Claim::New(1));
+        assert_eq!(registry.claim("B|com.x:0"), Claim::New(2));
+        assert_eq!(registry.claim("A|com.x:0"), Claim::Existing(1));
+    }
+
     #[test]
     fn registry_ids_monotonic_after_release() {
         let mut registry = Registry::default();

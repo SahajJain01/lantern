@@ -1,13 +1,17 @@
 //! Daemon <-> window IPC over `$XDG_RUNTIME_DIR/lantern/daemon.sock`.
 //!
+//! Several phones can be live at once, each with its own helper link ([`Hub::session_up`]).
 //! Each `lantern open` process is one client. Its first frame is `Control::Open` on stream 0;
-//! the daemon claims `pkg:user` in the [`Registry`]:
-//! - New window `N`: the Open (minus `activation_token` and `phone`) goes to the helper on
-//!   stream `N`, and from then on frames on stream `N` pass through unchanged in both directions.
-//! - An Open naming a `phone` other than the live session's is refused: with the connect prompt
-//!   running, lanternd offers to connect that phone ([`CONNECT_OFFERED`]).
-//! - Already open: the existing window's client gets `focus{activation_token}` on its stream,
-//!   the new client gets `focus` (stream = existing id) and is closed.
+//! it goes to the phone it names, else to the default phone (the link that came up last), and
+//! the daemon claims `serial|pkg:user` in the [`Registry`] (window ids are unique across phones
+//! and never reused within the run):
+//! - New window `N`: the Open (minus `activation_token` and `phone`) goes to that phone's helper
+//!   on stream `N`, and from then on frames on stream `N` pass through unchanged in both
+//!   directions, between that client and that phone's helper only.
+//! - An Open naming a `phone` with no live link is refused: with the connect prompt running,
+//!   lanternd offers to connect that phone ([`CONNECT_OFFERED`]).
+//! - Already open on that phone: the existing window's client gets `focus{activation_token}`
+//!   on its stream, the new client gets `focus` (stream = existing id) and is closed.
 //!
 //! The helper side is never blocked by a client: each client has a bounded outbound queue, and a
 //! client that overflows it is dropped exactly as if it had disconnected (close = quit).
@@ -19,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use futures_util::future::join_all;
 use lantern_proto::{
     read_frame_async, write_frame_async, CompanionState, Control, DaemonCmd, Frame, InputEvent,
     Kind, PhoneState, SessionState, StatusReport, WindowInfo, MAX_CLIP, MAX_IME_TEXT,
@@ -32,7 +37,7 @@ use tokio::time::{timeout, Instant};
 use super::catalog::{AppEntry, Catalog};
 use super::control::{Command, View};
 use super::registry::{Claim, Registry};
-use crate::clipboard::{ClipHandle, ClipSync, PcOffer};
+use crate::clipboard::{ClipFan, ClipHandle, PcOffer};
 use crate::settings::Settings;
 use crate::unlock::{LockEvent, Pin};
 
@@ -198,9 +203,12 @@ fn request_report(sock: &Path, request: Control, what: &str) -> Result<StatusRep
     }
 }
 
-/// The helper stopped draining its queue for [`HELPER_SEND_TIMEOUT`]; the session should end.
-#[derive(Debug)]
-pub struct HelperWedged;
+/// Phone `serial`'s helper stopped draining its queue for [`HELPER_SEND_TIMEOUT`]; that
+/// session (only) should end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperWedged {
+    pub serial: String,
+}
 
 pub enum ClientEvent {
     Frame(u64, Frame),
@@ -291,19 +299,38 @@ fn client_frame_for_helper(frame: Frame) -> Option<Frame> {
     }
 }
 
-/// Sends to the helper without ever blocking for long: a full queue gets
+/// Sends to phone `serial`'s helper without ever blocking for long: a full queue gets
 /// [`HELPER_SEND_TIMEOUT`] to drain. A closed queue means the session is already ending, which
 /// the run loop notices on its own.
-async fn to_helper(helper: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), HelperWedged> {
+async fn to_helper(
+    serial: &str,
+    helper: &mpsc::Sender<Frame>,
+    frame: Frame,
+) -> Result<(), HelperWedged> {
     match helper.try_send(frame) {
         Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
         Err(TrySendError::Full(frame)) => {
             match timeout(HELPER_SEND_TIMEOUT, helper.send(frame)).await {
                 Ok(_) => Ok(()),
-                Err(_) => Err(HelperWedged),
+                Err(_) => Err(HelperWedged {
+                    serial: serial.to_owned(),
+                }),
             }
         }
     }
+}
+
+/// One live phone session as the hub sees it.
+struct Link {
+    serial: String,
+    /// The helper's outbound queue.
+    helper: mpsc::Sender<Frame>,
+    /// The helper jar's SHA-256.
+    sha: String,
+    /// The helper's last `companion` state and its `msg`.
+    companion: Option<(CompanionState, Option<String>)>,
+    /// The phone's PIN lock is in the way (`locked` .. `unlocked`).
+    locked: bool,
 }
 
 /// The `t` (message type) of a control payload, for logs that must not dump the payload.
@@ -330,18 +357,20 @@ fn log_catalogue(c: &Control) {
     }
 }
 
-/// Routes frames between window clients and the current helper session.
+/// Routes frames between window clients and the live phones' helper sessions.
 pub struct Hub {
     listener: Option<UnixListener>,
     clients: HashMap<u64, Client>,
-    windows: HashMap<u32, u64>,
+    /// Each open window's client and phone.
+    windows: HashMap<u32, (u64, String)>,
     /// What `lantern status` reports for each open window.
     info: HashMap<u32, WindowInfo>,
+    /// Window ids for `serial|pkg:user`; never reset, so ids are unique for the whole run.
     registry: Registry,
-    /// The session part of `lantern status`, kept current by the run loop.
-    session: (SessionState, Option<String>, Option<String>),
-    /// The live session's last `companion` state and its `msg`; cleared when the session ends.
-    companion: Option<(CompanionState, Option<String>)>,
+    /// The live phones' links, in the order they came up (the last is the default phone).
+    links: Vec<Link>,
+    /// The phone `lantern status` reports as paused (switched off in Lantern), from the run loop.
+    paused: Option<String>,
     next_cid: u64,
     events_tx: mpsc::Sender<ClientEvent>,
     events: mpsc::Receiver<ClientEvent>,
@@ -349,11 +378,11 @@ pub struct Hub {
     catalog: Option<Catalog>,
     /// Where phone `clip`s go (the PC clipboard), if the daemon syncs it.
     clip_out: Option<ClipHandle>,
-    /// Echo/secret/size suppression for the clipboard; reset with each session.
-    clip_sync: ClipSync,
+    /// Echo/secret/size suppression for the clipboard, one memory per live phone.
+    clip: ClipFan,
     /// The user's settings (`clipboard_sync`), if the daemon has a settings file.
     settings: Option<watch::Receiver<Settings>>,
-    /// `clipboard_sync` as of the last clipboard event, to reset `clip_sync` when it turns on.
+    /// `clipboard_sync` as of the last clipboard event, to reset `clip` when it turns on.
     clip_was_on: bool,
     /// `lantern connect|disconnect` commands not yet taken by the run loop.
     commands: Vec<Command>,
@@ -364,8 +393,6 @@ pub struct Hub {
     state_dir: Option<PathBuf>,
     /// `$LANTERN_SERIAL`: the only phone lanternd serves; commands naming another are refused.
     configured: Option<String>,
-    /// The phone's PIN lock is in the way (`locked` .. `unlocked`); false between sessions.
-    locked: bool,
     /// Where `locked`/`unlocked`/`unlock_result` go (the unlock prompt), if anywhere.
     lock_events: Option<mpsc::Sender<LockEvent>>,
     /// Windows that got `opened` (an `error` before it is a failed open).
@@ -392,21 +419,20 @@ impl Hub {
             windows: HashMap::new(),
             info: HashMap::new(),
             registry: Registry::default(),
-            session: (SessionState::Idle, None, None),
-            companion: None,
+            links: Vec::new(),
+            paused: None,
             next_cid: 0,
             events_tx,
             events,
             catalog: None,
             clip_out: None,
-            clip_sync: ClipSync::default(),
+            clip: ClipFan::default(),
             settings: None,
             clip_was_on: true,
             commands: Vec::new(),
             view: View::default(),
             state_dir: None,
             configured: None,
-            locked: false,
             lock_events: None,
             opened: HashSet::new(),
             reopens: Vec::new(),
@@ -436,9 +462,94 @@ impl Hub {
         self.lock_events = Some(events);
     }
 
-    /// Whether the phone's PIN lock is in the way (for [`super::control::View::locked`]).
-    pub fn locked(&self) -> bool {
-        self.locked
+    /// Whether phone `serial`'s PIN lock is in the way (for [`super::control::View::locked`]);
+    /// false for a phone with no live link.
+    pub fn locked(&self, serial: &str) -> bool {
+        self.link(serial).is_some_and(|link| link.locked)
+    }
+
+    fn link(&self, serial: &str) -> Option<&Link> {
+        self.links.iter().find(|link| link.serial == serial)
+    }
+
+    fn link_mut(&mut self, serial: &str) -> Option<&mut Link> {
+        self.links.iter_mut().find(|link| link.serial == serial)
+    }
+
+    /// The default phone: the link that came up last. An `open` without `phone` goes to it,
+    /// and `lantern status` reports it at the top level.
+    pub fn default_phone(&self) -> Option<&str> {
+        self.links.last().map(|link| link.serial.as_str())
+    }
+
+    /// The live phones, in the order their links came up.
+    pub fn live_serials(&self) -> Vec<String> {
+        self.links.iter().map(|link| link.serial.clone()).collect()
+    }
+
+    /// The phone switched off in Lantern that `lantern status` reports as `paused` (when no
+    /// phone is ready or starting), as the run loop sees it.
+    pub fn set_paused(&mut self, serial: Option<String>) {
+        self.paused = serial;
+    }
+
+    /// Phone `serial`'s session is up: its link (helper queue, helper SHA-256), a fresh
+    /// catalogue sync window and clipboard memory. It becomes the default phone. A link
+    /// already up for `serial` is taken down first.
+    pub fn session_up(&mut self, serial: &str, helper: mpsc::Sender<Frame>, helper_sha: &str) {
+        if self.link(serial).is_some() {
+            tracing::warn!(
+                serial,
+                "session up again without going down; old link dropped"
+            );
+            self.session_down(serial);
+        }
+        self.links.push(Link {
+            serial: serial.to_owned(),
+            helper,
+            sha: helper_sha.to_owned(),
+            companion: None,
+            locked: false,
+        });
+        if let Some(catalog) = self.catalog.as_mut() {
+            catalog.start_session(serial);
+        }
+        self.clip.add(serial);
+        tracing::debug!(serial, live = self.links.len(), "hub: session up");
+    }
+
+    /// Phone `serial`'s session ended: its window clients are closed (they exit) and their ids
+    /// released, its catalogue sync window and clipboard memory go, and a lock stretch ends.
+    /// Its blocked opens wait for its next unlock. Every other phone's links, windows and
+    /// state are left alone. Clients still waiting to send Open are kept.
+    pub fn session_down(&mut self, serial: &str) {
+        let wins: Vec<(u32, u64)> = self
+            .windows
+            .iter()
+            .filter(|(_, (_, s))| s == serial)
+            .map(|(win, (cid, _))| (*win, *cid))
+            .collect();
+        for (win, cid) in wins {
+            if let Some(client) = self.clients.remove(&cid) {
+                client.finish();
+            }
+            self.release(win);
+        }
+        let Some(at) = self.links.iter().position(|link| link.serial == serial) else {
+            return;
+        };
+        let link = self.links.remove(at);
+        if let Some(catalog) = self.catalog.as_mut() {
+            catalog.end_session(serial);
+        }
+        self.clip.remove(serial);
+        // The stretch ends with the session.
+        if link.locked {
+            self.lock_event(LockEvent::Unlocked {
+                serial: serial.to_owned(),
+            });
+        }
+        tracing::debug!(serial, live = self.links.len(), "hub: session down");
     }
 
     /// Hands `event` to the unlock prompt without waiting; a full queue drops it.
@@ -450,56 +561,55 @@ impl Hub {
         }
     }
 
-    /// The served phone's serial.
-    fn serial(&self) -> Option<&str> {
-        self.session.1.as_deref()
-    }
-
-    /// The stretch ended in an unlock: the opens it blocked on this phone within
+    /// Phone `serial`'s stretch ended in an unlock: the opens it blocked on that phone within
     /// [`REOPEN_WITHIN`] go to the prompt to be reopened.
-    fn unlocked(&mut self) {
-        self.locked = false;
-        let serial = self.serial().map(str::to_owned);
+    fn unlocked(&mut self, serial: &str) {
+        if let Some(link) = self.link_mut(serial) {
+            link.locked = false;
+        }
         let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.reopens)
             .into_iter()
             .filter(|(.., at)| at.elapsed() < REOPEN_WITHIN)
-            .partition(|(s, ..)| Some(s) == serial.as_ref());
+            .partition(|(s, ..)| s == serial);
         self.reopens = others;
         let reopens: Vec<(String, u32)> = mine
             .into_iter()
             .map(|(_, pkg, user, _)| (pkg, user))
             .collect();
-        if let (Some(serial), false) = (serial, reopens.is_empty()) {
+        if !reopens.is_empty() {
             self.lock_event(LockEvent::Reopen {
-                serial,
+                serial: serial.to_owned(),
                 apps: reopens,
             });
         }
     }
 
-    /// Remembers `pkg`/`user` on the served phone for a reopen after its unlock (once per app;
+    /// Remembers `pkg`/`user` on phone `serial` for a reopen after its unlock (once per app;
     /// stale ones go).
-    fn blocked_open(&mut self, pkg: String, user: u32) {
-        let Some(serial) = self.serial().map(str::to_owned) else {
-            return;
-        };
+    fn blocked_open(&mut self, serial: &str, pkg: String, user: u32) {
         self.reopens.retain(|(s, p, u, at)| {
-            at.elapsed() < REOPEN_WITHIN && !(*s == serial && *p == pkg && *u == user)
+            at.elapsed() < REOPEN_WITHIN && !(s == serial && *p == pkg && *u == user)
         });
-        self.reopens.push((serial, pkg, user, Instant::now()));
+        self.reopens
+            .push((serial.to_owned(), pkg, user, Instant::now()));
     }
 
-    /// Sends `pin` to the helper as one `unlock` frame on stream 0. Neither the frame nor
-    /// the PIN is logged.
-    pub async fn send_unlock(
-        &mut self,
-        pin: Pin,
-        helper: &mpsc::Sender<Frame>,
-    ) -> Result<(), HelperWedged> {
+    /// Sends `pin` to phone `serial`'s helper as one `unlock` frame on stream 0, only while
+    /// that phone's session is up and its lock stretch is open. `Ok(false)`: not sent (no link,
+    /// or no stretch); the PIN is wiped either way. Neither the frame nor the PIN is logged.
+    pub async fn send_unlock(&mut self, serial: &str, pin: Pin) -> Result<bool, HelperWedged> {
+        let Some(helper) = self
+            .link(serial)
+            .filter(|link| link.locked)
+            .map(|link| link.helper.clone())
+        else {
+            drop(pin);
+            return Ok(false);
+        };
         let frame = control(0, Control::Unlock { pin: pin.secret() });
         drop(pin);
-        tracing::info!("unlock sent to the helper");
-        to_helper(helper, frame).await
+        tracing::info!(serial, "unlock sent to the helper");
+        to_helper(serial, &helper, frame).await.map(|()| true)
     }
 
     /// The `lantern connect|disconnect` commands received since the last call, oldest first,
@@ -597,9 +707,9 @@ impl Hub {
         self.settings = Some(settings);
     }
 
-    /// Whether clipboard sync is on now. Turning it back on resets [`ClipSync`]: what it
+    /// Whether clipboard sync is on now. Turning it back on resets [`ClipFan`]: what it
     /// remembered may be stale after changes it never saw. (Checked at each clipboard event,
-    /// which is equivalent: nothing reads `clip_sync` in between.)
+    /// which is equivalent: nothing reads `clip` in between.)
     fn clip_on(&mut self) -> bool {
         let on = self
             .settings
@@ -607,7 +717,7 @@ impl Hub {
             .is_none_or(|settings| settings.borrow().clipboard_sync);
         if on && !self.clip_was_on {
             tracing::debug!("clipboard sync back on");
-            self.clip_sync = ClipSync::default();
+            self.clip.reset();
         }
         self.clip_was_on = on;
         on
@@ -618,36 +728,55 @@ impl Hub {
         self.clip_out = Some(handle);
     }
 
-    /// The PC selection changed while a session is live: its text goes to the phone as
-    /// `clip{text}` on stream 0 unless [`ClipSync::pc_changed`] suppresses it.
-    pub async fn on_pc_clip(
-        &mut self,
-        offer: PcOffer,
-        helper: &mpsc::Sender<Frame>,
-    ) -> Result<(), HelperWedged> {
+    /// The PC selection changed: its text goes to each live phone [`ClipFan::pc_changed`]
+    /// names, as `clip{text}` on stream 0. Every send is tried at once; helpers whose queue is
+    /// full then share one [`HELPER_SEND_TIMEOUT`] wait. Each one still full is returned, and
+    /// only its session should end.
+    pub async fn on_pc_clip(&mut self, offer: PcOffer) -> Vec<HelperWedged> {
         if !self.clip_on() {
             let len = offer.text.as_ref().map_or(0, String::len);
             tracing::debug!("clipboard sync off; {len} chars not synced");
-            return Ok(());
+            return Vec::new();
         }
-        match self.clip_sync.pc_changed(&offer) {
-            Some(text) => {
-                tracing::debug!(len = text.len(), "PC clipboard sent to the phone");
-                to_helper(helper, control(0, Control::Clip { text })).await
-            }
-            None => {
-                tracing::debug!(
-                    secret = offer.secret,
-                    len = offer.text.as_ref().map(String::len),
-                    "PC clipboard change not sent"
-                );
-                Ok(())
+        let sends = self.clip.pc_changed(&offer);
+        if sends.is_empty() {
+            tracing::debug!(
+                secret = offer.secret,
+                len = offer.text.as_ref().map(String::len),
+                "PC clipboard change not sent"
+            );
+            return Vec::new();
+        }
+        let mut full = Vec::new();
+        for (serial, text) in sends {
+            let Some(link) = self.link(&serial) else {
+                continue;
+            };
+            tracing::debug!(serial, len = text.len(), "PC clipboard sent to the phone");
+            match link.helper.try_send(control(0, Control::Clip { text })) {
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                Err(TrySendError::Full(frame)) => full.push((serial, link.helper.clone(), frame)),
             }
         }
+        if full.is_empty() {
+            return Vec::new();
+        }
+        let deadline = Instant::now() + HELPER_SEND_TIMEOUT;
+        join_all(full.into_iter().map(|(serial, helper, frame)| async move {
+            match tokio::time::timeout_at(deadline, helper.send(frame)).await {
+                Ok(_) => None,
+                Err(_) => Some(HelperWedged { serial }),
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
-    /// A phone `clip`: onto the PC clipboard (never echoed back by [`Self::on_pc_clip`]).
-    fn on_phone_clip(&mut self, text: String) {
+    /// A `clip` from phone `serial`: onto the PC clipboard (the other phones get it when its
+    /// selection comes back through [`Self::on_pc_clip`]; `serial` never does).
+    fn on_phone_clip(&mut self, serial: &str, text: String) {
         let len = text.len();
         if !self.clip_on() {
             tracing::debug!("clipboard sync off; {len} chars not synced");
@@ -661,8 +790,8 @@ impl Hub {
             tracing::debug!(len, "phone clip ignored: no PC clipboard");
             return;
         };
-        tracing::debug!(len, "phone clipboard put on the PC");
-        out.set(self.clip_sync.from_phone(text));
+        tracing::debug!(serial, len, "phone clipboard put on the PC");
+        out.set(self.clip.from_phone(serial, text));
     }
 
     /// Keeps `catalog` in step with the helper's catalogue messages.
@@ -670,18 +799,10 @@ impl Hub {
         self.catalog = Some(catalog);
     }
 
-    /// A session with `serial` is up: the first catalogue sync window opens.
-    pub fn session_started(&mut self, serial: &str) {
-        if let Some(catalog) = self.catalog.as_mut() {
-            catalog.start_session(serial);
-        }
-    }
-
-    /// `app`/`apps_end`/`app_removed` from the helper of the session's phone. Catalogue file
-    /// writes are small and synchronous; kbuildsycoca6 runs off this loop.
-    fn on_catalogue(&mut self, c: Control) {
-        let (Some(catalog), Some(serial)) = (self.catalog.as_mut(), self.session.1.as_deref())
-        else {
+    /// `app`/`apps_end`/`app_removed` from phone `serial`'s helper. Catalogue file writes are
+    /// small and synchronous; kbuildsycoca6 runs off this loop.
+    fn on_catalogue(&mut self, serial: &str, c: Control) {
+        let Some(catalog) = self.catalog.as_mut() else {
             return;
         };
         match c {
@@ -695,6 +816,7 @@ impl Hub {
                 let entry = AppEntry::from_message(pkg, user, label, work, &icon);
                 if let Err(error) = catalog.upsert(serial, &entry) {
                     tracing::warn!(
+                        serial,
                         pkg = entry.pkg,
                         user,
                         error = format!("{error:#}"),
@@ -705,6 +827,7 @@ impl Hub {
             Control::AppRemoved { pkg, user } => {
                 if let Err(error) = catalog.remove(serial, &pkg, user) {
                     tracing::warn!(
+                        serial,
                         pkg,
                         user,
                         error = format!("{error:#}"),
@@ -714,36 +837,54 @@ impl Hub {
             }
             // `end_sync` also opens the next window (a companion relink, a profile change).
             Control::AppsEnd { count } => match catalog.end_sync(serial, count) {
-                Ok(removed) => tracing::info!(count, removed, "catalogue synced"),
+                Ok(removed) => tracing::info!(serial, count, removed, "catalogue synced"),
                 Err(error) => {
-                    tracing::warn!(error = format!("{error:#}"), "catalogue prune failed")
+                    tracing::warn!(
+                        serial,
+                        error = format!("{error:#}"),
+                        "catalogue prune failed"
+                    )
                 }
             },
             _ => {}
         }
     }
 
-    /// Records the session state `lantern status` reports: `serial` is the device being started
-    /// or served, `helper` the live helper's SHA-256.
-    pub fn set_session(
-        &mut self,
-        state: SessionState,
-        serial: Option<String>,
-        helper: Option<String>,
-    ) {
-        self.session = (state, serial, helper);
+    /// The top level of `lantern status` when no phone is ready: the first phone in view order
+    /// whose start is in flight as `starting`, else the paused phone, else `idle`.
+    fn not_ready(&self) -> (SessionState, Option<String>) {
+        if let Some(phone) = self
+            .view
+            .phones
+            .iter()
+            .find(|p| p.state == PhoneState::Starting)
+        {
+            (SessionState::Starting, Some(phone.serial.clone()))
+        } else if let Some(serial) = &self.paused {
+            (SessionState::Paused, Some(serial.clone()))
+        } else {
+            (SessionState::Idle, None)
+        }
     }
 
-    /// The `lantern status` answer: session state plus open windows by id.
+    /// The `lantern status` answer. The top level is the default phone as `ready` with its
+    /// helper SHA-256 and companion, else [`Self::not_ready`]; then every open window by id,
+    /// with its phone, and every phone in the view.
     pub fn status(&self) -> StatusReport {
         let mut windows: Vec<WindowInfo> = self.info.values().cloned().collect();
         windows.sort_by_key(|w| w.id);
-        let (state, serial, helper) = self.session.clone();
-        let companion = self
-            .companion
-            .as_ref()
-            .map(|(companion, _)| *companion)
-            .filter(|_| state == SessionState::Ready);
+        let (state, serial, helper, companion) = match self.links.last() {
+            Some(link) => (
+                SessionState::Ready,
+                Some(link.serial.clone()),
+                Some(link.sha.clone()),
+                link.companion.as_ref().map(|(companion, _)| *companion),
+            ),
+            None => {
+                let (state, serial) = self.not_ready();
+                (state, serial, None, None)
+            }
+        };
         let phones = self
             .view
             .phones
@@ -767,10 +908,10 @@ impl Hub {
         }
     }
 
-    /// The live session's last `companion` state with its `msg` (e.g. "keyboard off in Lantern
-    /// settings"), if the helper sent one.
-    pub fn companion(&self) -> Option<(CompanionState, Option<String>)> {
-        self.companion.clone()
+    /// Phone `serial`'s last `companion` state with its `msg` (e.g. "keyboard off in Lantern
+    /// settings"), if its live helper sent one.
+    pub fn companion(&self, serial: &str) -> Option<(CompanionState, Option<String>)> {
+        self.link(serial).and_then(|link| link.companion.clone())
     }
 
     /// Forgets window `win` (registry and status).
@@ -878,50 +1019,51 @@ impl Hub {
         }
     }
 
-    /// Drops a client now. A window it owned is closed on the phone (close = quit) and released.
-    async fn drop_client(
-        &mut self,
-        cid: u64,
-        helper: Option<&mpsc::Sender<Frame>>,
-    ) -> Result<(), HelperWedged> {
+    /// The phone window `win` is on and that phone's helper queue (if its link is up).
+    fn window_helper(&self, win: u32) -> Option<(String, mpsc::Sender<Frame>)> {
+        let (_, serial) = self.windows.get(&win)?;
+        let link = self.link(serial)?;
+        Some((serial.clone(), link.helper.clone()))
+    }
+
+    /// Drops a client now. A window it owned is closed on its phone (close = quit) and
+    /// released.
+    async fn drop_client(&mut self, cid: u64) -> Result<(), HelperWedged> {
         let Some(client) = self.clients.remove(&cid) else {
             return Ok(());
         };
         let win = client.win;
         client.kill();
         if let Some(win) = win {
+            let helper = self.window_helper(win);
             self.release(win);
             tracing::info!(cid, win, "window client gone; closing window");
-            if let Some(helper) = helper {
-                return to_helper(helper, control(win, Control::Close)).await;
+            if let Some((serial, helper)) = helper {
+                return to_helper(&serial, &helper, control(win, Control::Close)).await;
             }
         }
         Ok(())
     }
 
-    /// Handles one client event. `helper` is the live session's outbound queue, if any.
-    pub async fn on_client(
-        &mut self,
-        event: ClientEvent,
-        helper: Option<&mpsc::Sender<Frame>>,
-    ) -> Result<(), HelperWedged> {
+    /// Handles one client event. A window's frames go only to its own phone's helper.
+    pub async fn on_client(&mut self, event: ClientEvent) -> Result<(), HelperWedged> {
         let (cid, frame) = match event {
-            ClientEvent::Gone(cid) => return self.drop_client(cid, helper).await,
+            ClientEvent::Gone(cid) => return self.drop_client(cid).await,
             ClientEvent::Frame(cid, frame) => (cid, frame),
         };
         let Some(client) = self.clients.get(&cid) else {
             return Ok(());
         };
         let Some(win) = client.win else {
-            return self.on_open(cid, frame, helper).await;
+            return self.on_open(cid, frame).await;
         };
         let (stream, kind) = (frame.stream, frame.kind);
         match (stream == win)
             .then(|| client_frame_for_helper(frame))
             .flatten()
         {
-            Some(frame) => match helper {
-                Some(helper) => to_helper(helper, frame).await,
+            Some(frame) => match self.window_helper(win) {
+                Some((serial, helper)) => to_helper(&serial, &helper, frame).await,
                 None => Ok(()),
             },
             None => {
@@ -932,17 +1074,12 @@ impl Hub {
                     ?kind,
                     "client protocol error; dropping it"
                 );
-                self.drop_client(cid, helper).await
+                self.drop_client(cid).await
             }
         }
     }
 
-    async fn on_open(
-        &mut self,
-        cid: u64,
-        frame: Frame,
-        helper: Option<&mpsc::Sender<Frame>>,
-    ) -> Result<(), HelperWedged> {
+    async fn on_open(&mut self, cid: u64, frame: Frame) -> Result<(), HelperWedged> {
         let open = (frame.kind == Kind::Control && frame.stream == 0)
             .then(|| Control::decode(&frame.payload).ok())
             .flatten();
@@ -995,37 +1132,44 @@ impl Hub {
             self.reply_and_finish(cid, control(0, Control::error(msg)));
             return Ok(());
         }
-        // The window chose the live phone: it goes there whatever the catalogue says.
-        let chosen = helper.is_some() && phone.is_some() && phone.as_deref() == self.serial();
-        if let Some(serial) = phone.filter(|_| !chosen) {
-            let msg = self.refuse_for_phone(cid, serial, pkg, user);
-            self.reply_and_finish(cid, control(0, Control::error(msg)));
-            return Ok(());
-        }
-        let Some(helper) = helper else {
-            let msg = match self.session.0 {
-                SessionState::Paused => PAUSED,
-                _ => NOT_CONNECTED,
-            };
-            self.reply_and_finish(cid, control(0, Control::error(msg)));
-            return Ok(());
+        // The window chose a live phone: it goes there whatever the catalogue says.
+        let (serial, chosen) = match phone {
+            Some(serial) if self.link(&serial).is_some() => (serial, true),
+            Some(serial) => {
+                let msg = self.refuse_for_phone(cid, serial, pkg, user);
+                self.reply_and_finish(cid, control(0, Control::error(msg)));
+                return Ok(());
+            }
+            None => match self.default_phone() {
+                Some(serial) => (serial.to_owned(), false),
+                None => {
+                    let msg = match self.not_ready().0 {
+                        SessionState::Paused => PAUSED,
+                        _ => NOT_CONNECTED,
+                    };
+                    self.reply_and_finish(cid, control(0, Control::error(msg)));
+                    return Ok(());
+                }
+            },
         };
-        if !chosen && self.not_on_this_phone(&pkg, user) {
-            tracing::info!(cid, pkg, user, "app not on this phone; refusing the open");
+        if !chosen && self.not_on_this_phone(&serial, &pkg, user) {
+            tracing::info!(
+                cid,
+                serial,
+                pkg,
+                user,
+                "app not on this phone; refusing the open"
+            );
             self.reply_and_finish(cid, control(0, Control::error(NOT_ON_THIS_PHONE)));
             return Ok(());
         }
-        let key = format!("{pkg}:{user}");
+        let key = format!("{serial}|{pkg}:{user}");
         let mut claim = self.registry.claim(&key);
         if let Claim::Existing(win) = claim {
-            tracing::info!(cid, win, pkg, user, "already open; focusing");
-            if let Some(&owner) = self.windows.get(&win) {
-                self.send_to_client(
-                    owner,
-                    control(win, Control::Focus { activation_token }),
-                    Some(helper),
-                )
-                .await?;
+            tracing::info!(cid, win, serial, pkg, user, "already open; focusing");
+            if let Some(&(owner, _)) = self.windows.get(&win) {
+                self.send_to_client(owner, control(win, Control::Focus { activation_token }))
+                    .await?;
                 if !self.clients.contains_key(&owner) {
                     // The owner could not take the focus and was dropped (its window closed
                     // and released): this open becomes a new window instead.
@@ -1036,17 +1180,18 @@ impl Hub {
         }
         match claim {
             Claim::New(win) => {
-                tracing::info!(cid, win, pkg, user, "opening window");
+                tracing::info!(cid, win, serial, pkg, user, "opening window");
                 if let Some(client) = self.clients.get_mut(&cid) {
                     client.win = Some(win);
                 }
-                self.windows.insert(win, cid);
+                self.windows.insert(win, (cid, serial.clone()));
                 self.info.insert(
                     win,
                     WindowInfo {
                         id: win,
                         pkg: pkg.clone(),
                         user,
+                        phone: Some(serial.clone()),
                     },
                 );
                 let open = Control::Open {
@@ -1058,7 +1203,10 @@ impl Hub {
                     activation_token: None,
                     phone: None,
                 };
-                to_helper(helper, control(win, open)).await
+                match self.link(&serial).map(|link| link.helper.clone()) {
+                    Some(helper) => to_helper(&serial, &helper, control(win, open)).await,
+                    None => Ok(()),
+                }
             }
             Claim::Existing(win) => {
                 self.reply_and_finish(
@@ -1075,7 +1223,7 @@ impl Hub {
         }
     }
 
-    /// The refusal of an open naming `serial`, which isn't the live phone. With the connect
+    /// The refusal of an open naming `serial`, which has no live link. With the connect
     /// prompt, a phone the view lists (and isn't being undone) is offered: the open is queued for
     /// the prompt. Otherwise [`PAUSED`] for a phone switched off in Lantern, else
     /// [`NOT_CONNECTED`]; a serial lanternd doesn't know is never offered (no record, no row).
@@ -1124,11 +1272,11 @@ impl Hub {
         }
     }
 
-    /// Whether `pkg` for `user` is known to be only on other phones: this phone's full
-    /// catalogue has arrived, the app has a menu entry, and the entry does not list the
-    /// session's phone. Before the first sync nothing is refused.
-    fn not_on_this_phone(&self, pkg: &str, user: u32) -> bool {
-        let (Some(catalog), Some(serial)) = (&self.catalog, &self.session.1) else {
+    /// Whether `pkg` for `user` is known to be only on other phones than `serial`: that
+    /// phone's full catalogue has arrived, the app has a menu entry, and the entry does not
+    /// list `serial`. Before the first sync nothing is refused.
+    fn not_on_this_phone(&self, serial: &str, pkg: &str, user: u32) -> bool {
+        let Some(catalog) = &self.catalog else {
             return false;
         };
         if !catalog.synced(serial) {
@@ -1139,12 +1287,7 @@ impl Hub {
     }
 
     /// Queues `frame` for a window client; one that cannot keep up is dropped.
-    async fn send_to_client(
-        &mut self,
-        cid: u64,
-        frame: Frame,
-        helper: Option<&mpsc::Sender<Frame>>,
-    ) -> Result<(), HelperWedged> {
+    async fn send_to_client(&mut self, cid: u64, frame: Frame) -> Result<(), HelperWedged> {
         let Some(client) = self.clients.get(&cid) else {
             return Ok(());
         };
@@ -1152,82 +1295,116 @@ impl Hub {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 tracing::warn!(cid, win = ?client.win, "client queue overflowed; dropping it");
-                self.drop_client(cid, helper).await
+                self.drop_client(cid).await
             }
-            Err(TrySendError::Closed(_)) => self.drop_client(cid, helper).await,
+            Err(TrySendError::Closed(_)) => self.drop_client(cid).await,
         }
     }
 
-    /// Handles one frame from the helper.
-    pub async fn on_helper(
-        &mut self,
-        frame: Frame,
-        helper: &mpsc::Sender<Frame>,
-    ) -> Result<(), HelperWedged> {
+    /// Handles one frame from phone `serial`'s helper. A frame for a window reaches its client
+    /// only when that window is on `serial`.
+    pub async fn on_helper(&mut self, serial: &str, frame: Frame) -> Result<(), HelperWedged> {
+        if self.link(serial).is_none() {
+            tracing::debug!(
+                serial,
+                stream = frame.stream,
+                "frame from a phone with no live link; dropped"
+            );
+            return Ok(());
+        }
         if frame.stream == 0 {
             match Control::decode(&frame.payload) {
-                Ok(Control::Error { msg, .. }) => tracing::error!(msg, "helper session error"),
+                Ok(Control::Error { msg, .. }) => {
+                    tracing::error!(serial, msg, "helper session error")
+                }
                 Ok(Control::Companion { state, msg }) => {
                     match state {
-                        CompanionState::Ready => tracing::info!("companion linked"),
+                        CompanionState::Ready => tracing::info!(serial, "companion linked"),
                         CompanionState::Unavailable => {
                             tracing::warn!(
+                                serial,
                                 msg = msg.as_deref().unwrap_or(""),
                                 "companion unavailable"
                             )
                         }
                     }
-                    self.companion = Some((state, msg));
+                    if let Some(link) = self.link_mut(serial) {
+                        link.companion = Some((state, msg));
+                    }
                 }
                 Ok(
                     c
                     @ (Control::App { .. } | Control::AppsEnd { .. } | Control::AppRemoved { .. }),
                 ) => {
                     log_catalogue(&c);
-                    self.on_catalogue(c);
+                    self.on_catalogue(serial, c);
                 }
-                Ok(Control::Clip { text }) => self.on_phone_clip(text),
+                Ok(Control::Clip { text }) => self.on_phone_clip(serial, text),
                 // Only the start of a stretch goes on: a burst of `locked` must not fill the
                 // prompt's queue and crowd out the `unlocked`/`unlock_result` behind it.
                 Ok(Control::Locked { reason }) => {
-                    if !std::mem::replace(&mut self.locked, true) {
-                        tracing::info!(?reason, "phone locked");
-                        self.lock_event(LockEvent::Locked(reason));
+                    let started = self
+                        .link_mut(serial)
+                        .is_some_and(|link| !std::mem::replace(&mut link.locked, true));
+                    if started {
+                        tracing::info!(serial, ?reason, "phone locked");
+                        self.lock_event(LockEvent::Locked {
+                            serial: serial.to_owned(),
+                            reason,
+                        });
                     }
                 }
                 Ok(Control::Unlocked) => {
-                    tracing::info!("phone unlocked");
-                    self.lock_event(LockEvent::Unlocked);
-                    self.unlocked();
+                    tracing::info!(serial, "phone unlocked");
+                    self.lock_event(LockEvent::Unlocked {
+                        serial: serial.to_owned(),
+                    });
+                    self.unlocked(serial);
                 }
                 Ok(Control::UnlockResult { ok, reason }) => {
                     tracing::info!(
+                        serial,
                         ok,
                         reason = reason.as_deref().unwrap_or(""),
                         "unlock result"
                     );
-                    self.lock_event(LockEvent::Result { ok, reason });
+                    self.lock_event(LockEvent::Result {
+                        serial: serial.to_owned(),
+                        ok,
+                        reason,
+                    });
                     if ok {
-                        self.unlocked();
+                        self.unlocked(serial);
                     }
                 }
                 // Never dump whole frames: some carry icons or clipboard text.
                 Ok(_) => tracing::debug!(
+                    serial,
                     t = control_type(&frame.payload),
                     len = frame.payload.len(),
                     "helper stream-0 frame"
                 ),
                 Err(error) => {
-                    tracing::debug!(%error, len = frame.payload.len(), "undecodable helper stream-0 frame")
+                    tracing::debug!(serial, %error, len = frame.payload.len(), "undecodable helper stream-0 frame")
                 }
             }
             return Ok(());
         }
         let win = frame.stream;
         // Unknown or already-released window (e.g. the closed answering our close): ignore.
-        let Some(&cid) = self.windows.get(&win) else {
+        let Some((cid, on)) = self.windows.get(&win).cloned() else {
             return Ok(());
         };
+        // Never across phones: another phone's helper can't reach this window.
+        if on != serial {
+            tracing::debug!(
+                stream = win,
+                serial,
+                window_phone = on,
+                "helper frame for another phone's window; dropped"
+            );
+            return Ok(());
+        }
         let decoded = (frame.kind == Kind::Control)
             .then(|| Control::decode(&frame.payload).ok())
             .flatten();
@@ -1240,17 +1417,20 @@ impl Hub {
             // before this error): the client is told so and the app reopened after the unlock.
             // Without the unlock prompt nobody asks for the PIN: the phone's error stands.
             Some(Control::Error { .. })
-                if self.locked && self.lock_events.is_some() && !self.opened.contains(&win) =>
+                if self.locked(serial)
+                    && self.lock_events.is_some()
+                    && !self.opened.contains(&win) =>
             {
                 if let Some(info) = self.info.get(&win) {
                     tracing::info!(
                         cid,
                         win,
+                        serial,
                         pkg = info.pkg,
                         user = info.user,
                         "open blocked by the phone's lock"
                     );
-                    self.blocked_open(info.pkg.clone(), info.user);
+                    self.blocked_open(serial, info.pkg.clone(), info.user);
                 }
                 frame = control(win, Control::error(PHONE_LOCKED));
             }
@@ -1265,37 +1445,13 @@ impl Hub {
             self.reply_and_finish(cid, frame);
             return Ok(());
         }
-        self.send_to_client(cid, frame, Some(helper)).await
-    }
-
-    /// The helper session ended: every window client is closed (it exits) and the registry
-    /// starts over for the next session. Clients still waiting to send Open are kept.
-    pub fn reset(&mut self) {
-        let windowed: Vec<u64> = self.windows.values().copied().collect();
-        for cid in windowed {
-            if let Some(client) = self.clients.remove(&cid) {
-                client.finish();
-            }
-        }
-        self.windows.clear();
-        self.info.clear();
-        self.registry = Registry::default();
-        self.companion = None;
-        self.clip_sync = ClipSync::default();
-        self.opened.clear();
-        // The blocked opens of this phone wait for its next unlock; any other phone's go.
-        let serial = self.serial().map(str::to_owned);
-        // Its catalogue sync window closes with the session.
-        if let (Some(catalog), Some(serial)) = (self.catalog.as_mut(), serial.as_deref()) {
-            catalog.end_session(serial);
-        }
-        self.reopens.retain(|(s, ..)| Some(s) == serial.as_ref());
-        // The stretch ends with the session.
-        if std::mem::take(&mut self.locked) {
-            self.lock_event(LockEvent::Unlocked);
-        }
+        self.send_to_client(cid, frame).await
     }
 }
+
+#[cfg(test)]
+#[path = "ipc_phones_tests.rs"]
+mod phones_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1313,25 +1469,35 @@ mod tests {
         }
     }
 
-    /// R7: a blocked open is reopened only after an unlock of the phone it was blocked on;
-    /// a session end keeps only the ending phone's entries.
+    fn link(hub: &mut Hub, serial: &str) -> mpsc::Receiver<Frame> {
+        let (tx, rx) = mpsc::channel(16);
+        hub.session_up(serial, tx, "sha");
+        rx
+    }
+
+    /// R7: a blocked open is reopened only after an unlock of the phone it was blocked on.
+    /// A phone's session end keeps its own entries and leaves every other phone's alone.
     #[tokio::test]
     async fn reopens_wait_for_their_own_phone() {
         let mut hub = Hub::new(None);
         let (tx, mut rx) = mpsc::channel(16);
         hub.set_lock_events(tx);
-        let serve = |hub: &mut Hub, serial: &str| {
-            hub.set_session(SessionState::Ready, Some(serial.to_owned()), None);
-            hub.locked = true;
+        let lock = |hub: &mut Hub, serial: &str| {
+            hub.link_mut(serial).unwrap().locked = true;
         };
-        serve(&mut hub, "a");
-        hub.blocked_open("com.a".into(), 0);
-        hub.reset();
+        let _a = link(&mut hub, "a");
+        lock(&mut hub, "a");
+        hub.blocked_open("a", "com.a".into(), 0);
+        hub.session_down("a");
         // Unlocked on the end of a's session.
-        assert_eq!(rx.try_recv(), Ok(LockEvent::Unlocked));
-        serve(&mut hub, "b");
-        hub.blocked_open("com.b".into(), 10);
-        hub.unlocked();
+        assert_eq!(
+            rx.try_recv(),
+            Ok(LockEvent::Unlocked { serial: "a".into() })
+        );
+        let _b = link(&mut hub, "b");
+        lock(&mut hub, "b");
+        hub.blocked_open("b", "com.b".into(), 10);
+        hub.unlocked("b");
         assert_eq!(
             rx.try_recv(),
             Ok(LockEvent::Reopen {
@@ -1340,21 +1506,11 @@ mod tests {
             }),
             "a's open waits for a"
         );
-        // a's entry survived a's own session end, but b's session end drops it.
-        serve(&mut hub, "b");
-        hub.reset();
-        assert_eq!(rx.try_recv(), Ok(LockEvent::Unlocked));
-        serve(&mut hub, "a");
-        hub.unlocked();
-        assert!(rx.try_recv().is_err(), "nothing left to reopen");
-
-        // Same phone back within the window: its open is reopened.
-        serve(&mut hub, "a");
-        hub.blocked_open("com.a".into(), 0);
-        hub.reset();
-        assert_eq!(rx.try_recv(), Ok(LockEvent::Unlocked));
-        serve(&mut hub, "a");
-        hub.unlocked();
+        // b's session end leaves a's entry alone.
+        hub.session_down("b");
+        assert!(rx.try_recv().is_err(), "b wasn't locked");
+        let _a = link(&mut hub, "a");
+        hub.unlocked("a");
         assert_eq!(
             rx.try_recv(),
             Ok(LockEvent::Reopen {
@@ -1362,26 +1518,29 @@ mod tests {
                 apps: vec![("com.a".into(), 0)]
             })
         );
+        hub.unlocked("a");
+        assert!(rx.try_recv().is_err(), "nothing left to reopen");
     }
 
     #[tokio::test]
     async fn hub_keeps_the_companion_msg() {
         let mut hub = Hub::new(None);
-        let (helper, _rx) = mpsc::channel(4);
-        assert_eq!(hub.companion(), None);
+        let _rx = link(&mut hub, "a");
+        assert_eq!(hub.companion("a"), None);
         let off = "keyboard off in Lantern settings";
-        hub.on_helper(companion(CompanionState::Ready, Some(off)), &helper)
+        hub.on_helper("a", companion(CompanionState::Ready, Some(off)))
             .await
             .unwrap();
         assert_eq!(
-            hub.companion(),
+            hub.companion("a"),
             Some((CompanionState::Ready, Some(off.to_owned())))
         );
-        hub.on_helper(companion(CompanionState::Ready, None), &helper)
+        assert_eq!(hub.companion("b"), None, "per phone");
+        hub.on_helper("a", companion(CompanionState::Ready, None))
             .await
             .unwrap();
-        assert_eq!(hub.companion(), Some((CompanionState::Ready, None)));
-        hub.reset();
-        assert_eq!(hub.companion(), None, "cleared when the session ends");
+        assert_eq!(hub.companion("a"), Some((CompanionState::Ready, None)));
+        hub.session_down("a");
+        assert_eq!(hub.companion("a"), None, "cleared when the session ends");
     }
 }

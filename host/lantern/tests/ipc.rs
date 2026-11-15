@@ -688,7 +688,7 @@ async fn daemon_shutdown_eofs_clients() {
 }
 
 #[tokio::test]
-async fn session_end_eofs_clients_and_resets_registry() {
+async fn session_end_eofs_clients_and_never_reuses_ids() {
     let (mut helper, port) = FakeHelper::spawn().await;
     let daemon = start_daemon(Some(port));
     assert_eq!(helper.next_session().await, 0);
@@ -703,7 +703,8 @@ async fn session_end_eofs_clients_and_resets_registry() {
         "daemon restarts the session"
     );
     let (_client, again) = open_window(&daemon.sock, &mut helper, "com.example", 0).await;
-    assert_eq!(again, 1, "the new session starts a fresh registry");
+    // Decision 1: window ids are unique for lanternd's lifetime, across sessions and phones.
+    assert_eq!(again, 2, "ids are never reused within the run");
     daemon.shutdown().await;
 }
 
@@ -1174,12 +1175,14 @@ async fn status_reports_ready_session_and_open_windows() {
             WindowInfo {
                 id: win1,
                 pkg: "com.one".into(),
-                user: 0
+                user: 0,
+                phone: Some("dev".into()),
             },
             WindowInfo {
                 id: win2,
                 pkg: "com.two".into(),
-                user: 10
+                user: 10,
+                phone: Some("dev".into()),
             },
         ]
     );
@@ -3434,7 +3437,15 @@ impl Locky {
 #[tokio::test]
 async fn unlock_frame_reaches_helper_once() {
     let (mut helper, port) = FakeHelper::spawn().await;
-    let locky = start_locky(port).await;
+    let mut locky = start_locky(port).await;
+    // Decision 11: a PIN goes only to a phone whose lock stretch is open.
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Clipboard,
+        },
+    ));
+    locky.locked_until(true).await;
     locky
         .pins
         .send(("dev".into(), Pin::parse("24680\n".into()).unwrap()))
@@ -3586,11 +3597,19 @@ async fn locked_sets_view_and_unlocked_clears() {
     locky.locked_until(true).await;
     assert_eq!(
         locky.event().await,
-        LockEvent::Locked(LockReason::Clipboard)
+        LockEvent::Locked {
+            serial: "dev".into(),
+            reason: LockReason::Clipboard,
+        }
     );
     helper.send(control(0, Control::Unlocked));
     locky.locked_until(false).await;
-    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Unlocked {
+            serial: "dev".into(),
+        }
+    );
 
     // A successful unlock_result also ends it; a failed one does not.
     helper.send(control(
@@ -3600,8 +3619,15 @@ async fn locked_sets_view_and_unlocked_clears() {
         },
     ));
     locky.locked_until(true).await;
-    assert_eq!(locky.event().await, LockEvent::Locked(LockReason::Open));
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Locked {
+            serial: "dev".into(),
+            reason: LockReason::Open,
+        }
+    );
     let failed = LockEvent::Result {
+        serial: "dev".into(),
         ok: false,
         reason: Some("wrong PIN".into()),
     };
@@ -3625,6 +3651,7 @@ async fn locked_sets_view_and_unlocked_clears() {
     assert_eq!(
         locky.event().await,
         LockEvent::Result {
+            serial: "dev".into(),
             ok: true,
             reason: None
         }
@@ -3640,11 +3667,19 @@ async fn locked_sets_view_and_unlocked_clears() {
     locky.locked_until(true).await;
     assert_eq!(
         locky.event().await,
-        LockEvent::Locked(LockReason::Clipboard)
+        LockEvent::Locked {
+            serial: "dev".into(),
+            reason: LockReason::Clipboard,
+        }
     );
     helper.die();
     locky.locked_until(false).await;
-    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Unlocked {
+            serial: "dev".into(),
+        }
+    );
     locky.daemon.shutdown().await;
 }
 
@@ -3689,7 +3724,13 @@ async fn open_failed_while_locked_gets_phone_locked() {
     );
     assert_eq!(recv(&mut client).await, Some(closed));
     assert_eof(&mut client).await;
-    assert_eq!(locky.event().await, LockEvent::Locked(LockReason::Open));
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Locked {
+            serial: "dev".into(),
+            reason: LockReason::Open,
+        }
+    );
 
     // The same app blocked twice and another user's app: one entry each.
     for (pkg, user) in [("com.foo", 0), ("com.bar", 10)] {
@@ -3709,7 +3750,12 @@ async fn open_failed_while_locked_gets_phone_locked() {
     }
 
     helper.send(control(0, Control::Unlocked));
-    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Unlocked {
+            serial: "dev".into(),
+        }
+    );
     assert_eq!(
         locky.event().await,
         LockEvent::Reopen {
@@ -3725,7 +3771,12 @@ async fn open_failed_while_locked_gets_phone_locked() {
     helper.send(error.clone());
     assert_eq!(recv(&mut client).await, Some(error));
     helper.send(control(0, Control::Unlocked));
-    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Unlocked {
+            serial: "dev".into(),
+        }
+    );
     assert!(
         timeout(Duration::from_millis(300), locky.events.recv())
             .await
@@ -3762,7 +3813,18 @@ async fn pin_for_a_phone_no_longer_served_is_not_sent() {
     let notes = ctl.notes.lock().unwrap().clone();
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert_eq!(notes[0].0, "Pixel isn't connected");
-    // b's own PIN goes through.
+    // b's own PIN goes through while b is locked (decision 11).
+    helper.send(control(
+        0,
+        Control::Locked {
+            reason: LockReason::Clipboard,
+        },
+    ));
+    let deadline = Instant::now() + STEP;
+    while !ctl.view.borrow().phone("b").is_some_and(|p| p.locked) {
+        assert!(Instant::now() < deadline, "b never locked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     pins.send(("b".into(), Pin::parse("2468".into()).unwrap()))
         .await
         .unwrap();
@@ -3790,9 +3852,17 @@ async fn locked_burst_is_one_event() {
     helper.send(control(0, Control::Unlocked));
     assert_eq!(
         locky.event().await,
-        LockEvent::Locked(LockReason::Clipboard)
+        LockEvent::Locked {
+            serial: "dev".into(),
+            reason: LockReason::Clipboard,
+        }
     );
-    assert_eq!(locky.event().await, LockEvent::Unlocked);
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Unlocked {
+            serial: "dev".into(),
+        }
+    );
     // A new stretch is forwarded again.
     helper.send(control(
         0,
@@ -3800,7 +3870,13 @@ async fn locked_burst_is_one_event() {
             reason: LockReason::Open,
         },
     ));
-    assert_eq!(locky.event().await, LockEvent::Locked(LockReason::Open));
+    assert_eq!(
+        locky.event().await,
+        LockEvent::Locked {
+            serial: "dev".into(),
+            reason: LockReason::Open,
+        }
+    );
     locky.daemon.shutdown().await;
 }
 

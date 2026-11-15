@@ -174,7 +174,11 @@ async fn one_notice_per_locked_stretch() {
         } else {
             LockReason::Open
         };
-        rig.send(LockEvent::Locked(reason)).await;
+        rig.send(LockEvent::Locked {
+            serial: "s1".into(),
+            reason,
+        })
+        .await;
     }
     rig.notify_id(1).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -191,8 +195,15 @@ async fn one_notice_per_locked_stretch() {
         }]
     );
     // A new stretch after the unlock gets its own notice.
-    rig.send(LockEvent::Unlocked).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Unlocked {
+        serial: "s1".into(),
+    })
+    .await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     rig.notify_id(2).await;
     assert!(rig.calls().contains(&Call::Close(1)));
 }
@@ -204,7 +215,11 @@ async fn session_lock_prompts_at_once() {
     let rig = Rig::start(true, echo_prompt("1234")).await;
     rig.view
         .send_modify(|view| view.phones[0].name = Some("Pixel".into()));
-    rig.send(LockEvent::Locked(LockReason::Session)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Session,
+    })
+    .await;
     rig.notify_id(1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
@@ -224,7 +239,11 @@ async fn session_lock_prompts_at_once() {
 #[tokio::test]
 async fn action_prompts_and_sends_pin() {
     let mut rig = Rig::start(true, echo_prompt("1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     // Anyone else on the bus emitting the signal is ignored.
     let other = rig.bus.connect().await;
@@ -242,7 +261,11 @@ async fn action_prompts_and_sends_pin() {
 #[tokio::test]
 async fn invalid_pin_is_refused_and_not_sent() {
     let mut rig = Rig::start(true, echo_prompt("12a4")).await;
-    rig.send(LockEvent::Locked(LockReason::Open)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Open,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     rig.click(id, "unlock").await;
     rig.notify_id(2).await;
@@ -265,11 +288,16 @@ async fn invalid_pin_is_refused_and_not_sent() {
 #[tokio::test]
 async fn wrong_pin_notifies_once_no_retry() {
     let mut rig = Rig::start(true, echo_prompt("1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     rig.click(id, "unlock").await;
     assert_eq!(rig.next_pin().await, pin("1234"));
     rig.send(LockEvent::Result {
+        serial: "s1".into(),
         ok: false,
         reason: Some("wrong PIN".into()),
     })
@@ -301,9 +329,14 @@ async fn wrong_pin_notifies_once_no_retry() {
 #[tokio::test]
 async fn unconfirmed_unlock_does_not_blame_the_pin() {
     let rig = Rig::start(true, echo_prompt("1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     rig.notify_id(1).await;
     rig.send(LockEvent::Result {
+        serial: "s1".into(),
         ok: false,
         reason: Some("unlock not confirmed".into()),
     })
@@ -324,9 +357,14 @@ async fn unconfirmed_unlock_does_not_blame_the_pin() {
 #[tokio::test]
 async fn success_closes_notice_and_reopens_pending() {
     let rig = Rig::start(true, echo_prompt("1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Open)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Open,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     rig.send(LockEvent::Result {
+        serial: "s1".into(),
         ok: true,
         reason: None,
     })
@@ -357,14 +395,26 @@ async fn success_closes_notice_and_reopens_pending() {
 #[tokio::test]
 async fn no_notification_server_is_harmless() {
     let mut rig = Rig::start(false, echo_prompt("1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     rig.send(LockEvent::Result {
+        serial: "s1".into(),
         ok: false,
         reason: Some("wrong PIN".into()),
     })
     .await;
-    rig.send(LockEvent::Unlocked).await;
-    rig.send(LockEvent::Locked(LockReason::Open)).await;
+    rig.send(LockEvent::Unlocked {
+        serial: "s1".into(),
+    })
+    .await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Open,
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!rig.task.is_finished(), "run must keep going");
     rig.assert_no_pin().await;
@@ -391,7 +441,11 @@ fn slow_prompt(secs: &str, text: &str) -> Prompt {
 #[tokio::test]
 async fn pin_is_tagged_with_the_phone_clicked() {
     let mut rig = Rig::start(true, slow_prompt("0.5", "1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     rig.click(id, "unlock").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -409,13 +463,24 @@ async fn pin_is_tagged_with_the_phone_clicked() {
 #[tokio::test]
 async fn answer_after_the_stretch_ended_is_dropped() {
     let mut rig = Rig::start(true, slow_prompt("0.5", "1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     rig.click(id, "unlock").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    rig.send(LockEvent::Unlocked).await;
+    rig.send(LockEvent::Unlocked {
+        serial: "s1".into(),
+    })
+    .await;
     // A new stretch before the answer does not revive it.
-    rig.send(LockEvent::Locked(LockReason::Open)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Open,
+    })
+    .await;
     rig.assert_no_pin_within(Duration::from_millis(1500)).await;
 }
 
@@ -427,13 +492,20 @@ async fn request_prompts_only_while_locked() {
     // Not locked yet (or the click raced the unlock): no dialog.
     rig.request.ask("s1".into());
     rig.assert_no_pin().await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     rig.notify_id(1).await;
     rig.request.ask("s1".into());
     assert_eq!(rig.next_pin().await, pin("1234"));
     rig.assert_no_pin().await;
     // After the stretch ends, a request does nothing again.
-    rig.send(LockEvent::Unlocked).await;
+    rig.send(LockEvent::Unlocked {
+        serial: "s1".into(),
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     rig.request.ask("s1".into());
     rig.assert_no_pin().await;
@@ -444,7 +516,11 @@ async fn request_prompts_only_while_locked() {
 #[tokio::test]
 async fn second_click_while_dialog_open_does_nothing() {
     let mut rig = Rig::start(true, slow_prompt("0.5", "1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     rig.request.ask("s1".into());
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -462,7 +538,11 @@ async fn second_click_while_dialog_open_does_nothing() {
 #[tokio::test]
 async fn tray_request_for_another_phone_opens_nothing() {
     let mut rig = Rig::start(true, echo_prompt("1234")).await;
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     rig.notify_id(1).await;
     rig.request.ask("s2".into());
     rig.assert_no_pin().await;
@@ -479,15 +559,21 @@ async fn names_are_escaped() {
     let rig = Rig::start(true, echo_prompt("12a4")).await;
     rig.view
         .send_modify(|view| view.phones[0].name = Some("A&B <1>".into()));
-    rig.send(LockEvent::Locked(LockReason::Clipboard)).await;
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
     let id = rig.notify_id(1).await;
     rig.send(LockEvent::Result {
+        serial: "s1".into(),
         ok: false,
         reason: Some("<odd> & more".into()),
     })
     .await;
     rig.notify_id(2).await;
     rig.send(LockEvent::Result {
+        serial: "s1".into(),
         ok: false,
         reason: Some("unlock not confirmed".into()),
     })
@@ -520,4 +606,53 @@ async fn names_are_escaped() {
             pair("Couldn't unlock A&B <1>", "the PIN must be 4 to 16 digits"),
         ]
     );
+}
+
+/// One stretch at a time (this task): a stretch for `s1`, then `s2` locks. `s2`'s events are
+/// ignored while `s1`'s stretch is open (no second notice, `s1`'s notice stays), and the answer
+/// to `s1`'s notice carries `s1`.
+#[tokio::test]
+async fn events_for_another_phone_wait_for_the_stretch() {
+    let mut rig = Rig::start(true, echo_prompt("1234")).await;
+    rig.view.send_modify(|view| {
+        let mut other = view.phones[0].clone();
+        other.serial = "s2".into();
+        other.name = Some("Other".into());
+        view.phones.push(other);
+    });
+    rig.send(LockEvent::Locked {
+        serial: "s1".into(),
+        reason: LockReason::Clipboard,
+    })
+    .await;
+    let id = rig.notify_id(1).await;
+    rig.send(LockEvent::Locked {
+        serial: "s2".into(),
+        reason: LockReason::Session,
+    })
+    .await;
+    rig.send(LockEvent::Result {
+        serial: "s2".into(),
+        ok: false,
+        reason: Some("wrong PIN".into()),
+    })
+    .await;
+    rig.send(LockEvent::Unlocked {
+        serial: "s2".into(),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(rig.notifies().len(), 1, "{:?}", rig.calls());
+    assert!(!rig.calls().contains(&Call::Close(id)), "{:?}", rig.calls());
+    // A tray request for s2 opens nothing; s1's notice prompts for s1.
+    rig.request.ask("s2".into());
+    rig.assert_no_pin().await;
+    rig.click(id, "unlock").await;
+    let (serial, got) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "s1");
+    assert_eq!(got, pin("1234"));
+    match &rig.notifies()[0] {
+        Call::Notify { summary, .. } => assert_eq!(summary, "Unlock your Test Phone"),
+        other => panic!("{other:?}"),
+    }
 }

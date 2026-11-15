@@ -106,15 +106,21 @@ impl PartialEq for Pin {
 
 impl Eq for Pin {}
 
-/// What the daemon's [`crate::daemon::ipc::Hub`] tells [`run`] about the phone's lock.
+/// What the daemon's [`crate::daemon::ipc::Hub`] tells [`run`] about a phone's lock. Each
+/// event names the phone (`serial`) whose helper sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockEvent {
-    /// The helper's `locked{reason}`: the lock blocked a copy, a paste or an open.
-    Locked(LockReason),
+    /// The helper's `locked{reason}`: the lock blocked a copy, a paste or an open (or was there
+    /// when the session came up).
+    Locked { serial: String, reason: LockReason },
     /// The helper's `unlocked`, or the session ended: the locked stretch is over.
-    Unlocked,
+    Unlocked { serial: String },
     /// The helper's `unlock_result`.
-    Result { ok: bool, reason: Option<String> },
+    Result {
+        serial: String,
+        ok: bool,
+        reason: Option<String>,
+    },
     /// Sent right after the stretch ended in an unlock: the apps (pkg, user) on phone `serial`
     /// whose open the lock blocked in the last 2 minutes, each once.
     Reopen {
@@ -125,8 +131,8 @@ pub enum LockEvent {
 
 /// A cheap, cloneable handle that asks the unlock prompt for its PIN dialog for one phone: the
 /// tray's Unlock row. It takes the notification action's path (one dialog at a time, the
-/// answer pinned to the phone), and opens nothing unless the phone it names is the live one in
-/// a locked stretch; the holder never runs the dialog and never sees the PIN.
+/// answer pinned to the phone), and opens nothing unless the phone it names is the one whose
+/// locked stretch is open; the holder never runs the dialog and never sees the PIN.
 #[derive(Debug, Clone)]
 pub struct Request(mpsc::Sender<String>);
 
@@ -231,10 +237,10 @@ pub fn reopen_args(pkg: &str, user: u32, phone: Option<&str>) -> Vec<String> {
     args
 }
 
-/// The phone's name for notification texts.
-fn phone_name(view: &watch::Receiver<View>) -> String {
+/// Phone `serial`'s name for notification texts.
+fn phone_name(view: &watch::Receiver<View>, serial: &str) -> String {
     view.borrow()
-        .live()
+        .phone(serial)
         .map(|p| p.display_name().to_owned())
         .unwrap_or_else(|| "phone".to_owned())
 }
@@ -281,14 +287,15 @@ fn ask(prompt: &Prompt, name: &str) -> Result<Option<Pin>, String> {
     Pin::parse(raw).map(Some).map_err(str::to_owned)
 }
 
-/// Starts the PIN dialog for the live phone (its serial pinned to the answer), unless one is
-/// already open. `wanted` is the phone a tray request named: the dialog opens only if that is
-/// the live phone. `None` if a dialog is open, no phone is live or another phone was named.
+/// Starts the PIN dialog for the phone whose stretch is open (its serial pinned to the
+/// answer), unless one is already open. `wanted` is the phone a tray request named: the dialog
+/// opens only if that is the stretch's phone. `None` if a dialog is open, no stretch is open or
+/// another phone was named.
 fn begin_asking(
     asking: &Option<Asking>,
     view: &watch::Receiver<View>,
     prompt: &Prompt,
-    stretch: u64,
+    stretch: (Option<&str>, u64),
     from: &str,
     wanted: Option<&str>,
 ) -> Option<Asking> {
@@ -296,27 +303,28 @@ fn begin_asking(
         tracing::debug!(from, "PIN dialog already open");
         return None;
     }
-    // The PIN is pinned to the live phone now.
-    let Some(serial) = view.borrow().live().map(|p| p.serial.clone()) else {
-        tracing::info!(from, "unlock clicked with no phone; no PIN dialog");
+    let (open, ended) = stretch;
+    // The PIN is pinned to the stretch's phone now.
+    let Some(serial) = open.map(str::to_owned) else {
+        tracing::info!(from, "unlock clicked with no phone locked; no PIN dialog");
         return None;
     };
     if let Some(wanted) = wanted.filter(|wanted| *wanted != serial) {
         tracing::info!(
             from,
             wanted,
-            live = serial,
-            "unlock asked for a phone that isn't the live one; no PIN dialog"
+            locked = serial,
+            "unlock asked for a phone whose stretch isn't the open one; no PIN dialog"
         );
         return None;
     }
-    let name = phone_name(view);
+    let name = phone_name(view, &serial);
     let prompt = prompt.clone();
     tracing::info!(serial, from, "asking for the PIN");
     Some(Asking {
         task: tokio::task::spawn_blocking(move || ask(&prompt, &name)),
         serial,
-        stretch,
+        stretch: ended,
     })
 }
 
@@ -331,9 +339,11 @@ struct Asking {
 
 /// Shows the unlock notification and the PIN dialog, hands valid PINs to `pins` with the serial
 /// of the phone they were asked for (the run loop sends each as one `unlock` frame, only to that
-/// phone) and reopens blocked apps after an unlock, until `events` closes. The dialog opens on
-/// the notification's action (for the live phone) or on a [`Request`] (the tray's Unlock row)
-/// naming the live phone, during a locked stretch, one at a time. Without a notification server it logs one warning and carries on.
+/// phone) and reopens blocked apps after an unlock, until `events` closes. One stretch at a
+/// time: it belongs to the phone whose `Locked` opened it, and other phones' lock events are
+/// ignored until it ends. The dialog opens on the notification's action or on a [`Request`]
+/// (the tray's Unlock row) naming that phone, one at a time, and its answer is pinned to that
+/// phone. Without a notification server it logs one warning and carries on.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     conn: Connection,
@@ -345,8 +355,8 @@ pub async fn run(
     prompt: Prompt,
 ) -> Result<()> {
     let (mut notices, mut actions) = Notices::new(conn).await?;
-    // The locked stretch: open from the first `Locked` until it ends.
-    let mut stretch = false;
+    // The locked stretch: the phone whose first `Locked` opened it, until it ends.
+    let mut stretch: Option<String> = None;
     // Stretches ended so far: a dialog answer is only good for the stretch it was asked in.
     let mut ended: u64 = 0;
     // The notification on screen (0: none).
@@ -359,27 +369,37 @@ pub async fn run(
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
+                // Another phone's event while a stretch is open waits until it ends.
+                let other = |serial: &str| stretch.as_deref().is_some_and(|s| s != serial);
                 match event {
-                    LockEvent::Locked(reason) => {
-                        if stretch {
+                    LockEvent::Locked { serial, reason } => {
+                        if stretch.is_some() {
+                            if other(&serial) {
+                                tracing::info!(serial, ?reason, "another phone is locked; its prompt waits");
+                            }
                             continue;
                         }
-                        stretch = true;
-                        tracing::info!(?reason, "phone locked: asking for its PIN");
-                        let name = phone_name(&view);
+                        tracing::info!(serial, ?reason, "phone locked: asking for its PIN");
+                        let name = phone_name(&view, &serial);
+                        stretch = Some(serial);
                         shown = show(&mut notices, 0, locked_notice(&name), "Enter PIN…").await;
                     }
-                    LockEvent::Result { ok: false, reason } => {
-                        tracing::info!(reason = reason.as_deref().unwrap_or(""), "unlock failed");
-                        let name = phone_name(&view);
+                    LockEvent::Result { serial, .. } | LockEvent::Unlocked { serial }
+                        if other(&serial) =>
+                    {
+                        tracing::debug!(serial, "lock event for another phone than the stretch's; ignored");
+                    }
+                    LockEvent::Result { serial, ok: false, reason } => {
+                        tracing::info!(serial, reason = reason.as_deref().unwrap_or(""), "unlock failed");
+                        let name = phone_name(&view, &serial);
                         let notice = failed_notice(&name, reason.as_deref());
                         shown = show(&mut notices, shown, notice, "Try again").await;
                     }
-                    LockEvent::Result { ok: true, .. } | LockEvent::Unlocked => {
-                        if stretch || shown != 0 {
-                            tracing::info!("phone unlocked");
+                    LockEvent::Result { serial, ok: true, .. } | LockEvent::Unlocked { serial } => {
+                        if stretch.is_some() || shown != 0 {
+                            tracing::info!(serial, "phone unlocked");
                         }
-                        stretch = false;
+                        stretch = None;
                         ended += 1;
                         notices.close(std::mem::take(&mut shown)).await;
                     }
@@ -393,7 +413,7 @@ pub async fn run(
                 if id == 0 || id != shown || action != ACTION {
                     continue;
                 }
-                if let Some(started) = begin_asking(&asking, &view, &prompt, ended, "notification", None) {
+                if let Some(started) = begin_asking(&asking, &view, &prompt, (stretch.as_deref(), ended), "notification", None) {
                     asking = Some(started);
                 }
             }
@@ -404,11 +424,11 @@ pub async fn run(
                 };
                 // The tray shows its row only while locked; a click that raced the unlock
                 // opens nothing.
-                if !stretch {
-                    tracing::info!("unlock requested while not locked; no PIN dialog");
+                if stretch.is_none() {
+                    tracing::info!(wanted, "unlock requested while not locked; no PIN dialog");
                     continue;
                 }
-                if let Some(started) = begin_asking(&asking, &view, &prompt, ended, "tray", Some(&wanted)) {
+                if let Some(started) = begin_asking(&asking, &view, &prompt, (stretch.as_deref(), ended), "tray", Some(&wanted)) {
                     asking = Some(started);
                 }
             }
@@ -419,15 +439,15 @@ pub async fn run(
                         drop(pin);
                         tracing::info!(serial, "the lock stretch ended during the PIN dialog; PIN dropped");
                     }
-                    Ok(Ok(Some(pin))) => match pins.try_send((serial, pin)) {
-                        Ok(()) => tracing::info!("PIN handed to the session"),
+                    Ok(Ok(Some(pin))) => match pins.try_send((serial.clone(), pin)) {
+                        Ok(()) => tracing::info!(serial, "PIN handed to the session"),
                         // The Pin inside the error is dropped (wiped) here.
                         Err(_) => tracing::warn!("PIN not sent: an unlock is already pending"),
                     },
                     Ok(Ok(None)) => {}
                     Ok(Err(message)) => {
-                        tracing::warn!(message, "PIN not sent");
-                        let name = phone_name(&view);
+                        tracing::warn!(serial, message, "PIN not sent");
+                        let name = phone_name(&view, &serial);
                         let notice = (format!("Couldn't unlock {name}"), escape_markup(&message));
                         shown = show(&mut notices, shown, notice, "Try again").await;
                     }

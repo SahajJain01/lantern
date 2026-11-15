@@ -17,8 +17,8 @@ use anyhow::{bail, Result};
 use futures_core::Stream;
 use futures_util::future::BoxFuture;
 use futures_util::StreamExt;
-use ipc::Hub;
-use lantern_proto::{PhoneState, SessionState};
+use ipc::{HelperWedged, Hub};
+use lantern_proto::PhoneState;
 use session::{Inbound, SessionConn};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -64,14 +64,31 @@ impl RetryPolicy {
     }
 }
 
-/// Ends the active session, if any. Every window client is closed with it: windows belong to
+/// Ends the active session, if any. Its window clients are closed with it: windows belong to
 /// one helper session and cannot survive a restart.
 async fn close_session(session: &mut Option<(SessionConn, Instant)>, hub: &mut Hub) {
-    hub.reset();
     if let Some((session, _)) = session.take() {
         let serial = session.serial().to_owned();
+        hub.session_down(&serial);
         session.close().await;
         tracing::info!(serial, "session closed");
+    }
+}
+
+/// A wedged helper ends its own session only: `Some(why)` when it is the active one's.
+fn wedged_ends(
+    active: &Option<(SessionConn, Instant)>,
+    wedged: HelperWedged,
+) -> Option<&'static str> {
+    match active {
+        Some((session, _)) if session.serial() == wedged.serial => Some("helper stopped reading"),
+        _ => {
+            tracing::warn!(
+                serial = wedged.serial,
+                "a helper that isn't live stopped reading"
+            );
+            None
+        }
     }
 }
 
@@ -581,18 +598,7 @@ where
             .last_off
             .clone()
             .filter(|s| wanted.is_none() && table.plugged(s) && table.off(s));
-        match (&active, &starting, paused) {
-            (Some((session, _)), _, _) => hub.set_session(
-                SessionState::Ready,
-                Some(session.serial().to_owned()),
-                Some(session.helper_sha().to_owned()),
-            ),
-            (None, Some((serial, _)), _) => {
-                hub.set_session(SessionState::Starting, Some(serial.clone()), None)
-            }
-            (None, None, Some(serial)) => hub.set_session(SessionState::Paused, Some(serial), None),
-            (None, None, None) => hub.set_session(SessionState::Idle, None, None),
-        }
+        hub.set_paused(paused);
         // In a block: the closure borrows `undoing`, which must not live across an await.
         let now_view = {
             let state_of = |serial: &str| -> PhoneState {
@@ -636,21 +642,17 @@ where
             if let Some(configured) = configured {
                 listed.retain(|s| s == configured);
             }
-            let live_serial = active.as_ref().map(|(s, _)| s.serial().to_owned());
             View {
                 phones: listed
                     .iter()
-                    .map(|serial| {
-                        let live = live_serial.as_deref() == Some(serial.as_str());
-                        PhoneView {
-                            serial: serial.clone(),
-                            name: names.get(serial),
-                            state: state_of(serial),
-                            plugged: table.plugged(serial),
-                            off: table.off(serial),
-                            locked: live && hub.locked(),
-                            companion: if live { hub.companion() } else { None },
-                        }
+                    .map(|serial| PhoneView {
+                        serial: serial.clone(),
+                        name: names.get(serial),
+                        state: state_of(serial),
+                        plugged: table.plugged(serial),
+                        off: table.off(serial),
+                        locked: hub.locked(serial),
+                        companion: hub.companion(serial),
                     })
                     .collect(),
             }
@@ -859,7 +861,7 @@ where
                 match result {
                     Ok(session) => {
                         tracing::info!(serial, helper = session.helper_sha(), "session ready");
-                        hub.session_started(&serial);
+                        hub.session_up(&serial, session.tx.clone(), session.helper_sha());
                         // The start has just recorded the phone's name.
                         names.refresh(&serial);
                         active = Some((session, Instant::now()));
@@ -901,17 +903,14 @@ where
             }
             pin = async { unlock.as_mut().expect("guarded").recv().await }, if unlock.is_some() => {
                 match pin {
-                    Some((serial, pin)) => match active.as_ref() {
-                        // Only the phone the PIN was asked for gets it.
-                        Some((session, _)) if session.serial() == serial => {
-                            let helper = session.tx.clone();
-                            if hub.send_unlock(pin, &helper).await.is_err() {
-                                ended = Some("helper stopped reading");
-                            }
+                    // Only the phone the PIN was asked for gets it, and only in its stretch.
+                    Some((serial, pin)) => match hub.send_unlock(&serial, pin).await {
+                        Ok(true) => {}
+                        Ok(false) if hub.live_serials().contains(&serial) => {
+                            tracing::info!(serial, "unlock: {serial}'s lock stretch is over; PIN dropped");
                         }
-                        live => {
-                            drop(pin);
-                            let live = live.map(|(session, _)| session.serial().to_owned());
+                        Ok(false) => {
+                            let live = hub.live_serials();
                             tracing::info!(serial, ?live, "unlock: that phone is not live; PIN dropped");
                             if let Some(notify) = &notify {
                                 let name = names.get(&serial).unwrap_or(serial);
@@ -921,6 +920,7 @@ where
                                 );
                             }
                         }
+                        Err(wedged) => ended = wedged_ends(&active, wedged),
                     },
                     None => {
                         tracing::debug!("unlock channel closed");
@@ -929,9 +929,8 @@ where
                 }
             }
             event = hub.next_event() => {
-                let helper = active.as_ref().map(|(session, _)| session.tx.clone());
-                if hub.on_client(event, helper.as_ref()).await.is_err() {
-                    ended = Some("helper stopped reading");
+                if let Err(wedged) = hub.on_client(event).await {
+                    ended = wedged_ends(&active, wedged);
                 }
                 queued.extend(hub.take_commands());
                 for (serial, pkg, user) in hub.take_refused() {
@@ -946,13 +945,14 @@ where
             }
             offer = async { offers.as_mut().expect("guarded").recv().await }, if offers.is_some() => {
                 match offer {
-                    // Only while a session is live: nothing is queued for a later session.
-                    Some(offer) => if let Some((session, _)) = active.as_ref() {
-                        let helper = session.tx.clone();
-                        if hub.on_pc_clip(offer, &helper).await.is_err() {
-                            ended = Some("helper stopped reading");
+                    // To the live phones only: nothing is queued for a later session.
+                    Some(offer) => {
+                        for wedged in hub.on_pc_clip(offer).await {
+                            if let Some(why) = wedged_ends(&active, wedged) {
+                                ended = Some(why);
+                            }
                         }
-                    },
+                    }
                     None => {
                         tracing::warn!("PC clipboard thread ended; clipboard sync off");
                         offers = None;
@@ -962,9 +962,9 @@ where
             inbound = async { active.as_mut().expect("guarded").0.next().await }, if active.is_some() => {
                 match inbound {
                     Inbound::Frame(frame) => {
-                        let helper = active.as_ref().expect("guarded").0.tx.clone();
-                        if hub.on_helper(frame, &helper).await.is_err() {
-                            ended = Some("helper stopped reading");
+                        let serial = active.as_ref().expect("guarded").0.serial().to_owned();
+                        if let Err(wedged) = hub.on_helper(&serial, frame).await {
+                            ended = wedged_ends(&active, wedged);
                         }
                     }
                     Inbound::Ended(why) => ended = Some(why),

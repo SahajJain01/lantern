@@ -6,6 +6,7 @@
 
 pub mod wayland;
 
+use std::collections::{BTreeMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{mpsc as std_mpsc, Arc};
 
@@ -86,6 +87,77 @@ impl ClipSync {
     pub fn from_phone(&mut self, text: String) -> String {
         self.last_from_phone = Some(text.clone());
         text
+    }
+}
+
+/// Phone texts Lantern put on the PC whose selection event may still come back.
+pub const IN_FLIGHT_MAX: usize = 8;
+
+/// Clipboard sync for several phones at once. A phone copy goes onto the PC selection; the
+/// other phones get it when that selection comes back ([`Self::pc_changed`]), never its source.
+/// Each phone has its own [`ClipSync`] memory; the in-flight list keeps a stale echo (a burst:
+/// both phones copied before the first copy's selection came back) from going anywhere.
+#[derive(Debug, Default)]
+pub struct ClipFan {
+    /// One echo memory per phone with a live session (serial order).
+    phones: BTreeMap<String, ClipSync>,
+    /// Phone texts put on the PC, oldest first, at most [`IN_FLIGHT_MAX`].
+    in_flight: VecDeque<String>,
+}
+
+impl ClipFan {
+    /// `serial`'s session is up: a fresh memory.
+    pub fn add(&mut self, serial: &str) {
+        self.phones.insert(serial.to_owned(), ClipSync::default());
+    }
+
+    /// `serial`'s session is down.
+    pub fn remove(&mut self, serial: &str) {
+        self.phones.remove(serial);
+    }
+
+    /// Clipboard sync is back on: every memory and the in-flight list may be stale.
+    pub fn reset(&mut self) {
+        for sync in self.phones.values_mut() {
+            *sync = ClipSync::default();
+        }
+        self.in_flight.clear();
+    }
+
+    /// Phone `serial` copied `text`: what to put on the PC clipboard.
+    pub fn from_phone(&mut self, serial: &str, text: String) -> String {
+        if let Some(sync) = self.phones.get_mut(serial) {
+            sync.from_phone(text.clone());
+        }
+        self.in_flight.push_back(text.clone());
+        while self.in_flight.len() > IN_FLIGHT_MAX {
+            self.in_flight.pop_front();
+        }
+        text
+    }
+
+    /// The PC selection changed: (serial, text) for each phone it goes to, in serial order.
+    /// The echo of an older phone text while a newer one is still in flight goes nowhere and
+    /// changes no memory; an unsyncable offer clears every memory and sends nothing.
+    pub fn pc_changed(&mut self, offer: &PcOffer) -> Vec<(String, String)> {
+        let syncable = !offer.secret
+            && offer
+                .text
+                .as_ref()
+                .is_some_and(|t| !t.is_empty() && t.len() <= MAX_CLIP);
+        if syncable {
+            let text = offer.text.as_deref().unwrap_or_default();
+            if let Some(i) = self.in_flight.iter().position(|t| t == text) {
+                self.in_flight.drain(..=i);
+                if !self.in_flight.is_empty() {
+                    return Vec::new();
+                }
+            }
+        }
+        self.phones
+            .iter_mut()
+            .filter_map(|(serial, sync)| sync.pc_changed(offer).map(|text| (serial.clone(), text)))
+            .collect()
     }
 }
 
@@ -258,6 +330,98 @@ mod tests {
         assert!(decode_text(over).unwrap().len() > MAX_CLIP);
         // Invalid UTF-8 within the cap is not text.
         assert_eq!(decode_text(vec![0xff, 0xfe]), None);
+    }
+
+    fn fan(serials: &[&str]) -> ClipFan {
+        let mut fan = ClipFan::default();
+        for serial in serials {
+            fan.add(serial);
+        }
+        fan
+    }
+
+    fn to(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(s, t)| (s.to_string(), t.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn fan_pc_copy_goes_to_every_phone() {
+        let mut fan = fan(&["A", "B"]);
+        assert_eq!(
+            fan.pc_changed(&offer(Some("x"), false)),
+            to(&[("A", "x"), ("B", "x")])
+        );
+    }
+
+    #[test]
+    fn fan_phone_copy_goes_to_the_others_not_its_source() {
+        let mut fan = fan(&["A", "B"]);
+        assert_eq!(fan.from_phone("A", "x".into()), "x");
+        assert_eq!(fan.pc_changed(&offer(Some("x"), false)), to(&[("B", "x")]));
+    }
+
+    /// Both phones copy before the first copy's PC echo is back: the stale echo goes nowhere
+    /// (it would overwrite B's newer copy), and no phone gets its own copy back.
+    #[test]
+    fn burst_never_echoes_to_source() {
+        let mut fan = fan(&["A", "B"]);
+        fan.from_phone("A", "x".into());
+        fan.from_phone("B", "y".into());
+        assert_eq!(fan.pc_changed(&offer(Some("x"), false)), to(&[]));
+        assert_eq!(fan.pc_changed(&offer(Some("y"), false)), to(&[("A", "y")]));
+    }
+
+    #[test]
+    fn fan_secret_reaches_nobody_and_clears_memories() {
+        let mut fan = fan(&["A", "B"]);
+        fan.from_phone("A", "x".into());
+        assert_eq!(fan.pc_changed(&offer(Some("x"), true)), to(&[]));
+        assert_eq!(fan.pc_changed(&offer(None, false)), to(&[]));
+        // A's memory of x is gone: a later x is a real change for every phone.
+        assert_eq!(
+            fan.pc_changed(&offer(Some("x"), false)),
+            to(&[("A", "x"), ("B", "x")])
+        );
+    }
+
+    #[test]
+    fn fan_removed_phone_gets_nothing() {
+        let mut fan = fan(&["A", "B"]);
+        fan.remove("B");
+        assert_eq!(fan.pc_changed(&offer(Some("x"), false)), to(&[("A", "x")]));
+        // A phone that comes back starts with no memory.
+        fan.from_phone("A", "y".into());
+        fan.add("B");
+        assert_eq!(fan.pc_changed(&offer(Some("y"), false)), to(&[("B", "y")]));
+    }
+
+    #[test]
+    fn fan_reset_forgets_echoes() {
+        let mut fan = fan(&["A", "B"]);
+        fan.from_phone("A", "x".into());
+        fan.from_phone("B", "y".into());
+        fan.reset();
+        assert_eq!(
+            fan.pc_changed(&offer(Some("x"), false)),
+            to(&[("A", "x"), ("B", "x")])
+        );
+    }
+
+    #[test]
+    fn in_flight_is_capped() {
+        let mut fan = fan(&["A", "B"]);
+        for i in 0..=IN_FLIGHT_MAX {
+            let serial = if i % 2 == 0 { "A" } else { "B" };
+            fan.from_phone(serial, format!("t{i}"));
+        }
+        // t0 is no longer in flight: a real change for every phone.
+        assert_eq!(
+            fan.pc_changed(&offer(Some("t0"), false)),
+            to(&[("A", "t0"), ("B", "t0")])
+        );
     }
 
     #[test]

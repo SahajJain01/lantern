@@ -526,7 +526,10 @@ async fn unlock_row_click_prompts() {
         prompt,
     ));
     events
-        .send(LockEvent::Locked(LockReason::Clipboard))
+        .send(LockEvent::Locked {
+            serial: "s1".into(),
+            reason: LockReason::Clipboard,
+        })
         .await
         .unwrap();
     let (_, rows) = tray.layout().await;

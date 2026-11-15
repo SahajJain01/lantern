@@ -880,10 +880,14 @@ impl Catalog {
         }
     }
 
-    /// Whether another phone that has entries (or a folder) uses `serial`'s tag.
+    /// Whether another phone that has entries (or a folder) uses `serial`'s tag, or another
+    /// phone's open, unblocked sync window does (the first window keeps the tag).
     fn tag_taken(&self, serial: &str) -> bool {
         let tag = naming::tag(serial);
         let other = |s: &str| s != serial && naming::tag(s) == tag;
+        if self.phones.iter().any(|(s, p)| other(s) && !p.blocked) {
+            return true;
+        }
         let entries = match owned_entries(&self.dirs) {
             Ok(entries) => entries,
             Err(error) => {
@@ -1865,6 +1869,28 @@ mod tests {
         assert_eq!(mtime(&first_folder), old);
         assert!(!file(&dirs, "lantern.com.t-pa_b").exists());
         assert_eq!(cat.phones("com.s", 0), ["a:b"]);
+    }
+
+    /// R6: two live phones sharing a tag, neither with entries yet: the first sync window
+    /// keeps the tag, whichever phone upserts first.
+    #[test]
+    fn tag_of_an_open_window_is_taken() {
+        let (_t, dirs) = tmp();
+        set_primary(&dirs, "P");
+        let (mut cat, _) = quiet(dirs.clone());
+        cat.start_session("a:b");
+        cat.start_session("a_b");
+        assert!(
+            cat.upsert("a_b", &entry("com.s", 0)).is_err(),
+            "the second window is blocked"
+        );
+        cat.upsert("a:b", &entry("com.s", 0)).unwrap();
+        assert!(file(&dirs, "lantern.com.s-pa_b").exists());
+        assert_eq!(cat.phones("com.s", 0), ["a:b"]);
+        // The blocked window doesn't block the first phone's next session.
+        cat.end_session("a:b");
+        cat.start_session("a:b");
+        cat.upsert("a:b", &entry("com.t", 0)).unwrap();
     }
 
     #[test]

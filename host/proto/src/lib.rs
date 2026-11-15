@@ -412,6 +412,10 @@ pub struct WindowInfo {
     pub id: u32,
     pub pkg: String,
     pub user: u32,
+    /// Host-only: the serial of the phone the window is on (lanternd always fills it in;
+    /// absent in a v1 report).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
 }
 
 /// `serial` is the session's device (`null` when idle); `helper` is the live helper jar's
@@ -871,6 +875,7 @@ mod tests {
                 id: 1,
                 pkg: "com.android.settings".into(),
                 user: 0,
+                phone: None,
             }],
             companion: None,
             phones: vec![],
@@ -878,6 +883,16 @@ mod tests {
         let json = r#"{"t":"status_report","state":"ready","serial":"20e9318","helper":"ab12","windows":[{"id":1,"pkg":"com.android.settings","user":0}]}"#;
         assert_eq!(String::from_utf8(report.encode()).unwrap(), json);
         assert_eq!(Control::decode(json.as_bytes()).unwrap(), report);
+        // A window's phone, when known, rides along.
+        let on = WindowInfo {
+            id: 2,
+            pkg: "com.x".into(),
+            user: 10,
+            phone: Some("ZD222LMDFV".into()),
+        };
+        let on_json = r#"{"id":2,"pkg":"com.x","user":10,"phone":"ZD222LMDFV"}"#;
+        assert_eq!(serde_json::to_string(&on).unwrap(), on_json);
+        assert_eq!(serde_json::from_str::<WindowInfo>(on_json).unwrap(), on);
         let idle = Control::StatusReport(StatusReport {
             state: SessionState::Idle,
             serial: None,
