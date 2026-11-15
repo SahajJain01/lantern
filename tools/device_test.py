@@ -7,6 +7,7 @@
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
     python3 tools/device_test.py --manual --only 26                  # Plan 4b: Connect from a notice
+    python3 tools/device_test.py --pair                              # Plan 4c: two phones at once
 
 Items (26; 20 automatic, 8, 14, 21, 24, 25 and 26 only with --manual):
      1 session_starts_on_plug              11 title_is_label
@@ -25,10 +26,25 @@ Items (26; 20 automatic, 8, 14, 21, 24, 25 and 26 only with --manual):
                                            24 autoconnect_on_remembers_off (manual, 2 replugs)
                                            25 autoconnect_off_asks_on_plug (manual, replug, tray)
                                            26 connect_from_entry_opens_app (manual, Sahaj clicks)
-A full automatic run prints `20/20 PASS` when everything passes. Every wait for Sahaj (a replug,
-a click, a PIN) prints its `>>>` step first and waits up to MANUAL_WAIT (900 s): he answers
-through chat, often minutes later. A replug is always his: `adb reconnect` once left the
-Xiaomi in a non-adb USB mode (18d1:4e11) until a physical replug, so the suite never uses it.
+A full automatic run prints `20/20 PASS` when everything passes.
+
+Manual items never read stdin. Before any item runs, the suite prints every selected manual
+item's steps for Sahaj (he answers through chat, often minutes later, so he gets the whole
+list up front and does it at his pace); each manual item prints its own steps again (`>>>`) when
+it starts. Every wait for him (a replug, a click, a PIN) waits on something the suite can see
+(adb's device list, `lantern status`, the lanternd journal, logcat, `dumpsys trust`) for up to
+LANTERN_MANUAL_WAIT seconds (default 3600). A phone asleep on its own screen timeout counts as
+released (`wakefulness` from `dumpsys power`), so a slow answer never fails a release check. A
+replug is always his: `adb reconnect` once left the Xiaomi in a non-adb USB mode (18d1:4e11)
+until a physical replug, so the suite never uses it.
+
+--pair (Plan 4c) runs only the two-phone items (the PAIR set; none in this file yet: later
+tasks add them), inside `two_phones`: exactly SERIAL and OTHER attached, where OTHER is
+LANTERN_OTHER_SERIAL, else the only other attached `device`. It saves the PC clipboard,
+settings.toml (then `autoconnect = false`) and both device records' `off`/`live`, reads both
+phones' baselines, lifts LANTERN_SERIAL and connects both phones; if a phone is PIN-locked it
+asks Sahaj to unlock it (only with --manual). Its cleanup puts all of that back, checks both
+phones released and restored with lanternd stopped, and leaves lanternd serving SERIAL.
 
 Plan 4b (phone switchboard) items: 2 checks the window's app_id from the phone's names (the
 primary phone keeps `lantern.<pkg>`, any other gets `-p<tag>`), 10/15/16 the per-phone entries
@@ -46,7 +62,7 @@ primary=...`); check it by hand as docs/HANDOFF.md says, it is not an item.
 lanternd serves only LANTERN_SERIAL's phone during the run: the suite sets
 `LANTERN_SERIAL=<SERIAL>` in the systemd user environment (restarting lanternd) if it isn't set
 there, and puts the previous value back (restarting again) at the end. Item 24 lifts it for its
-own steps, and so do items 25 and 26.
+own steps, and so do items 25 and 26 and `two_phones` (--pair).
 
 Needs: lanternd installed as the systemd user unit (tools/build.py install), the phone
 (LANTERN_SERIAL, default 20e9318) authorized over USB, KWin's scripting D-Bus (qdbus6) and
@@ -75,6 +91,7 @@ step there. The clipboard still goes through the real session (lanternd's clipbo
 Klipper).
 """
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -89,24 +106,26 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 SERIAL = os.environ.get("LANTERN_SERIAL") or "20e9318"
+# The second phone for --pair: LANTERN_OTHER_SERIAL, else (resolved in main) the only other
+# attached phone (`pick_other`).
+OTHER = os.environ.get("LANTERN_OTHER_SERIAL") or None
 LANTERN = shutil.which("lantern") or str(Path.home() / ".local/bin/lantern")
 UNIT = "lanternd.service"
 SETTINGS = "com.android.settings"
 JELLY = "org.lineageos.jelly"
 COMPANION = "dev.lantern.companion"
 LANTERN_IME = "dev.lantern.companion/.LanternIme"
-# The phone's own stay_on_while_plugged_in value, which a session must restore. Item 1 reads it
-# with the daemon stopped (or set LANTERN_STAY_ON_RESTORED to skip that).
-STAY_ON_RESTORED = os.environ.get("LANTERN_STAY_ON_RESTORED") or None
-# The keyboard settings a session must restore, snapshotted with the stay-awake baseline.
-IME_RESTORED = None   # secure default_input_method
-IMES_RESTORED = None  # secure enabled_input_methods
+# Per phone, the values a session must restore: {serial: {stay_on, ime, imes}} (global
+# stay_on_while_plugged_in, secure default_input_method and enabled_input_methods), read with no
+# session on that phone (`read_baseline`). LANTERN_STAY_ON_RESTORED overrides SERIAL's stay_on.
+BASELINES = {}
 STAY_ON_SESSION = "7"  # Session.STAY_ON in the helper
 JOURNAL = "/data/local/tmp/lantern-session.json"  # JournalStore.PATH in the helper
 RESIZE_LOGICAL = 900
 KILL_SIGNAL = "TERM"  # item 7; --signal=KILL
 MANUAL_RUN = False  # --manual: items that need a person run; replug() refuses without it
-MANUAL_WAIT = 900  # s: how long a step waits for Sahaj (he answers through chat)
+# s: how long a step waits for Sahaj (he answers through chat, often minutes later)
+MANUAL_WAIT = int(os.environ.get("LANTERN_MANUAL_WAIT", "3600"))
 LOG_DIR = Path(tempfile.mkdtemp(prefix="lantern-device-test-"))
 NESTED = None  # the Nested compositor while --nested
 IME_TEXT = "Tiếng Việt 👍việ"  # item 12: the EditText after text + compose + finish
@@ -134,8 +153,9 @@ def sh(*args, timeout=20, check_rc=True, env=None):
     return r.stdout
 
 
-def adb(*args, timeout=20):
-    return sh("adb", "-s", SERIAL, *args, timeout=timeout).replace("\r", "")
+def adb(*args, timeout=20, serial=None):
+    """`adb -s <serial or SERIAL> ...` with a timeout."""
+    return sh("adb", "-s", serial or SERIAL, *args, timeout=timeout).replace("\r", "")
 
 
 def wait_until(what, timeout, fn, interval=0.1):
@@ -164,6 +184,8 @@ def status():
         r = subprocess.run([LANTERN, "status"], capture_output=True, text=True, timeout=10)
     except OSError as e:
         raise Fail(f"lantern status: {e}")
+    except subprocess.TimeoutExpired:
+        raise Fail("lantern status: no answer within 10 s")
     if r.returncode != 0:
         raise Fail(f"lantern status -> {r.returncode}: {r.stderr.strip()}")
     try:
@@ -181,9 +203,18 @@ def phone_status(serial=None):
     return {}
 
 
+def record_path(serial=None):
+    """`companion::record_path`: `[A-Za-z0-9._:-]` kept, any other character `_`, and a leading
+    `.` (or an empty name) gets a `_` first."""
+    name = re.sub(r"[^A-Za-z0-9._:-]", "_", serial or SERIAL)
+    if not name or name.startswith("."):
+        name = "_" + name
+    return devices_dir() / f"{name}.json"
+
+
 def device_record(serial=None):
     """`serial`'s device record (default SERIAL) as a dict, {} if absent or unreadable."""
-    path = devices_dir() / f"{re.sub(r'[^A-Za-z0-9._:-]', '_', serial or SERIAL)}.json"
+    path = record_path(serial)
     try:
         return json.loads(path.read_text())
     except (OSError, ValueError):
@@ -216,6 +247,37 @@ def lantern_connect_when_up(serial=None):
     """`lantern connect` once lanternd answers: a cleanup step right after a restart."""
     wait_daemon(10)
     return lantern_cmd("connect", serial or SERIAL)
+
+
+def serves(serial):
+    """True if lanternd answers and has (or is starting, retrying, ending) a session on
+    `serial`: a helper may run there, so its own settings can't be read now."""
+    try:
+        st = status()
+    except Fail:
+        return False
+    for phone in st.get("phones", []):
+        if phone.get("serial") == serial:
+            return phone.get("state") in ("starting", "ready", "retrying", "reconnecting",
+                                          "undoing")
+    return st.get("serial") == serial and st.get("state") in ("starting", "ready")
+
+
+def wait_journal(pattern, since, timeout):
+    """Polls lanternd's journal since `since` (a `journalctl --since` time) for the regex
+    `pattern`; returns (the matched text, seconds). Only the match is returned or printed: a
+    journal line may hold more than the item asked for."""
+    rx = re.compile(pattern)
+
+    def found():
+        text = sh("journalctl", "--user", "-u", UNIT, "--since", since, "--no-pager", "-o",
+                  "cat", timeout=30)
+        for line in text.splitlines():
+            m = rx.search(ANSI.sub("", line))
+            if m:
+                return m.group(0)
+        return None
+    return wait_until(f"journal /{pattern}/", timeout, found, interval=1)
 
 
 def wait_ready(timeout=10):
@@ -274,6 +336,28 @@ class manager_env:
         return False
 
 
+def attached(devices_text):
+    """{serial: state} from `adb devices` output."""
+    found = {}
+    for line in devices_text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            found[parts[0]] = parts[1]
+    return found
+
+
+def pick_other(devices_text, serial):
+    """The only phone other than `serial` that `adb devices` (`devices_text`) lists as
+    `device`; Fail (naming them) when there is none or several."""
+    others = [s for s, state in attached(devices_text).items()
+              if state == "device" and s != serial]
+    check(others, f"--pair needs a second phone: none attached besides {serial} "
+                  "(or set LANTERN_OTHER_SERIAL)")
+    check(len(others) == 1, f"--pair: several other phones attached ({', '.join(others)}); "
+                            "set LANTERN_OTHER_SERIAL")
+    return others[0]
+
+
 def adb_state(serial=None):
     """`serial`'s state in `adb devices` (`device`, `offline`, ...), None if not listed."""
     for line in sh("adb", "devices", timeout=10).splitlines()[1:]:
@@ -326,9 +410,39 @@ def replug():
     note(f"phone back on adb after {secs:.1f} s")
 
 
-def device_name():
+def device_name(serial=None):
     """The phone's friendly name (Settings > About), else its serial."""
-    return adb("shell", "settings", "get", "global", "device_name").strip() or SERIAL
+    serial = serial or SERIAL
+    return adb("shell", "settings", "get", "global", "device_name", serial=serial).strip() or serial
+
+
+def device_locked(serial=None):
+    """`dumpsys trust`'s current user: True if `deviceLocked=1`, False if 0, None if unread."""
+    for line in adb("shell", "dumpsys", "trust", serial=serial).splitlines():
+        if "(current)" in line:
+            m = re.search(r"deviceLocked=([01])\b", line)
+            return m.group(1) == "1" if m else None
+    return None
+
+
+def wait_off_and_back(serial=None):
+    """A cable pull and replug by Sahaj, observed (MANUAL_WAIT each): the phone off adb, then
+    lanternd idle, then the phone back as `device`."""
+    serial = serial or SERIAL
+    _, secs = wait_until(f"{serial} off adb (cable pulled)", MANUAL_WAIT,
+                         lambda: adb_state(serial) != "device", interval=0.2)
+    note(f"phone off adb after {secs:.1f} s")
+    _, secs = wait_until("lanternd idle", MANUAL_WAIT,
+                         lambda: status()["state"] == "idle", interval=0.5)
+    note(f"lanternd idle {secs:.1f} s later")
+    wait_back_on_adb(serial)
+
+
+def wait_back_on_adb(serial=None):
+    serial = serial or SERIAL
+    _, secs = wait_until(f"{serial} back on adb (cable plugged in)", MANUAL_WAIT,
+                         lambda: adb_state(serial) == "device", interval=0.2)
+    note(f"phone back on adb after {secs:.1f} s")
 
 
 class NotifyMonitor:
@@ -422,7 +536,7 @@ class Window:
 
     every = []  # all windows started, so the suite can kill whatever is left on any exit
 
-    def __init__(self, pkg, tag, debug_input=None):
+    def __init__(self, pkg, tag, debug_input=None, phone=None):
         Window.every.append(self)
         self.pkg = pkg
         self.log = LOG_DIR / f"{tag}.log"
@@ -435,7 +549,8 @@ class Window:
         if debug_input:
             env["LANTERN_DEBUG_INPUT"] = debug_input
         self.f = open(self.log, "w")
-        self.p = subprocess.Popen([LANTERN, "open", pkg], stdout=self.f, stderr=self.f, env=env)
+        args = [LANTERN, "open"] + (["--phone", phone] if phone else []) + [pkg]
+        self.p = subprocess.Popen(args, stdout=self.f, stderr=self.f, env=env)
 
     def lines(self):
         return [ANSI.sub("", l) for l in self.log.read_text(errors="replace").splitlines()]
@@ -478,8 +593,9 @@ def lantern_displays():
     return re.findall(r'Display id (\d+): DisplayInfo\{"(lantern-[^"]*)"', out)
 
 
-def display_ids():
-    return re.findall(r"Display id (\d+):", adb("shell", "cmd", "display", "get-displays"))
+def display_ids(serial=None):
+    return re.findall(r"Display id (\d+):", adb("shell", "cmd", "display", "get-displays",
+                                                  serial=serial))
 
 
 def tasks_off_display0(pkg):
@@ -494,88 +610,115 @@ def tasks_off_display0(pkg):
     return found
 
 
-def phone_state():
-    panel = re.findall(r"powerMode=(\w+)", adb("shell", "dumpsys", "SurfaceFlinger", "--displays"))
-    forwards = [l for l in sh("adb", "forward", "--list").splitlines()
-                if l.startswith(SERIAL) and "lantern" in l]
-    helpers = adb("shell", "pgrep -f 'dev[.]lantern[.]helper' || true").split()
+def parse_wakefulness(text):
+    """`mWakefulness=` from `dumpsys power` (Awake, Asleep, Dozing, Dreaming), else "?"."""
+    m = re.search(r"^\s*mWakefulness=(\w+)\s*$", text, re.M)
+    return m.group(1) if m else "?"
+
+
+def phone_state(serial=None):
+    serial = serial or SERIAL
+
+    def a(*args):
+        return adb(*args, serial=serial)
+    panel = re.findall(r"powerMode=(\w+)", a("shell", "dumpsys", "SurfaceFlinger", "--displays"))
+    forwards = [l for l in sh("adb", "-s", serial, "forward", "--list", timeout=10).splitlines()
+                if l.startswith(serial + " ") and "lantern" in l]
+    helpers = a("shell", "pgrep -f 'dev[.]lantern[.]helper' || true").split()
     return {
-        "stay_on": adb("shell", "settings", "get", "global", "stay_on_while_plugged_in").strip(),
-        "ime": adb("shell", "settings", "get", "secure", "default_input_method").strip(),
-        "imes": adb("shell", "settings", "get", "secure", "enabled_input_methods").strip(),
+        "stay_on": a("shell", "settings", "get", "global", "stay_on_while_plugged_in").strip(),
+        "ime": a("shell", "settings", "get", "secure", "default_input_method").strip(),
+        "imes": a("shell", "settings", "get", "secure", "enabled_input_methods").strip(),
         "panel": panel[0] if panel else "?",
-        "displays": display_ids(),
+        "wakefulness": parse_wakefulness(a("shell", "dumpsys", "power")),
+        "displays": display_ids(serial),
         "forwards": forwards,
         "helper_pids": helpers,
         # The session journal exists exactly while a session is live (or after one nothing
         # could restore).
-        "journal": adb("shell", f"ls {JOURNAL} 2>/dev/null || true").strip() == JOURNAL,
+        "journal": a("shell", f"ls {JOURNAL} 2>/dev/null || true").strip() == JOURNAL,
     }
 
 
-def restored(st):
-    base = baseline()
-    return (st["stay_on"] == base["stay_on"] and st["ime"] == base["ime"]
-            and st["imes"] == base["imes"] and st["panel"] == "On"
-            and st["displays"] == ["0"] and not st["forwards"] and not st["helper_pids"]
-            and not st["journal"])
+def panel_released(st):
+    """The panel as no session leaves it: on, or off because the phone went to sleep on its
+    own (its screen timeout can pass while Sahaj answers through chat)."""
+    return st["panel"] == "On" or st.get("wakefulness") != "Awake"
 
 
 def released(st):
     """No session on the phone (the guard, which restores the setting, has exited too)."""
-    return (st["panel"] == "On" and st["displays"] == ["0"] and not st["forwards"]
+    return (panel_released(st) and st["displays"] == ["0"] and not st["forwards"]
             and not st["helper_pids"])
 
 
-def read_stay_on_baseline():
-    """Stops lanternd, reads the phone's own stay-awake and keyboard values (the restore
-    targets), and leaves lanternd stopped."""
-    global STAY_ON_RESTORED, IME_RESTORED, IMES_RESTORED
-    systemctl("stop", UNIT)
-    st, _ = wait_until("phone released after stop", 10, lambda: released(s := phone_state()) and s,
-                       interval=0.2)
-    if STAY_ON_RESTORED is None:
-        STAY_ON_RESTORED = st["stay_on"]
-    if IME_RESTORED is None:
-        IME_RESTORED, IMES_RESTORED = st["ime"], st["imes"]
-    note(f"baseline with lanternd stopped: stay_on={st['stay_on']} ime={st['ime']} "
-         f"imes={st['imes']} (restore targets: {STAY_ON_RESTORED}, {IME_RESTORED}, "
-         f"{IMES_RESTORED})")
-    check(LANTERN_IME not in str(IME_RESTORED) and LANTERN_IME not in str(IMES_RESTORED),
-          f"the Lantern keyboard is still selected or enabled with no session: {st}")
+def restored(st, serial=None):
+    """Released, and the phone's own values back (`baseline(serial)`), no session journal."""
+    base = baseline(serial)
+    return (released(st) and st["stay_on"] == base["stay_on"] and st["ime"] == base["ime"]
+            and st["imes"] == base["imes"] and not st["journal"])
 
 
-def baseline():
-    """The phone's own values a session must restore: {stay_on, ime, imes}. Read once, with
-    lanternd stopped (then started again); take it at an item's start, while the suite's phone
-    is served. lanternd must answer again; a phone it doesn't serve (switched off, waiting, a
-    lifted LANTERN_SERIAL) is noted, not a failure: the item checks what it needs."""
-    if STAY_ON_RESTORED is None or IME_RESTORED is None:
+def read_baseline(serial=None):
+    """Reads `serial`'s own stay-awake and keyboard values (the restore targets) into BASELINES
+    with no session on that phone: stops lanternd only when it serves `serial` (and leaves it
+    stopped; returns True then), and requires the phone released."""
+    serial = serial or SERIAL
+    stopped = serves(serial)
+    if stopped:
+        systemctl("stop", UNIT)
+    st, _ = wait_until(f"{serial} released" + (" after stop" if stopped else ""), 20,
+                       lambda: released(s := phone_state(serial)) and s, interval=0.2)
+    stay_on = st["stay_on"]
+    if serial == SERIAL and os.environ.get("LANTERN_STAY_ON_RESTORED"):
+        stay_on = os.environ["LANTERN_STAY_ON_RESTORED"]
+    base = BASELINES.setdefault(serial, {"stay_on": stay_on, "ime": st["ime"],
+                                         "imes": st["imes"]})
+    note(f"baseline of {serial}" + (" with lanternd stopped" if stopped else "") +
+         f": stay_on={st['stay_on']} ime={st['ime']} imes={st['imes']} (restore targets: "
+         f"{base['stay_on']}, {base['ime']}, {base['imes']})")
+    check(LANTERN_IME not in str(base["ime"]) and LANTERN_IME not in str(base["imes"]),
+          f"the Lantern keyboard is still selected or enabled on {serial} with no session: {st}")
+    return stopped
+
+
+def baseline(serial=None):
+    """`serial`'s own values a session must restore: {stay_on, ime, imes}. Read once
+    (`read_baseline`); if that stopped lanternd it is started again and must answer; a phone
+    it then doesn't serve (switched off, waiting, a lifted LANTERN_SERIAL) is noted, not a
+    failure: the item checks what it needs. Take it at an item's start."""
+    serial = serial or SERIAL
+    if serial not in BASELINES:
+        stopped = False
         try:
-            read_stay_on_baseline()
+            stopped = read_baseline(serial)
         finally:
-            systemctl("start", UNIT)
-        wait_daemon(15)
-        try:
-            wait_ready(15)
-        except Fail as e:
-            note(f"after the baseline lanternd answers but does not serve {SERIAL}: {e}")
-    return {"stay_on": str(STAY_ON_RESTORED), "ime": IME_RESTORED, "imes": IMES_RESTORED}
+            if stopped:
+                systemctl("start", UNIT)
+        if stopped:
+            wait_daemon(15)
+            if serial == SERIAL:
+                try:
+                    wait_ready(15)
+                except Fail as e:
+                    note(f"after the baseline lanternd answers but does not serve {SERIAL}: {e}")
+    return dict(BASELINES[serial])
 
 
 def stay_on_baseline():
     return baseline()["stay_on"]
 
 
-def phone_now():
+def phone_now(serial=None):
     """The phone's clock (epoch seconds), for reading logcat from a point on."""
-    return int(adb("shell", "date +%s").strip())
+    return int(adb("shell", "date +%s", serial=serial).strip())
 
 
-def logcat_since(since, tags):
+def logcat_since(since, tags, serial=None):
     """`(epoch, message)` for the given logcat tags, at or after phone time `since`."""
     out = []
-    for line in adb("logcat", "-d", "-v", "epoch", "-s", *tags, timeout=30).splitlines():
+    for line in adb("logcat", "-d", "-v", "epoch", "-s", *tags, timeout=30,
+                    serial=serial).splitlines():
         m = re.match(r"\s*(\d+\.\d+)\s+\d+\s+\d+\s+\w\s+(\S+)\s*: (.*)$", line)
         if m and float(m.group(1)) >= since:
             out.append((float(m.group(1)), m.group(3)))
@@ -665,7 +808,8 @@ def tag(serial):
 
 def entry_for(serial, pkg, user=0):
     """The (path, keys) of the `lantern.*.desktop` whose X-Lantern-Serial, X-Lantern-Package
-    and X-Lantern-User are `serial`, `pkg` and `user`, or None."""
+    and X-Lantern-User are `serial` (None: SERIAL), `pkg` and `user`, or None."""
+    serial = serial or SERIAL
     for path in sorted(applications_dir().glob("lantern.*.desktop")):
         try:
             keys = read_keys(path)
@@ -677,9 +821,10 @@ def entry_for(serial, pkg, user=0):
     return None
 
 
-def app_id_of(pkg):
-    """The app_id of `pkg` (user 0) on SERIAL: its menu entry's stem, else `lantern.<pkg>`."""
-    found = entry_for(SERIAL, pkg)
+def app_id_of(pkg, serial=None):
+    """The app_id of `pkg` (user 0) on `serial` (default SERIAL): its menu entry's stem, else
+    `lantern.<pkg>`."""
+    found = entry_for(serial or SERIAL, pkg)
     return found[0].stem if found else f"lantern.{pkg}"
 
 
@@ -739,6 +884,162 @@ def armed(st):
     return (st["stay_on"] == STAY_ON_SESSION and st["panel"] == session_panel()
             and st["displays"] == ["0"]
             and len(st["forwards"]) == 1 and st["helper_pids"] and st["journal"])
+
+
+# --- two phones (--pair) ------------------------------------------------------------------
+
+def write_record_flags(serial, saved):
+    """Puts `saved` ({key: value, or ABSENT}) back into `serial`'s device record under
+    `devices/.lock` (lanternd's own record lock), through a temp file and a rename; a key saved
+    as ABSENT is deleted."""
+    path = record_path(serial)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.parent / ".lock", "a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            rec = {}
+        for k, v in saved.items():
+            if v is ABSENT:
+                rec.pop(k, None)
+            else:
+                rec[k] = v
+        tmp = path.parent / f".{path.name}.tmp-suite-{os.getpid()}"
+        try:
+            tmp.write_text(json.dumps(rec))
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+    note(f"{path.name}: put back {', '.join(f'{k}={v!r}' for k, v in saved.items())}")
+
+
+ABSENT = object()  # a record key that was not there
+
+
+def pair_cleanup_steps(restore_clipboard, restore_settings, stop_daemon, wait_released,
+                       restore_records, restore_env, wait_back):
+    """`two_phones`' cleanup, in order, as (what, fn) for `cleanup()`."""
+    return [("restore the PC clipboard", restore_clipboard),
+            ("restore settings.toml", restore_settings),
+            ("stop lanternd", stop_daemon),
+            ("both phones released and restored", wait_released),
+            ("put back both device records' off/live", restore_records),
+            ("restore lanternd's environment (restarts it)", restore_env),
+            (f"lanternd serving {SERIAL} again", wait_back)]
+
+
+class two_phones:
+    """Both SERIAL and OTHER connected at once (LANTERN_SERIAL lifted, `autoconnect = false`),
+    for a PAIR item. Refuses before changing anything unless exactly those two phones are
+    attached. Everything it changes is put back on exit (each step guarded, see
+    `pair_cleanup_steps`), and lanternd is left serving SERIAL."""
+
+    def __init__(self):
+        check(OTHER, "two_phones: no OTHER phone (run with --pair or set LANTERN_OTHER_SERIAL)")
+        self.phones = [SERIAL, OTHER]
+        self.clipboard = None
+        self.settings = None  # (saved?, bytes or None)
+        self.records = {}
+        self.env = None
+        self.entered = False
+
+    def __enter__(self):
+        found = {s for s, state in attached(sh("adb", "devices", timeout=10)).items()
+                 if state == "device"}
+        check(found == {SERIAL, OTHER},
+              f"two_phones needs exactly {SERIAL} and {OTHER} attached, found "
+              f"{', '.join(sorted(found)) or 'none'}")
+        try:
+            # 1. The PC clipboard text.
+            saved = klipper("getClipboardContents")
+            self.clipboard = saved[:-1] if saved.endswith("\n") else saved
+            note(f"saved the PC clipboard text ({len(self.clipboard)} chars)")
+            # 2. settings.toml, then autoconnect off.
+            path = settings_file()
+            self.settings = (True, path.read_bytes() if path.exists() else None)
+            edit_settings(self.settings[1], "autoconnect", "false")
+            # 3. Both records' off/live.
+            for s in self.phones:
+                rec = device_record(s)
+                self.records[s] = {k: rec.get(k, ABSENT) for k in ("off", "live")}
+            # 4. Both baselines: OTHER first, while lanternd (LANTERN_SERIAL=SERIAL) leaves it
+            # alone; SERIAL's stops lanternd if it serves SERIAL.
+            for s in (OTHER, SERIAL):
+                baseline(s)
+            # 5. Every phone served.
+            self.env = manager_env(unset=["LANTERN_SERIAL"])
+            self.env.__enter__()
+            self.entered = True
+            # 6. Both connected.
+            wait_daemon(15)
+            for s in self.phones:
+                note(f"lantern connect {s}: {lantern_cmd('connect', s)}")
+            # 7. Both ready.
+            _, secs = wait_until("both phones ready", 60, lambda: all(
+                phone_status(s).get("state") == "ready" for s in self.phones), interval=0.5)
+            note(f"both phones ready after {secs:.1f} s")
+            # 8. A PIN-locked phone is unlocked by Sahaj (lanternd shows its Unlock notice).
+            for s in self.phones:
+                if device_locked(s) is True:
+                    name = device_name(s)
+                    check(MANUAL_RUN, f"{name} ({s}) is locked: unlock it, or run with --manual "
+                                      "so the suite asks for it")
+                    ask(f"Unlock {name}: click Unlock on its notification and type its PIN")
+                    _, secs = wait_until(f"{name} unlocked (deviceLocked=0)", MANUAL_WAIT,
+                                         lambda s=s: device_locked(s) is False, interval=0.5)
+                    note(f"{name} unlocked after {secs:.1f} s")
+        except BaseException:
+            # A `with` never calls __exit__ when __enter__ raises: put everything back here.
+            self.__exit__(*sys.exc_info())
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        def restore_clipboard():
+            if self.clipboard is not None:
+                klipper("setClipboardContents", self.clipboard)
+                note("restored the PC clipboard text")
+
+        def restore_settings():
+            if self.settings is None:
+                return
+            path, saved = settings_file(), self.settings[1]
+            if saved is None:
+                path.unlink(missing_ok=True)
+                note(f"removed {path} (it was absent)")
+            else:
+                path.write_bytes(saved)
+                note(f"restored {path}")
+
+        def wait_released():
+            for s in self.phones:
+                if s in BASELINES:
+                    st, secs = wait_until(f"{s} released and restored", 20,
+                                          lambda s=s: restored(p := phone_state(s), s) and p,
+                                          interval=0.2)
+                else:
+                    st, secs = wait_until(f"{s} released", 20,
+                                          lambda s=s: released(p := phone_state(s)) and p,
+                                          interval=0.2)
+                note(f"{s} released after {secs:.1f} s (panel {st['panel']}, "
+                     f"{st['wakefulness']})")
+
+        def restore_records():
+            for s, saved in self.records.items():
+                write_record_flags(s, saved)
+
+        def restore_env():
+            if self.entered:
+                self.env.__exit__(*exc)
+
+        def wait_back():
+            wait_daemon(15)
+            wait_ready(20)
+        cleanup(exc[0] is None, *pair_cleanup_steps(
+            restore_clipboard, restore_settings, lambda: systemctl("stop", UNIT),
+            wait_released, restore_records, restore_env, wait_back))
+        return False
 
 
 # --- KWin scripting ------------------------------------------------------------------------
@@ -909,10 +1210,11 @@ for (const w of wins) { w.closeWindow(); print(TAG + " closed " + w.resourceClas
 """
 
 
-def kwin_on(pkg, js, name, **subst):
-    """Runs `js` on the windows of `pkg` on SERIAL: CLASS is its app_id (`app_id_of`), which a
-    window without --phone has only if it resolved SERIAL and named itself after its entry."""
-    js = js.replace("CLASS", json.dumps(app_id_of(pkg)))
+def kwin_on(pkg, js, name, serial=None, **subst):
+    """Runs `js` on the windows of `pkg` on `serial` (default SERIAL): CLASS is its app_id
+    (`app_id_of`), which a window without --phone has only if it resolved SERIAL and named
+    itself after its entry."""
+    js = js.replace("CLASS", json.dumps(app_id_of(pkg, serial)))
     for k, v in subst.items():
         js = js.replace(k, str(v))
     return kwin(js, name)
@@ -928,10 +1230,10 @@ class Suite:
         # Stop the daemon (reading the phone's own stay-awake value while no session runs), then
         # start it so the session start is observed from scratch.
         try:
-            read_stay_on_baseline()
+            read_baseline(SERIAL)
         finally:
             systemctl("start", UNIT)
-        sh("adb", "-s", SERIAL, "wait-for-device", timeout=60)
+        adb("wait-for-device", timeout=60)
         st, secs = wait_ready(10)
         note(f"ready {secs:.1f} s after wait-for-device: {json.dumps(st)}")
         check(st["serial"] == SERIAL and st["helper"] and st["windows"] == [], f"status {st}")
@@ -1113,7 +1415,8 @@ class Suite:
         stay-awake. Runs with `screen_off = true` in settings.toml (saved, set, lanternd
         restarted so the session applies it; the file is restored and lanternd restarted in a
         guarded cleanup), so the panel really is off before the yank and the restore path that
-        turns it on is the one tested."""
+        turns it on is the one tested. The restore is read from the helper's logcat since the
+        yank (Android's own screen timeout may sleep the phone again before anyone looks)."""
         base_stay_on = stay_on_baseline()
         path = settings_file()
         saved_file = path.read_bytes() if path.exists() else None
@@ -1146,22 +1449,16 @@ class Suite:
             before = status()
             pids = phone_state()["helper_pids"]
             check(before["state"] == "ready", f"not ready before the yank: {before}")
-            input(">>> Unplug the phone's USB cable now, then press Enter ")
-            wait_until("device gone", 20, lambda: SERIAL not in sh("adb", "devices"))
-            st, _ = wait_until("daemon idle", 10,
-                               lambda: (s := status())["state"] == "idle" and s)
-            note(f"unplugged: daemon {st['state']}")
-            print(">>> Keep it unplugged for 10 s (watch the phone screen)...", flush=True)
-            time.sleep(10)
-            lit = input(">>> Is the phone's screen on now (panel restored)? [y/n] ").strip().lower()
-            check(lit.startswith("y"), "panel not restored while unplugged")
-            input(">>> Plug the phone back in, then press Enter ")
-            sh("adb", "-s", SERIAL, "wait-for-device", timeout=120)
-            log = adb("logcat", "-d", "-s", "lantern")
-            restores = [l for l in log.splitlines() if "restored" in l]
+            t0 = phone_now()
+            ask(f"Pull {SERIAL}'s USB cable now, keep it out at least 15 s, then plug it back "
+                f"in (waiting up to {MANUAL_WAIT} s per step).")
+            wait_off_and_back()
+            lines = [m for _, m in logcat_since(t0, ["lantern"])]
+            restores = [l for l in lines if "restored" in l]
             note(f"helper log: {restores[-1].strip() if restores else '(no restore line)'}")
-            check(any("cleanup: panel on" in l for l in log.splitlines()),
-                  "no 'cleanup: panel on' in the helper log")
+            check(any("cleanup: panel on" in l for l in lines),
+                  "no 'cleanup: panel on' in the helper log since the yank")
+            note("helper log since the yank: cleanup: panel on")
             st, secs = wait_ready(15)
             new = phone_state()["helper_pids"]
             note(f"fresh session {secs:.1f} s after replug; helper pids {pids} -> {new}")
@@ -1170,8 +1467,10 @@ class Suite:
                   "no stay-awake restore logged")
             ok = True
         finally:
-            # The settings file first, then a session with Sahaj's own settings.
-            cleanup(ok, ("restore settings.toml", restore_file),
+            # The phone back first (a failure mid-yank may find it still unplugged), then the
+            # settings file, then a session with Sahaj's own settings.
+            cleanup(ok, ("the phone back on adb", wait_back_on_adb),
+                    ("restore settings.toml", restore_file),
                     ("restart lanternd with the saved settings", restart_ready))
 
     # --- Plan 2 ----------------------------------------------------------------------------
@@ -1342,24 +1641,29 @@ class Suite:
                     ("disable the test screen", lambda: test_activity(False)))
 
     def usb_yank_restores_keyboard(self):
-        """Unplug: the phone's own cleanup puts the keyboard back. Checked after replug with
-        lanternd stopped, so no new session switches it again first."""
+        """Unplug: the phone's own cleanup puts the keyboard back. lanternd is stopped once it
+        is idle (the phone gone), so no new session switches the keyboard again before the
+        check after the replug."""
         base = baseline()
         st = status()
         check(st["state"] == "ready", f"not ready before the yank: {st}")
         check(phone_state()["ime"] == LANTERN_IME, "the Lantern keyboard is not selected")
-        since = phone_now()
-        input(">>> Unplug the phone's USB cable now, then press Enter ")
-        wait_until("device gone", 20, lambda: SERIAL not in sh("adb", "devices"))
-        print(">>> Keep it unplugged for 10 s...", flush=True)
-        time.sleep(10)
-        systemctl("stop", UNIT)
+        t0 = phone_now()
+        ask(f"Pull {SERIAL}'s USB cable now, keep it out at least 15 s, then plug it back in "
+            f"(waiting up to {MANUAL_WAIT} s per step).")
+        ok = False
         try:
-            input(">>> Plug the phone back in, then press Enter ")
-            sh("adb", "-s", SERIAL, "wait-for-device", timeout=120)
+            _, secs = wait_until(f"{SERIAL} off adb (cable pulled)", MANUAL_WAIT,
+                                 lambda: adb_state() != "device", interval=0.2)
+            note(f"phone off adb after {secs:.1f} s")
+            _, secs = wait_until("lanternd idle", MANUAL_WAIT,
+                                 lambda: status()["state"] == "idle", interval=0.5)
+            systemctl("stop", UNIT)
+            note(f"lanternd idle {secs:.1f} s later; stopped it")
+            wait_back_on_adb()
             ph = phone_state()
             note(f"after replug, lanternd stopped: {ph}")
-            lines = [m for _, m in logcat_since(since, ["lantern", "LanternCompanion"])
+            lines = [m for _, m in logcat_since(t0, ["lantern", "LanternCompanion"])
                      if "ime_restored" in m or "default_input_method" in m]
             for l in lines:
                 note(f"logcat: {l}")
@@ -1368,9 +1672,15 @@ class Suite:
             check(ph["ime"] == base["ime"] and ph["imes"] == base["imes"],
                   f"keyboard not restored: {ph['ime']} / {ph['imes']}, want {base}")
             check(ph["stay_on"] == base["stay_on"], f"stay_on {ph['stay_on']}")
+            ok = True
         finally:
-            systemctl("start", UNIT)
-        wait_ready(15)
+            # The phone back first, then lanternd serving it again.
+            def start_ready():
+                if systemctl("is-active", UNIT, check_rc=False).strip() != "active":
+                    systemctl("start", UNIT)
+                wait_ready(15)
+            cleanup(ok, ("the phone back on adb", wait_back_on_adb),
+                    ("lanternd ready", start_ready))
 
     # --- Plan 3 ----------------------------------------------------------------------------
 
@@ -1735,11 +2045,7 @@ class Suite:
         note(f"phone name: {name}")
 
         def locked():
-            for line in adb("shell", "dumpsys", "trust").splitlines():
-                if "(current)" in line:
-                    m = re.search(r"deviceLocked=([01])\b", line)
-                    return m.group(1) == "1" if m else None
-            return None
+            return device_locked()
 
         def lock():
             adb("shell", "input", "keyevent", "KEYCODE_SLEEP")
@@ -2267,6 +2573,55 @@ ITEMS = [
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt",
           "autoconnect_on_remembers_off", "autoconnect_off_asks_on_plug",
           "connect_from_entry_opens_app"}
+# Run only with --pair (inside `two_phones`); a --pair run selects only these.
+PAIR = set()
+# The person's steps for every manual item, in order: printed for every selected manual item
+# before any item runs, and again (`>>>`) when the item starts. He does them at his pace; every
+# wait observes its edge for up to MANUAL_WAIT.
+STEPS = {
+    "usb_yank": [
+        f"When item 8 prints '>>> Pull {SERIAL}'s USB cable now' (its screen is off by "
+        "then), pull the cable.",
+        "Keep it out at least 15 s, then plug it back in.",
+        "Nothing to answer: the suite reads the panel restore from the phone's log.",
+    ],
+    "usb_yank_restores_keyboard": [
+        f"When item 14 prints '>>> Pull {SERIAL}'s USB cable now', pull the cable.",
+        "Keep it out at least 15 s, then plug it back in.",
+    ],
+    "unlock_prompt": [
+        "Keep the Motorola (ZD222LMDFV) at hand; the suite locks it and copies on the PC.",
+        "When 'Unlock your <phone>' shows, click 'Enter PIN…' and type the phone's PIN.",
+        "When it shows again, click 'Enter PIN…' and type a WRONG PIN.",
+        "On 'That PIN didn't unlock', click 'Try again' and type the right PIN.",
+    ],
+    "autoconnect_on_remembers_off": [
+        f"When item 24 prints '>>> Pull {SERIAL}'s USB cable', pull it, wait 5 s, plug it "
+        "back in.",
+        "About 30 s later it asks again: pull, wait 5 s, plug back in.",
+    ],
+    "autoconnect_off_asks_on_plug": [
+        f"When item 25 prints '>>> Pull {SERIAL}'s USB cable', pull it, wait 5 s, plug it "
+        "back in.",
+        "Leave the '<phone> is plugged in' notice alone: the suite connects through the tray.",
+    ],
+    "connect_from_entry_opens_app": [
+        "When 'Connect your <phone>' shows, click Connect on it.",
+        "Leave the Settings window that opens alone: the suite closes it.",
+    ],
+}
+
+
+def manual_plan(items):
+    """The steps of every manual item in `items`: one header line per item, then its
+    numbered steps. Non-manual items add nothing."""
+    out = []
+    for name in items:
+        if name not in MANUAL:
+            continue
+        out.append(f"[{ITEMS.index(name) + 1}] {name}:")
+        out += [f"    {n}. {step}" for n, step in enumerate(STEPS[name], 1)]
+    return out
 
 
 def desktop_locked():
@@ -2294,11 +2649,14 @@ def main():
     ap.add_argument("--nested", action="store_true",
                     default=os.environ.get("LANTERN_TEST_NESTED") == "1",
                     help="run test windows in a private headless KWin (for a locked desktop)")
+    ap.add_argument("--pair", action="store_true",
+                    help="run only the two-phone items (SERIAL and OTHER: LANTERN_OTHER_SERIAL, "
+                         "else the only other attached phone)")
     ap.add_argument("--signal", choices=["TERM", "KILL"], default="TERM",
                     help="item 7: TERM (clean stop, default) or KILL (no cleanup; systemd "
                          "restarts lanternd and its new session must drop the stale forward)")
     args = ap.parse_args()
-    global KILL_SIGNAL, NESTED, MANUAL_RUN
+    global KILL_SIGNAL, NESTED, MANUAL_RUN, OTHER
     KILL_SIGNAL = args.signal
     MANUAL_RUN = args.manual
     if args.state:
@@ -2309,15 +2667,25 @@ def main():
         print(json.dumps({"status": st, "phone": phone_state()}, indent=1))
         return 0
     suite = Suite()
-    items = [i for i in ITEMS if args.manual or i not in MANUAL]
+    items = [i for i in ITEMS if (args.manual or i not in MANUAL) and (i in PAIR) == args.pair]
     if args.only:
         unknown = [o for o in args.only if o not in ITEMS
                    and not (o.isdigit() and 1 <= int(o) <= len(ITEMS))]
         if unknown:
             ap.error(f"unknown items {unknown}; items: " +
                      ", ".join(f"{n} {i}" for n, i in enumerate(ITEMS, 1)))
-        items = [i for n, i in enumerate(ITEMS, 1) if i in args.only or str(n) in args.only]
-    print(f"lantern device test: serial={SERIAL} binary={LANTERN} logs={LOG_DIR}", flush=True)
+        items = [i for n, i in enumerate(ITEMS, 1) if (i in args.only or str(n) in args.only)
+                 and (i in PAIR) == args.pair]
+    if args.pair:
+        OTHER = OTHER or pick_other(sh("adb", "devices", timeout=10), SERIAL)
+    print(f"lantern device test: serial={SERIAL}" + (f" other={OTHER}" if args.pair else "") +
+          f" binary={LANTERN} logs={LOG_DIR}", flush=True)
+    plan = manual_plan(items)
+    if plan:
+        print("Steps for Sahaj (do them at your pace; each wait lasts up to "
+              f"{MANUAL_WAIT} s):", flush=True)
+        for line in plan:
+            print(f"  {line}", flush=True)
     if not args.nested and desktop_locked():
         print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
               "(4-6, 12, 13, 17, 22) cannot pass. Unlock it or use --nested.", flush=True)
@@ -2338,6 +2706,8 @@ def main():
         for name in items:
             idx = ITEMS.index(name) + 1
             print(f"[{idx}] {name}", flush=True)
+            for n, step in enumerate(STEPS.get(name, []), 1):
+                ask(f"{n}. {step}")
             t0 = time.monotonic()
             try:
                 getattr(suite, name)()
@@ -2390,7 +2760,7 @@ def main():
             except Exception as e:
                 print(f"WARNING: could not restart {UNIT}: {e}", flush=True)
     if not args.manual and not args.only:
-        for name in sorted(MANUAL, key=ITEMS.index):
+        for name in sorted(MANUAL - (set(ITEMS) - PAIR if args.pair else PAIR), key=ITEMS.index):
             print(f"SKIP {ITEMS.index(name) + 1} {name} (needs a person: run with --manual)")
     print(f"{sum(results)}/{len(results)} PASS", flush=True)
     return 0 if all(results) else 1
