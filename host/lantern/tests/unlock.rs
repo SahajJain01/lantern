@@ -850,3 +850,102 @@ async fn second_phone_locked_during_a_stretch_still_prompts() {
     assert_eq!(serial, "b");
     assert_eq!(got, pin("1234"));
 }
+
+/// Decision 15: when lanternd stops (its events sender dropped), each phone's notice on screen
+/// is closed before `run` returns.
+#[tokio::test]
+async fn notice_closes_when_events_end() {
+    let mut rig = Rig::start_view(two_view(), echo_prompt("1234")).await;
+    rig.send(locked("a")).await;
+    let a = rig.notify_id(1).await;
+    rig.send(locked("b")).await;
+    let b = rig.notify_id(2).await;
+    rig.events.take();
+    let task = std::mem::replace(&mut rig.task, tokio::spawn(async { Ok(()) }));
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("run did not end")
+        .unwrap()
+        .unwrap();
+    let mut closes: Vec<u32> = rig
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Close(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    closes.sort();
+    let mut want = vec![a, b];
+    want.sort();
+    assert_eq!(closes, want, "{:?}", rig.calls());
+}
+
+/// R9 m3: a failed result arriving after that phone's stretch ended (it was unlocked by hand
+/// meanwhile) is only logged: no notice inviting another PIN.
+#[tokio::test]
+async fn failed_result_after_the_stretch_ended_is_not_shown() {
+    let rig = Rig::start(true, echo_prompt("1234")).await;
+    rig.send(locked("s1")).await;
+    let id = rig.notify_id(1).await;
+    rig.send(unlocked("s1")).await;
+    rig.send(LockEvent::Result {
+        serial: "s1".into(),
+        ok: false,
+        reason: Some("unlock not confirmed".into()),
+    })
+    .await;
+    // A result for a phone never locked is not shown either.
+    rig.send(LockEvent::Result {
+        serial: "zz".into(),
+        ok: false,
+        reason: Some("wrong PIN".into()),
+    })
+    .await;
+    wait_for("the close", Duration::from_secs(5), || {
+        rig.calls().contains(&Call::Close(id)).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(rig.notifies().len(), 1, "{:?}", rig.calls());
+    // The next stretch prompts as usual, and a failure in it is shown.
+    rig.send(locked("s1")).await;
+    rig.notify_id(2).await;
+    rig.send(LockEvent::Result {
+        serial: "s1".into(),
+        ok: false,
+        reason: Some("wrong PIN".into()),
+    })
+    .await;
+    rig.notify_id(3).await;
+}
+
+/// R9 m6: b's click queued behind a's dialog is dropped when b unlocks; b's next stretch opens
+/// no dialog unless clicked again.
+#[tokio::test]
+async fn queued_click_is_dropped_when_that_phone_unlocks() {
+    let log = std::env::temp_dir().join(format!(
+        "lantern-unlock-asked-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&log);
+    let mut rig = Rig::start_view(two_view(), naming_prompt(&log, "0.8")).await;
+    rig.send(locked("a")).await;
+    let a_id = rig.notify_id(1).await;
+    rig.send(locked("b")).await;
+    let b_id = rig.notify_id(2).await;
+    rig.click(a_id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.click(b_id, "unlock").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // b unlocks and locks again while a's dialog is still open.
+    rig.send(unlocked("b")).await;
+    rig.send(locked("b")).await;
+    rig.notify_id(3).await;
+    let (serial, _) = rig.next_tagged_pin().await;
+    assert_eq!(serial, "a");
+    rig.assert_no_pin_within(Duration::from_millis(1500)).await;
+    assert_eq!(asked(&log), ["Pixel"]);
+    let _ = std::fs::remove_file(&log);
+}

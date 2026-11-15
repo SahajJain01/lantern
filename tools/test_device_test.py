@@ -241,6 +241,88 @@ class DeviceTestSelfTests(unittest.TestCase):
         for name in dt.ITEMS:
             self.assertTrue(callable(getattr(dt.Suite, name, None)), name)
 
+    def test_items_33_and_34(self):
+        self.assertEqual(dt.ITEMS[32:34], ["replug_keeps_requested_app", "notices_close_on_quit"])
+        self.assertIn("replug_keeps_requested_app", dt.MANUAL)
+        self.assertNotIn("notices_close_on_quit", dt.MANUAL)
+        self.assertFalse({"replug_keeps_requested_app", "notices_close_on_quit"} & dt.PAIR)
+        self.assertEqual(dt.STEPS["replug_keeps_requested_app"],
+                         ["Pull the Xiaomi's cable.",
+                          "When 'Connect your Xiaomi 11T Pro' shows, plug the phone in.",
+                          "On 'Xiaomi 11T Pro is plugged in', click Connect."])
+
+    def test_monitor_calls_pairs_notify_with_its_reply(self):
+        log = """\u2023 Type=method_call  Endian=l  Flags=0  Version=1 Cookie=12  Timestamp="x"
+  Sender=:1.55  Destination=org.freedesktop.Notifications  Path=/org/freedesktop/Notifications  Interface=org.freedesktop.Notifications  Member=Notify
+  UniqueName=:1.55
+  MESSAGE "susssasa{sv}i" {
+          STRING "Lantern";
+          UINT32 0;
+          STRING "smartphone";
+          STRING "Connect your Xiaomi 11T Pro";
+          STRING "Settings is on your Xiaomi 11T Pro. Connect it to open Settings here.";
+          ARRAY "s" {
+                  STRING "connect";
+                  STRING "Connect";
+          };
+          ARRAY "{sv}" {
+          };
+          INT32 -1;
+  };
+
+\u2023 Type=method_call  Endian=l  Flags=0  Version=1 Cookie=7  Timestamp="x"
+  Sender=:1.80  Destination=org.freedesktop.Notifications  Path=/org/freedesktop/Notifications  Interface=org.freedesktop.Notifications  Member=Notify
+  MESSAGE "susssasa{sv}i" {
+          STRING "other";
+          UINT32 0;
+          STRING "";
+          STRING "Someone else";
+          STRING "";
+          ARRAY "s" {
+          };
+  };
+
+\u2023 Type=method_return  Endian=l  Flags=1  Version=1 Cookie=40  ReplyCookie=7  Timestamp="x"
+  Sender=:1.20  Destination=:1.80
+  MESSAGE "u" {
+          UINT32 99;
+  };
+
+\u2023 Type=method_return  Endian=l  Flags=1  Version=1 Cookie=41  ReplyCookie=12  Timestamp="x"
+  Sender=:1.20  Destination=:1.55
+  MESSAGE "u" {
+          UINT32 17;
+  };
+
+\u2023 Type=method_call  Endian=l  Flags=0  Version=1 Cookie=13  Timestamp="x"
+  Sender=:1.55  Destination=org.freedesktop.Notifications  Path=/org/freedesktop/Notifications  Interface=org.freedesktop.Notifications  Member=CloseNotification
+  MESSAGE "u" {
+          UINT32 17;
+  };
+"""
+        calls = dt.monitor_calls(log)
+        self.assertEqual([c["member"] for c in calls], ["Notify", "Notify", "CloseNotification"])
+        self.assertEqual(calls[0]["summary"], "Connect your Xiaomi 11T Pro")
+        self.assertEqual(calls[0]["body"],
+                         "Settings is on your Xiaomi 11T Pro. Connect it to open Settings here.")
+        self.assertEqual(calls[0]["actions"], ["connect", "Connect"])
+        self.assertEqual(calls[0]["id"], 17)
+        self.assertEqual(calls[1]["id"], 99)
+        self.assertEqual(calls[2]["id"], 17)
+        # A Notify whose reply isn't in the log yet has no id.
+        cut = log[:log.index("Cookie=41")]
+        self.assertIsNone(dt.monitor_calls(cut)[0]["id"])
+
+    def test_unlock_ok_pattern_names_one_phone(self):
+        import re
+        rx = re.compile(dt.unlock_ok_pattern("ZD222LMDFV"))
+        line = ' INFO lantern::daemon::ipc: unlock result serial="ZD222LMDFV" ok=true reason=""'
+        self.assertTrue(rx.search(line))
+        self.assertTrue(rx.search(line.replace('"ZD222LMDFV"', "ZD222LMDFV")))
+        self.assertFalse(rx.search(line.replace("ZD222LMDFV", "20e9318")))
+        self.assertFalse(rx.search(line.replace("ZD222LMDFV", "ZD222LMDFV2")))
+        self.assertFalse(rx.search(line.replace("ok=true", "ok=false")))
+
     def test_pair_cleanup_runs_every_step_in_order(self):
         ran = []
 

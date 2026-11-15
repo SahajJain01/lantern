@@ -33,6 +33,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::daemon::companion::{self, Names};
 use crate::naming::{self, Naming};
+use crate::notices::escape_markup;
 pub use crate::window::identity::app_id;
 use crate::window::identity::{profile_suffix, MAX_LABEL, MAX_USER};
 
@@ -1389,11 +1390,15 @@ pub fn paused_notice(dirs: &Dirs, pkg: &str, user: u32) -> (String, String, Opti
     let (app, _, icon) = app_of_entries(dirs, pkg, user);
     (
         "Lantern is disconnected".to_owned(),
-        format!("Click Connect in Lantern's tray menu to open {app}."),
+        format!(
+            "Click Connect in Lantern's tray menu to open {}.",
+            escape_markup(&app)
+        ),
         icon,
     )
 }
 
+/// Summaries are plain text in Plasma, bodies are markup: names are escaped in bodies only.
 fn notice_for_phones(
     names: &dyn Fn(&str) -> Option<String>,
     app: String,
@@ -1402,18 +1407,20 @@ fn notice_for_phones(
     icon: Option<PathBuf>,
 ) -> (String, String, Option<PathBuf>) {
     let n = |serial: &str| names(serial).unwrap_or_else(|| serial.to_owned());
+    // For bodies.
+    let e = |serial: &str| escape_markup(&n(serial));
+    let app = escape_markup(&app);
     let (summary, body) = match phones {
         [] => (
             "Connect your phone".to_owned(),
             format!("{app} opens when your phone is connected by USB."),
         ),
         [a] => {
-            let a = n(a);
             let body = match here {
-                Some(h) => format!("{app} is on your {a}, not on {}.", n(h)),
-                None => format!("{app} opens when your {a} is connected by USB."),
+                Some(h) => format!("{app} is on your {}, not on {}.", e(a), e(h)),
+                None => format!("{app} opens when your {} is connected by USB.", e(a)),
             };
-            (format!("Connect your {a}"), body)
+            (format!("Connect your {}", n(a)), body)
         }
         [a, b] => (
             format!("Connect {} or {}", n(a), n(b)),
@@ -1421,7 +1428,7 @@ fn notice_for_phones(
         ),
         [a, b, rest @ ..] => (
             "Connect one of your phones".to_owned(),
-            format!("{app} is on {}, {} and {} more.", n(a), n(b), rest.len()),
+            format!("{app} is on {}, {} and {} more.", e(a), e(b), rest.len()),
         ),
     };
     (summary, body, icon)
@@ -2742,6 +2749,61 @@ mod tests {
         let (s, body, _) = connect_notice_for_phone(&dirs, &names, "com.zz", 0, "s9");
         assert_eq!(s, "Connect your s9");
         assert_eq!(body, "com.zz opens when your s9 is connected by USB.");
+    }
+
+    /// Notification bodies are markup: app and phone names are escaped there, summaries
+    /// keep them raw.
+    #[test]
+    fn window_notice_bodies_are_escaped() {
+        let (_t, dirs) = tmp();
+        let (mut cat, _) = quiet(dirs.clone());
+        cat.start_session("s");
+        cat.upsert(
+            "s",
+            &AppEntry {
+                label: "A&B".into(),
+                ..entry("com.a", 0)
+            },
+        )
+        .unwrap();
+        let odd = |serial: &str| match serial {
+            "s" => Some("<P>".to_owned()),
+            "h" => Some("H&I".to_owned()),
+            _ => None,
+        };
+        let (s, body, _) = connect_notice(&dirs, &odd, "com.a", 0, None);
+        assert_eq!(s, "Connect your <P>");
+        assert_eq!(
+            body,
+            "A&amp;B opens when your &lt;P&gt; is connected by USB."
+        );
+        let (_, body, _) = connect_notice(&dirs, &odd, "com.a", 0, Some("h"));
+        assert_eq!(body, "A&amp;B is on your &lt;P&gt;, not on H&amp;I.");
+        let (s, body, _) = connect_notice_for_phone(&dirs, &odd, "com.a", 0, "s");
+        assert_eq!(s, "Connect your <P>");
+        assert_eq!(
+            body,
+            "A&amp;B opens when your &lt;P&gt; is connected by USB."
+        );
+        let (_, body, _) = paused_notice(&dirs, "com.a", 0);
+        assert_eq!(
+            body,
+            "Click Connect in Lantern's tray menu to open A&amp;B."
+        );
+        // Several phones: the summary keeps them raw, the body escapes them.
+        let names = |serial: &str| Some(format!("<{serial}>"));
+        let (s, body, _) =
+            notice_for_phones(&names, "A&B".into(), &["x".into(), "y".into()], None, None);
+        assert_eq!(s, "Connect <x> or <y>");
+        assert_eq!(body, "A&amp;B opens when one of them is connected by USB.");
+        let (_, body, _) = notice_for_phones(
+            &names,
+            "A&B".into(),
+            &["x".into(), "y".into(), "z".into()],
+            None,
+            None,
+        );
+        assert_eq!(body, "A&amp;B is on &lt;x&gt;, &lt;y&gt; and 1 more.");
     }
 
     #[test]

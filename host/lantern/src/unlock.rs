@@ -163,7 +163,7 @@ impl Request {
 }
 
 /// The PIN dialog: a command whose stdout (exit 0) is the PIN. `{name}` in an argument becomes
-/// the phone's name.
+/// the phone's name, escaped for markup (the dialog's text is rich text).
 #[derive(Debug, Clone)]
 pub struct Prompt {
     pub program: PathBuf,
@@ -171,7 +171,8 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    /// `kdialog --title Lantern --password "Enter the PIN for {name}"`.
+    /// `kdialog --title Lantern --password "<qt>Enter the PIN for {name}</qt>"`: rich text, so
+    /// Qt shows the (escaped) name as typed whatever it holds.
     pub fn kdialog() -> Self {
         Self {
             program: "kdialog".into(),
@@ -179,7 +180,7 @@ impl Prompt {
                 "--title",
                 "Lantern",
                 "--password",
-                "Enter the PIN for {name}",
+                "<qt>Enter the PIN for {name}</qt>",
             ]
             .map(str::to_owned)
             .into(),
@@ -262,10 +263,11 @@ async fn show(
 /// Runs the PIN dialog (blocking): its stdout parsed as a [`Pin`], `Ok(None)` if the user
 /// cancelled.
 fn ask(prompt: &Prompt, name: &str) -> Result<Option<Pin>, String> {
+    let name = escape_markup(name);
     let args: Vec<OsString> = prompt
         .args
         .iter()
-        .map(|arg| arg.replace("{name}", name).into())
+        .map(|arg| arg.replace("{name}", &name).into())
         .collect();
     let mut command = crate::desktop::command(&prompt.program, &args);
     command.stdout(Stdio::piped()).stderr(Stdio::null());
@@ -375,9 +377,10 @@ struct Asking {
 /// another phone's notice. The dialog opens on a notice's action or on a [`Request`] (the
 /// tray's Unlock row), only for a phone whose stretch is open, and one at a time across
 /// phones: a click for another phone while a dialog is open waits (once per phone) and its
-/// dialog opens after the answer if that phone is still locked. The answer goes only to the
-/// phone it was asked for, and only in the stretch it was asked in. Without a notification
-/// server it logs one warning and carries on.
+/// dialog opens after the answer if that phone is still in that stretch. The answer goes only
+/// to the phone it was asked for, and only in the stretch it was asked in; a failed result
+/// after its stretch ended is only logged. When `events` closes, every notice still shown is
+/// closed. Without a notification server it logs one warning and carries on.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     conn: Connection,
@@ -413,6 +416,11 @@ pub async fn run(
                     }
                     LockEvent::Result { serial, ok: false, reason } => {
                         tracing::info!(serial, reason = reason.as_deref().unwrap_or(""), "unlock failed");
+                        if !locks.get(&serial).is_some_and(|lock| lock.stretch) {
+                            // Its stretch already ended (unlocked by hand): nothing to retry.
+                            tracing::info!(serial, "the lock stretch already ended; the failure is not shown");
+                            continue;
+                        }
                         let name = phone_name(&view, &serial);
                         let notice = failed_notice(&name, reason.as_deref());
                         let lock = locks.entry(serial).or_default();
@@ -426,6 +434,8 @@ pub async fn run(
                         lock.stretch = false;
                         lock.ended += 1;
                         notices.close(std::mem::take(&mut lock.shown)).await;
+                        // A click queued for it is void: its next stretch asks again.
+                        queued.retain(|s| *s != serial);
                     }
                     LockEvent::Reopen { serial, apps } => reopen(&exe, &serial, apps),
                 }
@@ -478,13 +488,21 @@ pub async fn run(
                     }
                     Err(error) => tracing::warn!(%error, "PIN dialog task failed"),
                 }
-                // The next phone clicked meanwhile that is still locked gets its dialog.
+                // The next phone clicked meanwhile (still in the stretch it was clicked in) gets
+                // its dialog.
                 while asking.is_none() {
                     let Some(next) = queued.pop_front() else { break };
                     asking = begin_asking(&locks, &view, &prompt, &next, "queued");
                 }
             }
         }
+    }
+    // lanternd is stopping: no notice may outlive it (each close is bounded, 5 s).
+    for (serial, lock) in locks.iter_mut() {
+        if lock.shown != 0 {
+            tracing::debug!(serial, id = lock.shown, "closing the unlock notice at exit");
+        }
+        notices.close(std::mem::take(&mut lock.shown)).await;
     }
     Ok(())
 }
@@ -677,7 +695,40 @@ mod tests {
                 "--title",
                 "Lantern",
                 "--password",
-                "Enter the PIN for {name}"
+                "<qt>Enter the PIN for {name}</qt>"
+            ]
+        );
+    }
+
+    /// Decision 16: the dialog's text is rich text with the phone's name escaped. The program
+    /// is a shell that writes its arguments to a scratch file (never the real kdialog).
+    #[test]
+    fn kdialog_prompt_is_escaped_rich_text() {
+        let log = std::env::temp_dir().join(format!(
+            "lantern-unlock-kdialog-args-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log);
+        let mut prompt = Prompt::kdialog();
+        prompt.program = "/bin/sh".into();
+        let mut args = vec![
+            "-c".to_owned(),
+            format!("printf '%s\\n' \"$@\" > '{}'; echo 1234", log.display()),
+            "sh".to_owned(),
+        ];
+        args.extend(Prompt::kdialog().args);
+        prompt.args = args;
+        let pin = ask(&prompt, "A<B").unwrap().unwrap();
+        assert_eq!(pin.digits(), "1234");
+        let got = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(
+            got.lines().collect::<Vec<_>>(),
+            [
+                "--title",
+                "Lantern",
+                "--password",
+                "<qt>Enter the PIN for A&lt;B</qt>"
             ]
         );
     }

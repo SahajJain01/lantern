@@ -59,6 +59,15 @@ pub fn plug_in_notice(name: &str, app: Option<&str>) -> (String, String) {
     (format!("Plug in your {name}"), body)
 }
 
+/// "{name} is plugged in" replacing a shown "Connect your {name}" for `app`: its Connect still
+/// opens `app` (escaped in the body).
+pub fn plugged_with_app_notice(name: &str, app: &str) -> (String, String) {
+    (
+        format!("{name} is plugged in"),
+        format!("Connect it to open {} here.", escape_markup(app)),
+    )
+}
+
 /// Whether the connect prompt's notifications get through: false until the server first
 /// answers, false after a failed `Notify`, true again once it answers. Cheap to clone; the
 /// daemon's [`crate::daemon::ipc::Hub`] reads it for every refused open.
@@ -89,11 +98,15 @@ struct Shown {
     /// `Some` while it has the Connect action: the app (pkg, user) to open after connecting
     /// (`None` inside for a plain plug-in).
     connect: Option<Option<(String, u32)>>,
+    /// The offered app's name, while `connect` carries an app.
+    app: Option<String>,
 }
 
 /// Shows the connect notices for `events` and sends a Connect click as
-/// [`Command::Connect`] on `commands` (`try_send`), until `events` closes. `health` follows the
-/// notification server (see [`Health`]). Without a server it logs one warning and carries on.
+/// [`Command::Connect`] on `commands` (`try_send`), until `events` closes; then it closes every
+/// notice it still shows. A `PluggedIn` replacing a shown offer keeps the offered app (its
+/// Connect opens it). `health` follows the notification server (see [`Health`]). Without a
+/// server it logs one warning and carries on.
 pub async fn run(
     conn: Connection,
     mut events: mpsc::Receiver<ConnectEvent>,
@@ -120,15 +133,23 @@ pub async fn run(
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
-                let (serial, (summary, body), connect) = match event {
+                let (serial, (summary, body), connect, app) = match event {
                     ConnectEvent::PluggedIn { serial, name } => {
-                        (serial, plugged_notice(&name), Some(None))
+                        // A replug while its offer is on screen keeps the offered app.
+                        match shown.get(&serial) {
+                            Some(Shown { connect: Some(Some(open)), app: Some(app), .. }) => {
+                                let (open, app) = (open.clone(), app.clone());
+                                (serial, plugged_with_app_notice(&name, &app), Some(Some(open)), Some(app))
+                            }
+                            _ => (serial, plugged_notice(&name), Some(None), None),
+                        }
                     }
                     ConnectEvent::OpenRefused { serial, name, app, pkg, user } => {
-                        (serial, offered_notice(&name, &app), Some(Some((pkg, user))))
+                        let notice = offered_notice(&name, &app);
+                        (serial, notice, Some(Some((pkg, user))), Some(app))
                     }
                     ConnectEvent::PlugIn { serial, name, app } => {
-                        (serial, plug_in_notice(&name, app.as_deref()), None)
+                        (serial, plug_in_notice(&name, app.as_deref()), None, None)
                     }
                     ConnectEvent::Gone { serial } => {
                         if let Some(old) = shown.remove(&serial) {
@@ -159,7 +180,7 @@ pub async fn run(
                     shown.remove(&serial);
                     continue;
                 }
-                shown.insert(serial, Shown { id, connect });
+                shown.insert(serial, Shown { id, connect, app });
             }
             message = actions.next() => {
                 let Some(Ok(message)) = message else { continue };
@@ -186,6 +207,11 @@ pub async fn run(
         }
     }
     drop(probe);
+    // lanternd is stopping: nothing it shows may outlive it (each close is bounded, 5 s).
+    for (serial, old) in shown.drain() {
+        tracing::debug!(serial, id = old.id, "closing the connect notice at exit");
+        notices.close(old.id).await;
+    }
     Ok(())
 }
 

@@ -184,6 +184,12 @@ pub fn status_line(view: &View) -> String {
     }
 }
 
+/// The SNI tooltip's text: [`status_line`] with the phone names escaped, since the host reads
+/// it as markup (the line's own words hold no `&`, `<` or `>`).
+pub fn tooltip_text(view: &View) -> String {
+    crate::notices::escape_markup(&status_line(view))
+}
+
 /// The overlay icon name on the tray icon, or `""` for none: busy while any live phone isn't
 /// ready or any phone is being undone, a warning while any ready phone has a companion `msg`,
 /// paused while no phone is live and one is listed.
@@ -742,6 +748,24 @@ mod tests {
         let mut more = v.clone();
         more.phones.push(phone("c", "c", PhoneState::Waiting));
         assert_eq!(status_line(&more), "Connected to Pixel and b");
+    }
+
+    /// R9 m1: the tooltip body is markup for the SNI host: names are escaped there, while
+    /// `status_line` stays raw.
+    #[test]
+    fn tooltip_text_escapes_names() {
+        let v = View {
+            phones: vec![
+                phone("dev", "A&B", PhoneState::Ready),
+                phone("b", "<P>", PhoneState::Ready),
+            ],
+        };
+        assert_eq!(status_line(&v), "Connected to A&B and <P>");
+        assert_eq!(tooltip_text(&v), "Connected to A&amp;B and &lt;P&gt;");
+        let busy = View {
+            phones: vec![phone("dev", "A&B", PhoneState::Starting)],
+        };
+        assert_eq!(tooltip_text(&busy), "Connecting to A&amp;B…");
     }
 
     #[test]

@@ -117,14 +117,15 @@ pub type UndoRunner = Arc<dyn Fn(String) -> BoxFuture<'static, (bool, String)> +
 /// Shows a desktop notification (summary, body).
 pub type Notifier = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
-/// The notification after an undo on the phone called `name`: one body line per step.
+/// The notification after an undo on the phone called `name`: one body line per step
+/// (escaped for markup; the summary is plain text and keeps the name raw).
 pub fn undo_notice(ok: bool, name: &str, output: &str) -> (String, String) {
     let summary = if ok {
         format!("Lantern removed itself from {name}")
     } else {
         format!("Undo phone setup failed on {name}")
     };
-    (summary, output.to_owned())
+    (summary, crate::notices::escape_markup(output))
 }
 
 #[cfg(test)]
@@ -155,6 +156,23 @@ mod tests {
         assert_eq!(
             undo_notice(false, "20e9318", "a: FAILED: x").0,
             "Undo phone setup failed on 20e9318"
+        );
+    }
+
+    /// The body is markup in Plasma: the undo's output is escaped there, the summary keeps
+    /// the raw name.
+    #[test]
+    fn undo_notice_body_is_escaped() {
+        assert_eq!(
+            undo_notice(true, "A&B", "x <y> & z"),
+            (
+                "Lantern removed itself from A&B".to_owned(),
+                "x &lt;y&gt; &amp; z".to_owned()
+            )
+        );
+        assert_eq!(
+            undo_notice(false, "A&B", "x <y> & z").1,
+            "x &lt;y&gt; &amp; z"
         );
     }
 

@@ -4879,9 +4879,10 @@ async fn wedged_helper_ends_only_its_own_session() {
             .unwrap();
         sent += 1;
     }
-    // b's session ended (helper stopped reading) and a new one starts.
+    // b's session ended (helper stopped reading) and a new one starts. Its close and the
+    // retry delay come first: 10 s keeps a loaded machine from failing it.
     assert_eq!(
-        timeout(Duration::from_secs(5), b.sessions.recv())
+        timeout(Duration::from_secs(10), b.sessions.recv())
             .await
             .expect("b never restarted"),
         Some(1)

@@ -425,12 +425,14 @@ async fn open_settings(settings: SettingsHandle) {
     }
 }
 
-/// The Undo confirmation text for the phone called `name`.
+/// The Undo confirmation text for the phone called `name`: rich text (`<qt>`) with the name
+/// escaped, so kdialog shows it as typed whatever it holds.
 fn undo_question(name: &str) -> String {
+    let name = crate::notices::escape_markup(name);
     format!(
-        "Remove Lantern from {name}? This puts back the phone's keyboard and settings, uninstalls \
-         the Lantern companion app and removes {name}'s apps from the Phone menu. Plug the phone \
-         in again to set it up again."
+        "<qt>Remove Lantern from {name}? This puts back the phone's keyboard and settings, \
+         uninstalls the Lantern companion app and removes {name}'s apps from its menu folder. \
+         Plug the phone in again to set it up again.</qt>"
     )
 }
 
@@ -596,10 +598,23 @@ mod tests {
     fn undo_question_text() {
         assert_eq!(
             undo_question("Pixel"),
-            "Remove Lantern from Pixel? This puts back the phone's keyboard and settings, \
-             uninstalls the Lantern companion app and removes Pixel's apps from the Phone menu. \
-             Plug the phone in again to set it up again."
+            "<qt>Remove Lantern from Pixel? This puts back the phone's keyboard and settings, \
+             uninstalls the Lantern companion app and removes Pixel's apps from its menu folder. \
+             Plug the phone in again to set it up again.</qt>"
         );
+    }
+
+    /// Decision 16: kdialog reads the text as rich text whatever the name holds.
+    #[test]
+    fn undo_question_is_escaped_rich_text() {
+        let text = undo_question("A&B");
+        assert!(
+            text.starts_with("<qt>Remove Lantern from A&amp;B?"),
+            "{text}"
+        );
+        assert!(text.ends_with("</qt>"), "{text}");
+        assert!(text.contains("removes A&amp;B's apps"), "{text}");
+        assert!(!text.contains("A&B"), "{text}");
     }
 
     #[tokio::test]

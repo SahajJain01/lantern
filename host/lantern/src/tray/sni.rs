@@ -75,7 +75,7 @@ impl Sni {
             "smartphone".to_owned(),
             Vec::new(),
             "Lantern".to_owned(),
-            menu::status_line(&self.shared.state().view),
+            menu::tooltip_text(&self.shared.state().view),
         )
     }
 

@@ -57,6 +57,10 @@ Item 28 opens Settings on both phones at once (two windows, displays, forwards a
 29 copies on the PC and on each phone's test screen (enabled on both only during the item; the
 PC clipboard is put back); 30 kills SERIAL's helper and disconnects SERIAL while OTHER keeps a
 Settings window; 31 has Sahaj pull SERIAL's cable for at least 15 s while OTHER keeps one.
+Single-phone items 33 and 34 (not --pair): 33 has Sahaj pull the cable, plug it back in and click
+Connect on "<phone> is plugged in", which still opens the Settings app offered while the phone
+was out (LANTERN_SERIAL lifted, so only SERIAL may be attached); 34 checks a lanternd restart
+closes a "Connect your <phone>" it showed.
 
 Plan 4b (phone switchboard) items: 2 checks the window's app_id from the phone's names (the
 primary phone keeps `lantern.<pkg>`, any other gets `-p<tag>`), 10/15/16 the per-phone entries
@@ -292,6 +296,12 @@ def wait_journal(pattern, since, timeout):
     return wait_until(f"journal /{pattern}/", timeout, found, interval=1)
 
 
+def unlock_ok_pattern(serial):
+    """The journal regex for phone `serial`'s `unlock result` with ok=true (lanternd logs the
+    message, then `serial`, then `ok`)."""
+    return rf'unlock result.*\bserial="?{re.escape(serial)}"?\s.*\bok=true\b'
+
+
 def wait_ready(timeout=10):
     """Waits until lanternd serves SERIAL's phone."""
     st, secs = wait_until("daemon ready", timeout,
@@ -517,6 +527,43 @@ class NotifyMonitor:
 
     def matching(self, summary, since=0):
         return [n for n in self.notifies()[since:] if n[0] == summary]
+
+    def calls(self):
+        """`monitor_calls` of the log so far."""
+        return monitor_calls(self.log.read_text(errors="replace"))
+
+
+_STRING = r'STRING "((?:[^"\\]|\\.)*)";'
+
+
+def monitor_calls(text):
+    """The Notify and CloseNotification calls in a `busctl monitor` log, in order: dicts with
+    `member`; a Notify has `summary`, `body`, `actions` and `id` (the server's reply, None until
+    its method_return is in the log); a CloseNotification has `id`."""
+    calls, pending = [], {}
+    for block in text.split("\u2023"):
+        head = dict(re.findall(r"\b(Type|Cookie|ReplyCookie|Sender|Destination|Member)=(\S+)",
+                               block))
+        kind, member = head.get("Type"), head.get("Member")
+        if kind == "method_call" and member == "Notify":
+            strings = re.findall(_STRING, block)
+            arr = re.search(r'ARRAY "s" \{(.*?)\};', block, re.S)
+            if len(strings) < 4:
+                continue
+            call = {"member": "Notify", "summary": strings[2], "body": strings[3],
+                    "actions": re.findall(_STRING, arr.group(1)) if arr else [], "id": None}
+            calls.append(call)
+            pending[(head.get("Sender"), head.get("Cookie"))] = call
+        elif kind == "method_call" and member == "CloseNotification":
+            m = re.search(r"UINT32 (\d+);", block)
+            if m:
+                calls.append({"member": "CloseNotification", "id": int(m.group(1))})
+        elif kind == "method_return":
+            call = pending.pop((head.get("Destination"), head.get("ReplyCookie")), None)
+            m = re.search(r"UINT32 (\d+);", block)
+            if call is not None and m:
+                call["id"] = int(m.group(1))
+    return calls
 
 
 def tray_name():
@@ -2993,9 +3040,14 @@ class Suite:
                     text = f"lock-one-{os.getpid()}{int(time.time()) % 100000}"
                     t0 = {p: phone_now(p) for p in (SERIAL, OTHER)}
                     klipper("setClipboardContents", text)
-                    # 4. Within 10 s: O's notice and journal line, S's copy; S untouched.
+                    # 4. Within 10 s of the copy (one deadline for every wait of this step):
+                    # O's one notice and journal line, S's copy; S untouched.
+                    step4 = time.monotonic() + 10
+
+                    def left():
+                        return max(0.0, step4 - time.monotonic())
                     want = f"Unlock your {name}"
-                    _, nsecs = wait_until(f"Notify {want!r}", 10, lambda: mon.matching(want),
+                    _, nsecs = wait_until(f"Notify {want!r}", left(), lambda: mon.matching(want),
                                           interval=0.2)
                     note(f"Notify {want!r} {nsecs:.1f} s after the copy")
 
@@ -3005,10 +3057,10 @@ class Suite:
                         return [l for l in out.splitlines() if "phone locked" in l
                                 and re.search(rf'serial="?{re.escape(OTHER)}"?(\s|$)',
                                               ANSI.sub("", l))]
-                    wait_until(f"journal: phone locked for {OTHER}", 10, o_locked_line)
+                    wait_until(f"journal: phone locked for {OTHER}", left(), o_locked_line)
                     note(f"journal: phone locked for {OTHER}")
                     s_want = f"clip: PC clipboard ({len(text)} chars) set on the phone"
-                    _, secs = wait_until(f"the copy set on {SERIAL}", 10, lambda: [
+                    _, secs = wait_until(f"the copy set on {SERIAL}", left(), lambda: [
                         m for _, m in logcat_since(t0[SERIAL], ["lantern"], SERIAL)
                         if m == s_want], interval=0.3)
                     note(f"{SERIAL}: {s_want!r} within {secs:.1f} s")
@@ -3030,11 +3082,13 @@ class Suite:
                     check(not stray, f"lock rows outside {name}'s slot: {stray}")
                     note(f"tray: Locked / {unlock_label!r} under {name}'s slot only; "
                          f"{SERIAL}: same helper, window open")
-                    # 5. Sahaj types O's PIN; O then gets the held copy.
+                    got = mon.matching(want)
+                    check(len(got) == 1, f"{len(got)} Notify {want!r}, want exactly one")
+                    # 5. Sahaj types O's PIN; O then gets the held copy. Only O's result counts.
                     ask(f"Click 'Enter PIN…' on 'Unlock your {name}' and type its PIN "
                         f"(waiting up to {MANUAL_WAIT} s).")
-                    _, secs = wait_journal(r"unlock result.*ok=true", since, MANUAL_WAIT)
-                    note(f"journal: unlock result ok=true after {secs:.1f} s")
+                    _, secs = wait_journal(unlock_ok_pattern(OTHER), since, MANUAL_WAIT)
+                    note(f"journal: unlock result ok=true for {OTHER} after {secs:.1f} s")
                     o_want = f"clip: held PC copy ({len(text)} chars) set on the phone"
                     _, secs = wait_until(f"the held copy set on {OTHER}", 30, lambda: [
                         m for _, m in logcat_since(t0[OTHER], ["lantern"], OTHER)
@@ -3048,6 +3102,150 @@ class Suite:
                     note("restored the PC clipboard text")
                 cleanup(ok, ("restore the PC clipboard", restore),
                         ("close S's Settings window", lambda: self._close_pair_settings(windows)))
+
+    def replug_keeps_requested_app(self):
+        """Item 33 (manual; real desktop: lanternd opens the window there). Autoconnect off,
+        LANTERN_SERIAL lifted, a 0 ms unplug grace. Sahaj pulls the cable; `lantern open --phone
+        SERIAL com.android.settings` exits 1 and a "Connect your <phone>" Notify carries
+        `connect`. He plugs the phone in: a "<phone> is plugged in" Notify whose body names
+        Settings replaces it. His Connect click logs `Connect clicked ... open=Some((
+        "com.android.settings", 0))`; the phone is ready, one Settings window opens within 20 s,
+        and lanternd lists exactly one 10 s later. Refused while another phone is attached."""
+        check(MANUAL_RUN, "item 33 needs a real unplug and replug: run it with --manual")
+        check(not NESTED, "item 33 needs the real desktop: lanternd opens the window there")
+        only_this_phone("33")
+        baseline()  # the originals now, while the suite's phone is served (see item 24)
+        path = settings_file()
+        saved_file = path.read_bytes() if path.exists() else None
+        note(f"{path}: " + (f"saved ({len(saved_file)} bytes)" if saved_file is not None
+                            else "absent"))
+
+        def restore_file():
+            if saved_file is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(saved_file)
+
+        def settings_windows():
+            return [w for w in status()["windows"] if w["pkg"] == SETTINGS]
+
+        def close_settings():
+            if settings_windows():
+                kwin_on(SETTINGS, CLOSE, "lantern_close")
+                wait_until("Settings window gone", 10, lambda: not settings_windows())
+
+        device = device_name()
+        offer, plugged = f"Connect your {device}", f"{device} is plugged in"
+        since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        env = manager_env(set={"LANTERN_UNPLUG_GRACE_MS": "0"}, unset=["LANTERN_SERIAL"])
+        ok = False
+        entered = False
+        with NotifyMonitor("33") as mon:
+            try:
+                edit_settings(saved_file, "autoconnect", "false")
+                env.__enter__()  # puts the environment back itself if it fails part-way
+                entered = True
+                _, secs = wait_ready(15)
+                note(f"autoconnect off: ready {secs:.1f} s after the restart (live flag)")
+                # 1. The cable out: the open is refused and offered.
+                ask(f"Pull {SERIAL}'s cable (waiting up to {MANUAL_WAIT} s).")
+                _, secs = wait_until(f"{SERIAL} off adb (cable pulled)", MANUAL_WAIT,
+                                     lambda: adb_state(SERIAL) != "device", interval=0.2)
+                note(f"phone off adb after {secs:.1f} s")
+                wait_until("lanternd sees the phone unplugged", 15,
+                           lambda: not phone_status(SERIAL).get("plugged"), interval=0.5)
+                time.sleep(1)  # its (0 ms) grace has ended: nothing closes the offer below
+                before = len(mon.notifies())
+                r = subprocess.run([LANTERN, "open", "--phone", SERIAL, SETTINGS],
+                                   capture_output=True, text=True, timeout=5)
+                note(f"lantern open --phone {SERIAL} {SETTINGS}: exit {r.returncode}")
+                check(r.returncode == 1, f"lantern open exited {r.returncode}, want 1")
+                got, secs = wait_until(f"Notify {offer!r}", 5,
+                                       lambda: mon.matching(offer, before), interval=0.2)
+                note(f"Notify {offer!r} {secs:.1f} s after the open; actions {got[0][1]}")
+                check("connect" in got[0][1][::2], f"no `connect` action: {got[0][1]}")
+                # 2. Back on adb: the plugged-in notice names Settings.
+                ask(f"Plug {SERIAL} back in (waiting up to {MANUAL_WAIT} s).")
+                wait_back_on_adb(SERIAL)
+                calls, secs = wait_until(f"Notify {plugged!r}", 15, lambda: [
+                    c for c in mon.calls()
+                    if c["member"] == "Notify" and c["summary"] == plugged], interval=0.2)
+                body = calls[-1]["body"]
+                note(f"Notify {plugged!r} {secs:.1f} s after the phone came back: {body!r}")
+                check("Settings" in body, f"the plugged-in notice doesn't name Settings: {body!r}")
+                check("connect" in calls[-1]["actions"][::2],
+                      f"no `connect` action: {calls[-1]['actions']}")
+                # 3. Sahaj clicks Connect: the click carries the app.
+                ask(f"Click Connect on {plugged!r} (waiting up to {MANUAL_WAIT} s).")
+                line, secs = wait_journal(
+                    r'Connect clicked.*open=Some\(\("com\.android\.settings", 0\)\)',
+                    since, MANUAL_WAIT)
+                note(f"journal: {line} ({secs:.1f} s)")
+                # 4. Ready, and Settings opens once.
+                _, secs = wait_ready(20)
+                note(f"ready {secs:.1f} s after the click")
+                want = f"resourceClass={app_id_of(SETTINGS)} "
+                lines, secs = wait_until(
+                    "the Settings window", 20,
+                    lambda: [l for l in kwin_on(SETTINGS, DESCRIBE, "lantern_describe")
+                             if l.startswith(want)])
+                note(f"{lines[0]} ({secs:.1f} s after ready)")
+                time.sleep(10)
+                wins = settings_windows()
+                check(len(wins) == 1, f"{len(wins)} Settings windows after 10 s: {wins}")
+                close_settings()
+                note("Settings closed through KWin")
+                ok = True
+            finally:
+                steps = [("close Settings", close_settings),
+                         ("restore settings.toml", restore_file)]
+                if entered:
+                    steps.append(("restore lanternd's environment",
+                                  lambda: env.__exit__(None if ok else Fail, None, None)))
+                if not ok:
+                    steps.append(("lantern connect", lambda: lantern_connect_when_up()))
+                steps.append(("lanternd ready", lambda: wait_ready(20)))
+                cleanup(ok, *steps)
+
+    def notices_close_on_quit(self):
+        """Item 34 (automatic, single phone): with the phone disconnected in Lantern, `lantern
+        open --phone SERIAL com.android.settings` exits 1 and lanternd shows "Connect your
+        <phone>"; `systemctl restart` of lanternd closes it: within 5 s the monitor logs a
+        CloseNotification with the id the server returned for that Notify."""
+        summary = f"Connect your {device_name()}"
+        ok = False
+        try:
+            with NotifyMonitor("34") as mon:
+                # 1. Disconnected in Lantern.
+                note(f"lantern disconnect {SERIAL}: {lantern_cmd('disconnect', SERIAL)}")
+                wait_until("phone restored", 5, lambda: restored(phone_state()), interval=0.2)
+                # 2. The open is refused and offered.
+                before = len(mon.calls())
+                r = subprocess.run([LANTERN, "open", "--phone", SERIAL, SETTINGS],
+                                   capture_output=True, text=True, timeout=5)
+                note(f"lantern open --phone {SERIAL} {SETTINGS}: exit {r.returncode}")
+                check(r.returncode == 1, f"lantern open exited {r.returncode}, want 1")
+                calls, secs = wait_until(f"Notify {summary!r} and its id", 5, lambda: [
+                    c for c in mon.calls()[before:]
+                    if c["member"] == "Notify" and c["summary"] == summary
+                    and c["id"] is not None], interval=0.2)
+                nid = calls[-1]["id"]
+                note(f"Notify {summary!r} id {nid} {secs:.1f} s after the open")
+                # 3. lanternd stops (and starts again).
+                t0 = time.monotonic()
+                systemctl("restart", UNIT)
+                note(f"lanternd restarted in {time.monotonic() - t0:.1f} s")
+                # 4. Its notice was closed.
+                _, secs = wait_until(f"CloseNotification {nid}", 5, lambda: [
+                    c for c in mon.calls()
+                    if c["member"] == "CloseNotification" and c["id"] == nid], interval=0.2)
+                note(f"CloseNotification {nid} seen {time.monotonic() - t0:.1f} s after the "
+                     "restart began")
+            ok = True
+        finally:
+            # 5. Connected again, lanternd ready.
+            cleanup(ok, ("lantern connect", lambda: lantern_connect_when_up()),
+                    ("lanternd ready", lambda: wait_ready(20)))
 
 
 ITEMS = [
@@ -3083,13 +3281,15 @@ ITEMS = [
     "one_phone_failure_isolated",
     "unplug_one_keeps_other",
     "lock_one_keeps_other",
+    "replug_keeps_requested_app",
+    "notices_close_on_quit",
 ]
-# Need a person: pull the cable (8, 14, 24, 25, 31), type the phone's PIN (21, 27, 32) or click
-# Connect (26).
+# Need a person: pull the cable (8, 14, 24, 25, 31, 33), type the phone's PIN (21, 27, 32) or
+# click Connect (26, 33).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt",
           "autoconnect_on_remembers_off", "autoconnect_off_asks_on_plug",
           "connect_from_entry_opens_app", "unlock_prompt_at_connect", "unplug_one_keeps_other",
-          "lock_one_keeps_other"}
+          "lock_one_keeps_other", "replug_keeps_requested_app"}
 # Run only with --pair (inside `two_phones`); a --pair run selects only these.
 PAIR = {"two_phones_live", "clipboard_fans_out", "one_phone_failure_isolated",
         "unplug_one_keeps_other", "lock_one_keeps_other"}
@@ -3139,6 +3339,11 @@ STEPS = {
     "lock_one_keeps_other": [
         "When 'Unlock your edge 50 pro' shows, click Enter PIN… and type the PIN.",
     ],
+    "replug_keeps_requested_app": [
+        "Pull the Xiaomi's cable.",
+        "When 'Connect your Xiaomi 11T Pro' shows, plug the phone in.",
+        "On 'Xiaomi 11T Pro is plugged in', click Connect.",
+    ],
 }
 
 
@@ -3172,7 +3377,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manual", action="store_true",
-                    help="also run items 8, 14, 21, 24-27 and 31 (USB unplug/replug, "
+                    help="also run items 8, 14, 21, 24-27, 31-33 (USB unplug/replug, "
                          "typing the PIN, clicking Connect; prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
     ap.add_argument("--only", nargs="*", help="run only these items (numbers or names)")

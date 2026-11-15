@@ -460,3 +460,146 @@ async fn without_a_server_it_never_reports_healthy() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(!rig.health.healthy());
 }
+
+/// Decision 18: a replug while "Connect your Pixel" is shown keeps the offered app. The new
+/// notice replaces the offer, names the app, and its Connect opens it.
+#[tokio::test]
+async fn plugged_in_keeps_the_offered_app() {
+    let mut rig = Rig::start(true).await;
+    rig.send(ConnectEvent::OpenRefused {
+        serial: "dev".into(),
+        name: "Pixel".into(),
+        app: "Files".into(),
+        pkg: "com.x".into(),
+        user: 0,
+    })
+    .await;
+    let first = rig.notify_id(1).await;
+    rig.send(plugged("dev", "Pixel")).await;
+    let id = match rig.notify(2).await {
+        Call::Notify {
+            id,
+            replaces,
+            summary,
+            body,
+            actions,
+            ..
+        } => {
+            assert_eq!(replaces, first);
+            assert_eq!(summary, "Pixel is plugged in");
+            assert_eq!(body, "Connect it to open Files here.");
+            assert_eq!(actions, ["connect", "Connect"]);
+            id
+        }
+        _ => unreachable!(),
+    };
+    rig.click(id, "connect").await;
+    assert_eq!(
+        rig.next_command().await,
+        Command::Connect {
+            serial: "dev".into(),
+            open: Some(("com.x".into(), 0))
+        }
+    );
+    rig.wait_closed(id).await;
+}
+
+#[test]
+fn plugged_with_app_notice_escapes_the_body_only() {
+    assert_eq!(
+        connect::plugged_with_app_notice("A&B", "<X>"),
+        (
+            "A&B is plugged in".to_owned(),
+            "Connect it to open &lt;X&gt; here.".to_owned()
+        )
+    );
+}
+
+/// A plug-in with no offer on screen (or after one was answered) is the plain notice.
+#[tokio::test]
+async fn plugged_in_without_an_offer_is_unchanged() {
+    let mut rig = Rig::start(true).await;
+    // Another phone's offer doesn't count.
+    rig.send(refused("b", "Moto")).await;
+    rig.notify_id(1).await;
+    rig.send(plugged("dev", "Pixel")).await;
+    let id = match rig.notify(2).await {
+        Call::Notify {
+            id, replaces, body, ..
+        } => {
+            assert_eq!(replaces, 0);
+            assert_eq!(body, PLUGGED_BODY);
+            id
+        }
+        _ => unreachable!(),
+    };
+    // A plug-in replacing a plain plug-in stays plain.
+    rig.send(plugged("dev", "Pixel")).await;
+    match rig.notify(3).await {
+        Call::Notify { replaces, body, .. } => {
+            assert_eq!(replaces, id);
+            assert_eq!(body, PLUGGED_BODY);
+        }
+        _ => unreachable!(),
+    }
+    rig.click(id, "connect").await;
+    assert_eq!(
+        rig.next_command().await,
+        Command::Connect {
+            serial: "dev".into(),
+            open: None
+        }
+    );
+    // An offer closed by Gone is forgotten: the next plug-in is plain.
+    rig.send(refused("dev", "Pixel")).await;
+    rig.notify_id(4).await;
+    rig.send(gone("dev")).await;
+    rig.send(plugged("dev", "Pixel")).await;
+    match rig.notify(5).await {
+        Call::Notify { replaces, body, .. } => {
+            assert_eq!(replaces, 0);
+            assert_eq!(body, PLUGGED_BODY);
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Decision 15: when lanternd stops (its events sender dropped), every notice on screen is
+/// closed before `run` returns.
+#[tokio::test]
+async fn notices_close_when_events_end() {
+    let mut rig = Rig::start(true).await;
+    rig.send(plugged("dev", "Pixel")).await;
+    let a = rig.notify_id(1).await;
+    rig.send(refused("b", "Moto")).await;
+    let b = rig.notify_id(2).await;
+    // A closed notice isn't closed twice.
+    rig.send(ConnectEvent::PlugIn {
+        serial: "c".into(),
+        name: "Edge".into(),
+        app: None,
+    })
+    .await;
+    let c = rig.notify_id(3).await;
+    rig.send(gone("c")).await;
+    rig.wait_closed(c).await;
+    rig.events.take();
+    let task = std::mem::replace(&mut rig.task, tokio::spawn(async { Ok(()) }));
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("run did not end")
+        .unwrap()
+        .unwrap();
+    let mut closes: Vec<u32> = rig
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Close(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    closes.sort();
+    let mut want = vec![a, b, c];
+    want.sort();
+    assert_eq!(closes, want, "{:?}", rig.calls());
+}

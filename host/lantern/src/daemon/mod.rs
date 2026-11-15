@@ -106,11 +106,18 @@ where
 }
 
 /// How long a phone's due start waits for its previous session's close to finish. A close is
-/// bounded (~5 s, `SessionConn::close`); one still running then is aborted first.
+/// bounded, but can take ~16 s (`SessionConn::close`: the Bye and both socket halves, then the
+/// adb forward removal and the helper's exit, each with its own timeout); one still running
+/// after this hold is aborted first. If the abort lands before it removed its adb forward, the
+/// next start's stale-forward sweep removes that forward.
 const CLOSE_HOLD: Duration = Duration::from_secs(5);
 
 /// How long quitting waits for the closes still running; the rest are aborted.
 const CLOSE_CAP: Duration = Duration::from_secs(10);
+
+/// How long quitting waits for the connect and unlock prompts to close their notices (decision
+/// 15), once the run loop has dropped their event senders.
+const SHUTDOWN_NOTICES: Duration = Duration::from_secs(3);
 
 /// A session close running in the background.
 struct Close {
@@ -1474,8 +1481,13 @@ pub async fn run() -> Result<()> {
     let (pin_tx, pin_rx) = mpsc::channel::<(String, unlock::Pin)>(1);
     let (lock_tx, lock_rx) = mpsc::channel(16);
     let prompt = crate::unlock::spawn(lock_rx, view_rx.clone(), pin_tx).await;
+    // The prompts' tasks: quitting waits for them to close their notices.
+    let mut prompts = Vec::new();
     let (unlock, lock_events, request) = match prompt {
-        Some((_, request)) => (Some(pin_rx), Some(lock_tx), Some(request)),
+        Some((task, request)) => {
+            prompts.push(task);
+            (Some(pin_rx), Some(lock_tx), Some(request))
+        }
         None => (None, None, None),
     };
     // The connect prompt on its own bus connection: "plugged in" / "Connect your …" / "Plug in
@@ -1485,7 +1497,10 @@ pub async fn run() -> Result<()> {
     let connect_health = crate::connect::Health::new();
     let (connect_events, connect_health) =
         match crate::connect::spawn(connect_rx, cmd_tx.clone(), connect_health.clone()).await {
-            Some(_) => (Some(connect_tx), Some(connect_health)),
+            Some(task) => {
+                prompts.push(task);
+                (Some(connect_tx), Some(connect_health))
+            }
             None => (None, None),
         };
     // The tray's Unlock row asks the same prompt (it never runs the dialog or sees a PIN).
@@ -1498,50 +1513,89 @@ pub async fn run() -> Result<()> {
         tracing::info!(ms, "unplug grace from LANTERN_UNPLUG_GRACE_MS");
         timing.unplug_grace = Duration::from_millis(ms);
     }
-    serve_with(
+    let parts = Parts {
+        catalog,
+        clipboard: Some(clipboard),
+        settings: Some(settings),
+        names: Some(companion::names()),
+        undo: Some(undo_runner()),
+        notify: Some(Arc::new(|summary: &str, body: &str| {
+            crate::notify::send(summary, body, None)
+        })),
+        commands: Some(cmd_rx),
+        view: Some(view_tx),
+        unlock,
+        lock_events,
+        state_dir: companion::state_dir(),
+        timing,
+        // Setting this also turns opens for a phone that isn't connected into offers
+        // (`CONNECT_OFFERED`), while the prompt's notifications get through.
+        connect_events,
+        connect_health,
+        opener: opener(),
+    };
+    // Read at each session start: a changed `lantern_keyboard` or `screen_off` applies from the
+    // next one.
+    let starter = move |serial| {
+        let setup = setup.clone();
+        let settings = session_settings.get();
+        let (keyboard, screen_off) = (settings.lantern_keyboard, settings.screen_off);
+        async move { start_with_companion(&Adb::new(serial), &setup, keyboard, screen_off).await }
+    };
+    let result = serve_with(
         listener,
-        Parts {
-            catalog,
-            clipboard: Some(clipboard),
-            settings: Some(settings),
-            names: Some(companion::names()),
-            undo: Some(undo_runner()),
-            notify: Some(Arc::new(|summary: &str, body: &str| {
-                crate::notify::send(summary, body, None)
-            })),
-            commands: Some(cmd_rx),
-            view: Some(view_tx),
-            unlock,
-            lock_events,
-            state_dir: companion::state_dir(),
-            timing,
-            // Setting this also turns opens for a phone that isn't connected into offers
-            // (`CONNECT_OFFERED`), while the prompt's notifications get through.
-            connect_events,
-            connect_health,
-            opener: opener(),
-        },
+        parts,
         configured,
         track_devices(),
-        move |serial| {
-            let setup = setup.clone();
-            // Read at each session start: a changed `lantern_keyboard` or `screen_off` applies
-            // from the next one.
-            let settings = session_settings.get();
-            let (keyboard, screen_off) = (settings.lantern_keyboard, settings.screen_off);
-            async move {
-                start_with_companion(&Adb::new(serial), &setup, keyboard, screen_off).await
-            }
-        },
+        starter,
         shutdown,
         RetryPolicy::default(),
     )
-    .await
+    .await;
+    // Quit or a signal: the run loop dropped every event sender with the hub and the controls,
+    // so the prompts close their notices and end (decision 15).
+    close_prompts(prompts, SHUTDOWN_NOTICES).await;
+    result
+}
+
+/// Waits for the prompts' tasks to end (they close their notices first), at most `cap`; one
+/// still running then is left to the runtime's end.
+async fn close_prompts(prompts: Vec<tokio::task::JoinHandle<()>>, cap: Duration) {
+    if prompts.is_empty() {
+        return;
+    }
+    let all = futures_util::future::join_all(prompts);
+    if tokio::time::timeout(cap, all).await.is_err() {
+        tracing::warn!(?cap, "the prompts did not close their notices in time");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision 15: quitting waits for the prompts to end, but never longer than its cap.
+    #[tokio::test]
+    async fn close_prompts_waits_within_its_cap() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let quick = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(());
+        });
+        let t0 = std::time::Instant::now();
+        close_prompts(vec![quick], Duration::from_secs(3)).await;
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        rx.await.expect("the prompt ran to its end");
+        let hung = tokio::spawn(std::future::pending::<()>());
+        let t0 = std::time::Instant::now();
+        close_prompts(vec![hung], Duration::from_millis(300)).await;
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        close_prompts(Vec::new(), Duration::from_secs(3)).await;
+    }
 
     #[test]
     fn exit_code_separates_protocol_mismatch_from_runtime_failures() {
