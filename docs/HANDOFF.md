@@ -1,4 +1,4 @@
-# Lantern — handoff (end of Plan 4b, 2026-11-15)
+# Lantern — handoff (Plan 4c implemented, 2026-11-15)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -57,6 +57,19 @@ Start here in a new session. Read this file, then `README.md`, then the spec
     migration). Since then every test that spawns `lantern` uses scratch XDG dirs (incl. cache),
     a dead session bus and stubbed `kbuildsycoca6`/`notify-send`/`kdialog` with asserted markers,
     and every task checked a before/after fingerprint of his real files (identical).
+- **Plan 4c** (`docs/superpowers/plans/2026-11-15-lantern-many-phones.md`, design
+  `docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md` G6–G8 and the 2026-11-15
+  addendum: G9 and the Plan 4b rough edges): **implemented, device acceptance pending**, on
+  branch `plan4c-many-phones` (worktree `.worktrees/plan4c`, base `main` `5a9ab86`). Device steps
+  were deferred by Sahaj's instruction to one acceptance run at the end (Task 8 Steps 2–8, see
+  "Plan 4c device acceptance"). Task 1 passed review after one fix round; Tasks 2–7 passed
+  without one, with binding follow-ups (rulings R6–R10) folded into the next task each time.
+  Ruling R10's four fixes and these docs are Task 8's code part.
+  - Host: `cargo test --workspace --offline` 547 passed (2026-11-15); clippy `-D warnings` and
+    `cargo fmt --check` clean; `tools/test_device_test.py` 28 passed.
+  - The SDD ledger and per-task reports are in the worktree's gitignored
+    `.superpowers/sdd/2026-11-15-lantern-many-phones/` (copy it to the main checkout before
+    removing the worktree).
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
 Lantern is **installed and running** on the PC from the **Plan 4b** branch build (2026-11-14;
@@ -65,6 +78,15 @@ same code as `main` after the merge): `~/.local/bin/lantern`, user unit `lantern
 is switched on from its tray row. While connected it is kept awake, the Lantern keyboard is
 selected, and its screen stays on unless `screen_off = true`. Each phone's apps are a top-level
 category in the launcher, named after the phone.
+
+### Plan 4c device acceptance (pending)
+
+_Placeholder: the controller fills this in after the run (Task 8 Steps 2–8): Pass A (`build.py
+install && device_test.py`, expected 21/21: items 1–7, 9–13, 15–20, 22, 23, 34), Pass B
+(`--pair --only 28 29 30`, expected 3/3), the manual items (8, 14; `--pair` 31, 32; the
+Motorola's 27, 21; with the Motorola unplugged 24, 25, 26, 33) and the hand checks (two checked
+tray rows, the Remove dialog's escaped name, two taskbar groups, both phones' settings
+restored)._
 
 ### Plan 4b device acceptance (2026-11-14/15, desktop unlocked)
 
@@ -233,9 +255,9 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
    first with a probe.
 
 ### Still unverified
-- **All of Plan 4b on a device** (pending acceptance above): the real menu migration, per-phone
-  folders in Kickoff, the tray switchboard, the plugged-in / Connect-your notifications on
-  Plasma, the unplug grace on a real cable, and a two-phone switch.
+- **All of Plan 4c on a device** (pending acceptance above): two live sessions at once, the
+  clipboard fan-out, unlock per phone, G9's prompt at connect, a replug keeping an offered app,
+  notices closing when lanternd stops, and the PIN dialog killed at stop (R10).
 - The Motorola work-profile catalogue, badged icons and the `Files (work)` title (Task 5/6/10).
 - Typing on the real desktop: real focus, a physical `abc`, and any real PC input method (none
   runs on this PC: no ibus, no fcitx5). The composition path ran only through `LANTERN_DEBUG_INPUT`
@@ -373,6 +395,77 @@ by Plan 4a (device-checked 2026-11-13); 2 and 3 are not fixed and stay on the Pl
   "Lantern set up your phone" the first time (record in `~/.local/state/lantern/devices/`). A
   failed install leaves a session without the companion and one notification per daemon run.
 
+## Plan 4c decisions (Sahaj may override)
+The design (`docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md`, G6–G9) left these
+to the builder; the plan's numbering:
+
+1. **Window ids** come from one registry for lanternd's lifetime: unique across phones, never
+   reused within a run. Single-instance focus keys on `serial|pkg:user`.
+2. **`lantern status` top level** describes the *default phone*: the phone whose session came up
+   most recently in this run; else `starting` for the first phone in view order whose start is
+   in flight, else `paused`, else `idle`. `windows[]` entries gain an optional `phone`.
+3. **An `open` without `phone`** (old pins, hand-typed commands) goes to the default phone, with
+   Plan 3's "app not on this phone" check against it.
+4. **Connect rules:** `on_plug` lost its `wanted` argument. A `live` phone connects, and so does
+   a phone with autoconnect on and not `off`, whatever else is live. Plan 4b decision 4 and the
+   tray's row 15 ("Lantern connects one phone at a time") are retired; id 15 is never reused.
+5. **Pending connect-and-open requests are independent per phone.** A choice for one phone no
+   longer drops another phone's request. Disconnect and Undo drop that phone's own.
+6. **Undo:** one at a time. Commands for other phones run normally during it. A Connect for the
+   phone being undone, and an Undo of a second phone, are refused with a notification saying why.
+7. **Clipboard fan-out goes through the PC selection:** a phone copy reaches the other phones when
+   its own PC selection event comes back. Without a PC clipboard phone copies reach no other
+   phone. Phone texts in flight to the PC (at most 8) make a stale echo go nowhere and keep a
+   burst from echoing a copy back to its source.
+8. **Fan-out sends** `try_send` to every live helper first; helpers whose queue is full share one
+   1 s wait. A wedged helper ends only its own session.
+9. **G9 is helper-side:** at session-up the helper reads its lock on its `lantern-clip` thread
+   and, if sure it is locked, opens a stretch with `locked{reason:"session"}`. lanternd shows the
+   usual "Unlock your {name}". A swipe phone reads `deviceLocked=0` and never prompts. Each new
+   helper session checks once.
+10. **Unlock dialogs:** a click for phone B while A's dialog is open is queued, at most one per
+    phone, and B's dialog opens when A's closes if B is still in that stretch.
+11. **A PIN is sent only to a phone whose session is up and whose lock stretch is open**
+    (`Hub::send_unlock`); the prompt pins a dialog to its stretch's serial.
+12. **`adb forward tcp:0`:** each session takes the port adb chose (no free-port race).
+13. **The companion-install failure notice** is once per phone per run.
+14. **The start-up stale-live check** runs once adb's first device list was handled and the grace
+    passed, or at the latest grace + 30 s after start.
+15. **Notices on exit:** when lanternd stops (Quit or a signal), the connect and unlock prompts
+    close every notification they show; lanternd waits at most 3 s for that.
+16. **kdialog texts** (the Remove confirm and the PIN dialog) are `<qt>…</qt>` with the phone name
+    escaped.
+17. **A `menu.json` rerun** picks as primary the serial that owns the most per-phone entries at
+    legacy (unsuffixed) stems, before the pin/entry rules.
+18. **A replug keeps an offered app:** a `PluggedIn` that replaces a shown "Connect your {name}"
+    keeps its app; its body names the app and its Connect opens it.
+19. **Tray tooltip** with several live phones: `Connected to {a} and {b}`, or `Connected to {n}
+    phones` for three or more; a live phone that isn't ready shows first.
+20. **Suite:** `--pair` runs the two-phone items. The second phone is `LANTERN_OTHER_SERIAL`, else
+    the only other attached phone. Manual waits last `LANTERN_MANUAL_WAIT` (default 3600 s), and
+    the suite never reads stdin.
+
+Also settled during execution (ledger rulings):
+- **R1/R4:** device steps deferred to one acceptance run, verified from the lanternd journal and
+  logcat (never `adb reconnect`, no tight interactive waits).
+- **R3:** host-test isolation binding for every task (scratch XDG, dead or private bus, stubbed
+  desktop tools with markers, fingerprint of Sahaj's real files before and after).
+- **R5:** a replug inside the unplug grace during items 8/14 fails at once ("plugged back within
+  the unplug grace; redo with the cable out >= 15 s").
+- **R6:** a catalogue tag is taken by another open sync window with the same tag too (the first
+  window keeps it).
+- **R8:** a phone's restart waits for its own background close (at most 5 s, then that close is
+  aborted), so an old close can't remove a same-port new forward; quitting aborts closes still
+  running after 10 s.
+- **R9:** phone names escaped in the tray tooltip body; a failed `unlock_result` after its stretch
+  ended is only logged; a queued unlock click is dropped when that phone unlocks.
+- **R10:** Disconnect and the start of an Undo send the connect prompt `Gone` for that phone (its
+  notice closes and an offered app is dropped); a PIN dialog still open when lanternd stops is
+  killed (an async `kill_on_drop` child read into a wiping buffer) instead of holding the
+  runtime's shutdown up to systemd's 90 s; `device_test.py`'s `busctl monitor` parser reads header
+  keys from header lines only, and item 33 waits on the journal's `unplugged (offline past the
+  grace)` instead of sleeping.
+
 ## Plan 4b decisions (Sahaj may override)
 The design (`docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md`) left these to
 the builder; the plan's numbering:
@@ -396,9 +489,11 @@ the builder; the plan's numbering:
 3. **`live` is cleared by** a real unplug (absent past the grace), unchecking, Undo, being
    switched away for another phone (or left waiting while another connects, R5), the tray's
    **Quit**, and lanternd starting while that phone stays absent for the whole grace.
-   SIGTERM/SIGINT keep it.
-4. **With autoconnect on and another phone live,** a newly plugged phone is not connected but
-   gets "… is plugged in", so one click switches to it.
+   SIGTERM/SIGINT keep it. (Plan 4c: there is no switching away any more, so those two cases are
+   gone; Quit clears every phone's `live`.)
+4. ~~**With autoconnect on and another phone live,** a newly plugged phone is not connected but
+   gets "… is plugged in", so one click switches to it.~~ **Superseded by Plan 4c decision 4:**
+   it connects; other live phones keep their sessions.
 5. **`LANTERN_SERIAL`:** lanternd ignores every other serial (not listed, never prompted or
    started); CLI commands naming another serial are refused with "phone <s> is not served:
    lanternd serves only <c> because LANTERN_SERIAL=<c> is set". The bypass applies when the
@@ -416,8 +511,10 @@ the builder; the plan's numbering:
    only the `--phone` phone).
 10. **The two-minute request** opens the app once (`lantern open --phone S [--user N] -- pkg`)
     when S's session becomes ready. The latest phone choice drops every other phone's request
-    (R5); Disconnect/Undo drop that phone's own.
-11. **The tray's one-at-a-time note** (row 15) shows while two or more phones are listed.
+    (R5); Disconnect/Undo drop that phone's own. (Plan 4c decision 5: requests are now
+    independent per phone.)
+11. ~~**The tray's one-at-a-time note** (row 15) shows while two or more phones are listed.~~
+    **Superseded by Plan 4c decision 4:** row 15 is retired and its id never reused.
 
 Also settled during execution (ledger rulings):
 - **R3:** `update_record` takes an flock on `devices/.lock` around its read-modify-write, so a
@@ -490,24 +587,17 @@ Also settled during execution (ledger rulings):
 - **Cargo.lock** offline-resolution downgrades (clap, wasm-bindgen, js-sys, toml_edit, winnow)
   were accepted for `zbus`/`toml` (Ruling R7); re-resolve when online.
 
-## Next: Plan 4c (not yet written)
+## Next
 
-After Plan 4b's device acceptance and merge, write **Plan 4c** from the same design
-(`docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md`, "Several sessions (G6–G8)")
-with superpowers:writing-plans, and run it with superpowers:subagent-driven-development:
-
-- **G6. Several phones live at once:** every checked phone gets its own session (helper, adb
-  forward, retry backoff, companion state, lock state, journal, restore); window ids unique
-  across phones; single-instance focus keyed on phone + package + user; Plan 4b's "checking one
-  phone switches the other off" rule is removed. 4b's data shapes are already per phone (records,
-  desktop files, app_id/`windows.json` keys, tray rows, `open.phone`, `View.phones`,
-  `status_report.phones`), so 4c adds sessions.
-- **G7. Clipboard with several phones:** a PC copy goes to every live phone, a phone copy to the
-  PC and on to the others, never echoed back to its source; per-phone echo suppression and
-  held copies.
-- **G8. Unlock per phone:** each phone's own lock stretch and notification; one PIN dialog at a
-  time across phones; Plan 4a's serial pinning unchanged.
-- Undo acts on the named phone without touching other live sessions.
+1. **Plan 4c device acceptance** (Task 8 Steps 2–8 of the plan, with Sahaj): back up the real
+   launcher files, menu fragments, Lantern state and settings; ask before `build.py install` if
+   `lantern status` shows windows he is using; give him every step in one message; run Pass A,
+   Pass B, the manual items one at a time and the hand checks; verify from the lanternd journal
+   and logcat. Every wrong PIN counts toward the Motorola's lockout. Then fill in "Plan 4c device
+   acceptance" above and commit `docs: Plan 4c acceptance, protocol and README updates`.
+2. Final whole-branch review (triage every `minor (deferred)` ledger line), then merge
+   `plan4c-many-phones` into `main` (fast-forward), copy the SDD ledger to the main checkout and
+   fix "Where things stand".
 
 Still open from earlier lists (later plans):
 
@@ -638,7 +728,7 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
   - It logs every `ime` dropped before the IME is created; `LinkReceiver` is misnamed (it only
     toggles TestActivity).
 - **Daemon**
-  - `Bye` is rarely sent. Race between picking a free port and `adb forward` (use `tcp:0`).
+  - `Bye` is rarely sent. (The free-port race is fixed in Plan 4c: `adb forward tcp:0`.)
   - A second SIGINT during teardown is ignored; teardown can take up to about 16 s.
   - A synchronous adb call in `Drop` can stall a worker for up to 2 s.
   - No `flock` to stop two daemons running. ANSI colour codes end up in the journal.
@@ -680,7 +770,6 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
   - Phone names and "Connect your …":
     - `read_phone_name` keeps trying after an adb error (worst case about 40 s added to the
       session start); stop on the first error (`companion.rs`).
-    - Phone names go unescaped into the notify-send body (Plasma markup: `&`, `<`, `>`).
     - ~~The device record's name temp file isn't fsynced before the rename~~ (fixed in Plan 4b
       Task 1: `write_atomic`).
     - The window's "here" phone can be wrong if the session changes between the refusal and its
@@ -705,7 +794,8 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
       Undoing).
     - After an undo with the phone unplugged and another phone online, the other phone waits for
       the next device event.
-    - A first-online phone stuck in start backoff keeps a second phone from starting.
+    - ~~A first-online phone stuck in start backoff keeps a second phone from starting~~ (gone
+      in Plan 4c: every phone has its own run).
   - Tray:
     - Repeated Undo clicks open several kdialogs (the daemon refuses the extra ones while
       undoing).
@@ -730,19 +820,15 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
       another display if the hidden API fails).
     - `displayIdOf`/`requireBound` wiring is untested on the host (the rule fails closed).
   - Daemon unlock:
-    - Unwiped PIN copies (`SecretPin` String, the encoded frame `Vec`, `Command::output`
-      buffers): memory only, never logged; consider a wiping `Drop` on `SecretPin`.
+    - Unwiped PIN copies (`SecretPin` String, the encoded frame `Vec`): memory only, never
+      logged; consider a wiping `Drop` on `SecretPin`. (The dialog's stdout is read into a
+      wiping buffer since Plan 4c R10.)
     - Any open error while locked is rewritten to "phone locked" and queued for reopen.
-    - The stretch-ended check is best-effort (`select!` not biased): a PIN can still be sent to
-      the same phone after it unlocked (the helper answers "already unlocked" and types
-      nothing). Fix: `drive` also requires `hub.locked()` before `send_unlock`.
   - Docs (fixed in Task 4): protocol.md's "unknown counts as unlocked" wording and the
     `unlock_result` reasons.
 - **Plan 4b** (`minor (deferred)` in the Plan 4b SDD ledger, for the final review's triage; none
   leaves the phone changed)
   - Catalogue and migration:
-    - A corrupt or deleted `menu.json` reruns the migration, which may pick another primary and
-      give duplicate entries (prefer the serial that already owns the legacy stems).
     - The `keep_old` comment overstates; a kept shared file is invisible in the menu
       (`Categories=X-Lantern` only).
     - Colliding tags: a folder file carrying another serial's marker can be deleted later in the
@@ -761,8 +847,6 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
       of resuming it.
     - An open naming a phone that is already connecting gets "Connect your A" and is lost if not
       clicked; store a pending open instead.
-    - Notices are not closed when lanternd quits.
-    - A Connect click during that phone's Undo is dropped silently.
     - Fixed in Task 7: CLI commands for other serials under `LANTERN_SERIAL` now get an explicit
       error saying why (was a misleading "not plugged in or known", and protocol.md said
       "ignored").
@@ -777,6 +861,34 @@ fsync, prune after the wait) were fixed in Plan 2 Task 1.
     - No-runtime scratch dirs left behind; `scratch_xdg` also on usage-error spawns.
     - The ignored test `failed_open_prints_the_error_once_and_exits_1` uses the real Wayland
       session and bus.
+- **Plan 4c** (`minor (deferred)` in the Plan 4c SDD ledger, for the final review's triage; none
+  leaves the phone changed). Fixed by Plan 4c (and removed above where listed): the first-list cap on the
+  start-up check, the `menu.json` rerun, notices on quit, a Connect during Undo, escaped bodies,
+  a PIN after the stretch, the free-port race, and item 8's whole-buffer logcat read.
+  - Helper: `LockWatch.checkNow`'s pre-check and `onLocked` are not atomic across the read, so a
+    brief stale `"session"` prompt can follow an unlock (fix: a stretch counter). The session-up
+    `dumpsys trust` read (up to 3 s) delays the first clipboard callbacks on `lantern-clip`.
+  - Daemon:
+    - Clipboard: a real PC copy equal to an older in-flight phone text whose echo never came
+      back, while a newer phone text is in flight, is dropped as a stale echo (bounded by the
+      cap of 8).
+    - adb noise on stdout before `forward tcp:0`'s port number fails the forward (take the last
+      numeric line).
+    - Undo requested again for the phone being undone is only logged (could notify).
+    - The connect prompt keeps its `shown` entry when the user dismisses a notice
+      (`NotificationClosed` isn't subscribed; `notices.rs` matches `ActionInvoked` only): a later
+      replug's notice still names the offered app. R10 (2), deferred because it needs new D-Bus
+      plumbing.
+  - Suite (`device_test.py`):
+    - Item 27 failing before the PIN leaves a fresh "Unlock your …" prompt after its cleanup
+      restarts lanternd (tell Sahaj).
+    - Item 31 doesn't check that lanternd saw the phone `unplugged` before the replug.
+  - Tests: `fake_adb`'s probe-port can be reused across parallel tests; no
+    `live_phone_gone_starts_nothing` variant with autoconnect on and the other phone `off`;
+    `wedged_helper_ends_only_its_own_session` pushes ~20 MB through loopback (heaviest ipc
+    test).
+  - Old lanternd with a new helper would never show a `"session"` stretch (can't happen: the
+    jar ships inside `lantern`).
 - **Tests**
   - Several tests rely on fixed sleeps or timing windows (fake_adb, fake_helper, ipc, the catalogue
     debounce, CompanionLink); some assert little (`setExtrasAcceptsHandler`, the ipc mismatch step,
