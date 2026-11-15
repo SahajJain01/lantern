@@ -1,4 +1,4 @@
-# Lantern — handoff (Plan 4b implemented, device acceptance pending, 2026-11-14)
+# Lantern — handoff (end of Plan 4b, 2026-11-15)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -37,18 +37,17 @@ Start here in a new session. Read this file, then `README.md`, then the spec
   `.superpowers/sdd/2026-11-13-lantern-unlock-prompt/`.
   - Host: `cargo test --workspace --offline` 341 passed, 1 ignored; clippy clean (2026-11-13).
 - **Plan 4b** (`docs/superpowers/plans/2026-11-14-lantern-phone-switchboard.md`, design
-  `docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md` G1–G5): **implemented on
-  branch `plan4b-phone-switchboard`** (worktree `.worktrees/plan4b`, base `main` `eda6412`),
-  **host tests passing, device acceptance pending** (Task 7 Steps 2–4, see "Plan 4b device
-  acceptance (pending)"). Device steps were deferred by Sahaj's instruction to one run at the
-  end. Tasks 1, 4 and 5 passed review without a fix round, Tasks 2 and 3 after one, Task 6 after
-  two; Task 7 (these docs plus three small ledger fixes: the `LANTERN_SERIAL` refusal text, the
-  Remove-cancel notice reason, the asserted fake kdialog) is the last. Not yet merged and not installed.
-  - Host: `cargo test --workspace --offline` all passing (see the Task 7 report for counts);
-    clippy `-D warnings` clean; `git diff --stat host/proto/golden` empty for the whole plan.
-  - The SDD ledger and per-task reports are in the worktree's gitignored
-    `.superpowers/sdd/2026-11-14-lantern-phone-switchboard/` (copy them to the main checkout
-    before `git worktree remove`).
+  `docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md` G1–G5): **done and merged
+  into `main`** (2026-11-15), device acceptance passed (see "Plan 4b device acceptance"). Device
+  steps were deferred by Sahaj's instruction to one run at the end. Tasks 1, 4 and 5 passed
+  review without a fix round, Tasks 2 and 3 after one, Task 6 after two; the final review's fix
+  wave and three acceptance fixes (start-up live check after the first adb list; one top-level
+  launcher category per phone, R9; manual-only replug) were each reviewed. The branch also
+  carries the `screen_off` setting (another session's commit `583da55`, reviewed, fix round
+  `c6104a4`).
+  - Host: `cargo test --workspace --offline` all passing; clippy `-D warnings` clean.
+  - The SDD ledger and per-task reports are in the main checkout's gitignored
+    `.superpowers/sdd/2026-11-14-lantern-phone-switchboard/`.
   - **Menu incident (Task 2, 2026-11-14):** a Task 2 test run spawned `lantern daemon` on the real
     XDG dirs and migrated Sahaj's real KDE menu (Exec lines pointed into the worktree), and a
     fake_adb undo test then deleted `lantern.menu` and `lantern-phone.directory`. It was restored
@@ -60,79 +59,50 @@ Start here in a new session. Read this file, then `README.md`, then the spec
     and every task checked a before/after fingerprint of his real files (identical).
 - The git remote is `origin` (`https://github.com/SahajJain01/lantern.git`, branch `main`).
 
-Lantern is **installed and running** on the PC from the **Plan 4a** branch build (2026-11-13; same code as `main` `08b974b`); the Plan 4b build is not installed yet (its first `build.py install` migrates the real menu):
-`~/.local/bin/lantern`, user unit `lanternd.service` (enabled). When the phone is plugged in, its
-screen turns off, the Lantern keyboard is selected, and its apps are in the KDE menu under
-**Phone**. (From the Plan 4b build on, the phone's screen stays on unless `screen_off = true` in
-settings.toml or the tray's "Turn the phone's screen off" is ticked.)
+Lantern is **installed and running** on the PC from the **Plan 4b** branch build (2026-11-14;
+same code as `main` after the merge): `~/.local/bin/lantern`, user unit `lanternd.service`
+(enabled). Autoconnect is off: a plugged-in phone shows "<phone> is plugged in" with Connect, or
+is switched on from its tray row. While connected it is kept awake, the Lantern keyboard is
+selected, and its screen stays on unless `screen_off = true`. Each phone's apps are a top-level
+category in the launcher, named after the phone.
 
-### Plan 4b device acceptance (pending: plan Task 7 Steps 2–4)
+### Plan 4b device acceptance (2026-11-14/15, desktop unlocked)
 
-Run in `.worktrees/plan4b` with Sahaj, the desktop **unlocked**. `build.py install` restarts
-lanternd from the Plan 4b build: stay-awake reads 7 on the served phone, and its panel stays on
-unless `screen_off = true` in settings.toml (default false). Ask first if `lantern status` shows
-windows he is using.
-
-1. **Migration check (Step 3), before the install.** Save the real menu and pins:
-   ```sh
-   S=~/.hermes/cache/scratch/plan4b-menu-before; mkdir -p $S
-   cp -p ~/.local/share/applications/lantern.*.desktop $S/
-   grep '^launchers=' ~/.config/plasma-org.kde.plasma.desktop-appletsrc > $S/launchers.txt
-   cp -p ~/.local/share/applications/dev.lantern.Lantern.desktop $S/
-   ```
-2. **Acceptance run (Step 2), in two passes.** Items 24, 25 and 26 lift `LANTERN_SERIAL`, so
-   lanternd would serve every plugged phone (item 24 would connect an attached Motorola through
-   rule 4; 25/26 would show it notices); they fail at once ("unplug other phones") while another
-   phone is attached. Every other item pins `LANTERN_SERIAL` in its preflight, so two phones
-   attached is fine for them.
-   - Pass 1, both phones attached:
-     ```sh
-     python3 tools/build.py install && \
-       python3 tools/device_test.py --only 1 2 3 4 5 6 7 9 10 11 12 13 15 16 17 18 19 20 22 23
-     ```
-     Expected: `20/20 PASS`.
-   - Pass 2, **only the Xiaomi attached** (ask Sahaj to unplug the Motorola). Items 24 and 25
-     need real replugs (24: two, 25: one), so they are `--manual`; relay each `>>>` step to
-     Sahaj (each waits up to 900 s). Never `adb reconnect`: it left the Xiaomi in a non-adb USB
-     mode (18d1:4e11) until a physical replug.
-     ```sh
-     python3 tools/device_test.py --manual --only 24 25
-     ```
-     Expected: `2/2 PASS`. Then, still with only the Xiaomi, after telling Sahaj the step
-     ("click Connect on the 'Connect your Xiaomi 11T Pro' notification"):
-     ```sh
-     python3 tools/device_test.py --manual --only 26
-     ```
-   Record the summary lines and timings here.
-3. **After the install (Step 3 continued):**
-   ```sh
-   journalctl --user -u lanternd | grep 'menu migrated'        # primary=ZD222LMDFV …
-   ls ~/.local/share/applications/lantern.com.microsoft.rdc.androidx-u10.desktop  # pinned launcher still there
-   ls ~/.local/share/applications/ | grep -- '-p20e9318\.desktop$' | wc -l         # the Xiaomi's apps
-   grep -l '^X-Lantern-Serials=' ~/.local/share/applications/lantern.*.desktop    # expect nothing
-   cmp ~/.local/share/applications/dev.lantern.Lantern.desktop ~/.hermes/cache/scratch/plan4b-menu-before/dev.lantern.Lantern.desktop
-   cat ~/.local/state/lantern/menu.json                        # {"version":2,"primary":"ZD222LMDFV"}
-   ```
-   Ask Sahaj to look at Kickoff: top-level categories "Xiaomi 11T Pro" and "edge 50 pro" (no
-   "Phone" category; `kbuildsycoca6 --menutest | grep -c '^Xiaomi 11T Pro/'`); take a
-   screenshot. List the Xiaomi pins that need re-pinning (none were pinned on 2026-11-14).
-4. **Two-phone hand check (Step 4):** plug the Motorola back in (both phones plugged in),
-   `LANTERN_SERIAL` unset (`systemctl --user show-environment | grep LANTERN` empty),
-   `autoconnect` off. The suite leaves the Xiaomi connected with `live:true`, so a plain restart
-   would reconnect it without asking (rule 3); the Motorola's `live` is already clear (under
-   `LANTERN_SERIAL` the start-up timer clears the `live` flag of a phone lanternd ignores).
-   - **Quit** from the tray (clears the Xiaomi's `live`), then `systemctl --user start lanternd`:
-     the tray shows two unchecked rows, row 15 "Lantern connects one phone at a time", and two
-     "… is plugged in" notifications (neither phone has a `live` flag, so both are asked). Check
-     first: `devices/20e9318.json` and `devices/ZD222LMDFV.json` both have `live:false`.
-   - Check the Xiaomi: ready (`lantern status`). Check the Motorola: the Xiaomi is restored,
-     `~/.local/state/lantern/devices/20e9318.json` has `off:false, live:false`, the Motorola is
-     ready.
-   - Uncheck the Motorola: `devices/ZD222LMDFV.json` has `off:true`.
-   - Open a Xiaomi entry from Kickoff: "Connect your Xiaomi 11T Pro"; its **Connect** connects
-     the Xiaomi and opens the app.
-   - Tell Sahaj which phone was left connected.
-5. Commit the results here (`docs: Plan 4b acceptance, protocol and README updates`).
+- **Migration on the real menu:** `menu migrated: primary=ZD222LMDFV written=73 removed=15`;
+  `menu.json` `{"primary":"ZD222LMDFV","version":2}`; the pinned
+  `lantern.com.microsoft.rdc.androidx-u10.desktop` unchanged; 18 `…-p20e9318.desktop` entries;
+  no `X-Lantern-Serials=` left; `dev.lantern.Lantern.desktop` byte-identical. Backup of the
+  pre-migration menu: `~/.hermes/cache/scratch/plan4b-menu-before/`.
+- **Kickoff flattens nested menus** (Sahaj's screenshot: "Phone" showed one mixed list), so each
+  phone became a top-level category (R9, `8b49040`). `kbuildsycoca6 --menutest`: `Xiaomi 11T
+  Pro/` 18 entries, `edge 50 pro/` 55; no `Phone`. No Xiaomi pin needed re-pinning.
+- **Pass 1, both phones attached:** `device_test.py --only 1 … 23` **20/20 PASS** on the final
+  build (item 23 checks the top-level layout).
+- **Items 24–26 and the hand check:** the scripted manual items (900 s waits per step) kept
+  timing out against chat round-trips, so the behaviour was checked by hand and read back from
+  the lanternd journal:
+  - Quit then start with both phones plugged: both waiting, two "… is plugged in" notices.
+  - Tray: checking the Xiaomi then the Motorola switched phones; unchecking set `off:true`.
+  - Autoconnect on (item 24 run): the switched-off Xiaomi stayed off for 15 s after a real
+    replug.
+  - Autoconnect off: a real replug (≥10 s) showed "Xiaomi 11T Pro is plugged in" and the phone
+    waited; its tray row connected it (item 25 PASS in one run); Connect on the notice was ready
+    1.2 s later. Short pulls (~3 s) logged "back within the unplug grace; not asking again".
+  - Connect from an app: `lantern open --phone 20e9318 com.android.settings` while disconnected
+    gave "Connect your Xiaomi 11T Pro"; its Connect opened Settings 1.4 s after the click
+    (`opening the requested app`, window `win=1`).
+- **Item 8 (USB yank, `screen_off = true`):** the helper's Cleanup set the panel on 0.3 s after
+  the yank (`cleanup: panel on`, SurfaceFlinger power mode 2); Android's own 60 s timeout slept
+  it before Sahaj answered in chat, so the y/n question failed. Plan-next: read the panel state
+  from logcat instead of asking.
+- **Not re-run on this build:** item 21 (unlock, Motorola) and item 14.
+- **Found during acceptance, fixed:** the start-up stale-live timer could fire before adb's first
+  device list (`3dfc231`); `adb reconnect` leaves the Xiaomi in a non-adb USB mode until a
+  physical replug, so replug is manual-only.
+- **Plan-next findings:** a replug's "is plugged in" notice replaces a pending "Connect your
+  <phone>" notice and drops the app to open; `released()`/`baseline()` in the suite need the
+  panel On, so a phone asleep on its own timeout fails "phone released after stop"; the manual
+  items should not depend on chat-speed answers.
 
 ### Plan 2 acceptance (`tools/device_test.py`, Xiaomi 20e9318, 2026-11-10)
 
