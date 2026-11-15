@@ -264,3 +264,38 @@ Plan 4b is useful by itself, and it tests the new tray and menu before the core 
   - **4c:** both phones live with a window from each; a PC copy reaches both; a phone copy
     reaches the PC and the other phone; locking one phone doesn't affect the other's windows;
     unplugging one leaves the other's session and windows running.
+
+## Addendum (2026-11-15): Plan 4c scope
+
+Sahaj approved Plan 4b's acceptance and asked to do the rest "all in one plan". Plan 4c covers:
+
+1. **G6–G8**, as above: several phones live at once. The "one phone at a time" note and the
+   switch-off are removed.
+2. **G9. Phones stay awake and unlocked while their screen is off** (approved 2026-11-15).
+   - During a session a phone already never locks itself: stay-awake holds it awake, and the
+     panel is switched off at the display level (SurfaceControl), so Android still counts the
+     screen as on. Plan 4c keeps that guarantee for every live phone and checks it on the
+     Motorola: `deviceLocked=0` for the whole session with `screen_off = true`.
+   - **New:** when a session becomes ready on a phone whose PIN keyguard is locked, Lantern
+     shows "Unlock your <phone>" right away (Plan 4a's prompt, the same per-phone notification
+     and tray row). It doesn't wait for a blocked paste or open. That means one PIN per
+     connection, after which the phone stays unlocked while connected.
+   - A phone that reboots, or stays unplugged longer than its own screen timeout, locks as
+     Android decides. Lantern never stores the PIN (Plan 4a anti-goal) and can't set up Smart
+     Lock for him.
+   - A swipe-only phone (the Xiaomi) never prompts (Plan 4a item 22 stays).
+3. **Plan 4b rough edges:**
+   - A replug's "is plugged in" notice must not drop a pending "Connect your <phone>" app open.
+     The app stays with the phone's notice and opens after Connect.
+   - The device suite:
+     - `released()`/`baseline()` accept a phone asleep by its own timeout.
+     - The USB-yank item reads the panel restore from logcat (`cleanup: panel on`) instead of
+       asking y/n.
+     - Manual items wait on the lanternd journal or phone state with no tight deadline, and
+       print every step up front.
+   - The Plan 4b ledger's deferred minors that the final review marked worth fixing:
+     - the adb first-list cap on the start-up timer;
+     - a menu.json rerun that prefers the serial already owning the legacy stems;
+     - notices closed when lanternd quits;
+     - a Connect click during Undo that gives feedback;
+     - escaped notice bodies outside the prompts (undo, window notices, kdialog text).
