@@ -949,3 +949,72 @@ async fn queued_click_is_dropped_when_that_phone_unlocks() {
     assert_eq!(asked(&log), ["Pixel"]);
     let _ = std::fs::remove_file(&log);
 }
+
+/// R10 (4): a PIN dialog still open when lanternd stops must not hold its shutdown (a blocking
+/// dialog kept the runtime alive until the user answered, up to systemd's 90 s stop timeout).
+/// The dialog here records its pid and sleeps 20 s; once `events` closes, `run` ends, and the
+/// whole runtime is down within the 3 s shutdown notice budget, with the dialog killed.
+#[test]
+fn open_pin_dialog_does_not_hold_shutdown() {
+    let pidfile = std::env::temp_dir().join(format!(
+        "lantern-unlock-dialog-pid-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&pidfile);
+    let prompt = Prompt {
+        program: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            format!("echo $$ > '{}'; exec sleep 20", pidfile.display()),
+        ],
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pid: i32 = rt.block_on(async {
+        let mut rig = Rig::start(true, prompt).await;
+        rig.send(locked("s1")).await;
+        let id = rig.notify_id(1).await;
+        rig.click(id, "unlock").await;
+        let pid = wait_for("the dialog", Duration::from_secs(5), || {
+            std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+        })
+        .await;
+        // lanternd stops: the run loop drops the prompt's events sender.
+        rig.events.take();
+        let task = std::mem::replace(&mut rig.task, tokio::spawn(async { Ok(()) }));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("run did not end")
+            .unwrap()
+            .unwrap();
+        assert!(rig.pins.try_recv().is_err(), "a PIN was handed on");
+        pid
+    });
+    let stopping = std::time::Instant::now();
+    drop(rt);
+    let took = stopping.elapsed();
+    let _ = std::fs::remove_file(&pidfile);
+    assert!(took < Duration::from_secs(3), "shutdown held for {took:?}");
+    // The dialog is gone (or a zombie awaiting its reaper), not still asking.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat
+            .rsplit(')')
+            .next()
+            .and_then(|s| s.split_whitespace().next());
+        if stat.is_empty() || state == Some("Z") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dialog still runs: {stat}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

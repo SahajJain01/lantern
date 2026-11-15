@@ -2679,6 +2679,8 @@ async fn released_in_grace_by_disconnect_closes_its_notice() {
     assert_eq!(ctl.prompt().await, plugged_in("a", "a"));
     wanted_in_grace(&mut ctl).await;
     ctl.command(disconnect("a")).await;
+    // R10: the Disconnect's own Gone, then the grace's end.
+    assert_eq!(ctl.event().await, gone("a"));
     ctl.state_until("a", PhoneState::Unplugged).await;
     tokio::time::sleep(2 * fast_timing().unplug_grace).await;
     assert_eq!(ctl.events_for_a_while().await, [gone("a")]);
@@ -2690,6 +2692,7 @@ async fn released_in_grace_by_disconnect_closes_its_notice() {
     ctl.offline("a");
     ctl.state_until("a", PhoneState::Reconnecting).await;
     ctl.command(disconnect("a")).await;
+    assert_eq!(ctl.event().await, gone("a"));
     ctl.state_until("a", PhoneState::Unplugged).await;
     ctl.online("a");
     ctl.state_until("a", PhoneState::Off).await;
@@ -2711,6 +2714,8 @@ async fn disconnected_phone_blip_never_prompts() {
     ctl.ready("dev").await;
     assert_eq!(ctl.event().await, gone("dev"));
     ctl.command(disconnect("dev")).await;
+    // R10: a Disconnect closes its notice (and drops an offered app) at once.
+    assert_eq!(ctl.event().await, gone("dev"));
     expect_bye(&mut helper).await;
     ctl.state_until("dev", PhoneState::Off).await;
     for _ in 0..3 {
@@ -4086,6 +4091,48 @@ async fn open_naming_another_phone_is_offered() {
     );
     ctl.assert_no_prompt().await;
     assert!(ctl.phone("typo").is_none());
+    helper.assert_quiet().await;
+    ctl.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// R10 (1): a Disconnect, or the start of an Undo, drops the phone's offered app: lanternd sends
+/// `Gone` for it, so the connect prompt closes "Connect your …" and forgets its app (a later
+/// `PluggedIn` is the plain notice, `connect::plugged_in_without_an_offer_is_unchanged`).
+#[tokio::test]
+async fn disconnect_and_undo_drop_the_offered_app() {
+    let (mut helper, port) = FakeHelper::spawn().await;
+    let (root, dirs, catalog) = temp_catalog();
+    plant_named_entry(&dirs, "com.x", "b", "Xray");
+    let (undo, mut calls) = instant_undo();
+    let mut opts = manual();
+    opts.undo = Some(undo);
+    let mut ctl = start_ctl_opts(port, &["dev", "b"], opts, |p| p.catalog = Some(catalog));
+    assert_eq!(ctl.prompt().await, plugged_in("dev", "Pixel"));
+    assert_eq!(ctl.prompt().await, plugged_in("b", "b"));
+    ctl.command(connect("dev")).await;
+    helper.next_session().await;
+    ctl.ready("dev").await;
+    for undo in [false, true] {
+        assert_eq!(
+            refused(&ctl.sock, open_on("com.x", 0, "b")).await,
+            Control::error(ipc::CONNECT_OFFERED)
+        );
+        assert!(matches!(
+            ctl.prompt().await,
+            ConnectEvent::OpenRefused { .. }
+        ));
+        if undo {
+            ctl.command(undo_setup("b")).await;
+            assert_eq!(timeout(STEP, calls.recv()).await.unwrap().unwrap(), "b");
+        } else {
+            ctl.command(disconnect("b")).await;
+        }
+        ctl.state_until("b", PhoneState::Off).await;
+        assert_eq!(ctl.events_for_a_while().await, [gone("b")], "undo: {undo}");
+    }
+    // The live phone's session is untouched.
+    assert_eq!(ctl.phone("dev").unwrap().state, PhoneState::Ready);
     helper.assert_quiet().await;
     ctl.shutdown().await;
     let _ = std::fs::remove_dir_all(root);

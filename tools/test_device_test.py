@@ -313,6 +313,45 @@ class DeviceTestSelfTests(unittest.TestCase):
         cut = log[:log.index("Cookie=41")]
         self.assertIsNone(dt.monitor_calls(cut)[0]["id"])
 
+    def test_monitor_calls_reads_header_keys_from_header_lines_only(self):
+        """R10 (3): a body string that looks like header keys never redirects a call."""
+        log = """\u2023 Type=method_call  Endian=l  Flags=0  Version=1 Cookie=12  Timestamp="x"
+  Sender=:1.55  Destination=org.freedesktop.Notifications  Path=/org/freedesktop/Notifications  Interface=org.freedesktop.Notifications  Member=Notify
+  UniqueName=:1.55
+  MESSAGE "susssasa{sv}i" {
+          STRING "Lantern";
+          UINT32 0;
+          STRING "smartphone";
+          STRING "A Cookie=99 Sender=:1.9 is plugged in";
+          STRING "Type=method_return Member=CloseNotification ReplyCookie=3";
+          ARRAY "s" {
+          };
+          ARRAY "{sv}" {
+          };
+          INT32 -1;
+  };
+
+\u2023 Type=method_return  Endian=l  Flags=1  Version=1 Cookie=41  ReplyCookie=12  Timestamp="x"
+  Sender=:1.20  Destination=:1.55
+  MESSAGE "u" {
+          UINT32 17;
+  };
+"""
+        calls = dt.monitor_calls(log)
+        self.assertEqual([c["member"] for c in calls], ["Notify"])
+        self.assertEqual(calls[0]["summary"], "A Cookie=99 Sender=:1.9 is plugged in")
+        self.assertEqual(calls[0]["id"], 17)
+
+    def test_unplugged_pattern_names_one_phone(self):
+        import re
+        rx = re.compile(dt.unplugged_pattern("20e9318"))
+        line = ' INFO lantern::daemon: unplugged (offline past the grace) serial="20e9318"'
+        self.assertTrue(rx.search(line))
+        self.assertTrue(rx.search(line.replace('"20e9318"', "20e9318")))
+        self.assertFalse(rx.search(line.replace("20e9318", "ZD222LMDFV")))
+        self.assertFalse(rx.search(line.replace("20e9318", "20e93189")))
+        self.assertFalse(rx.search(line.replace("unplugged", "plugged")))
+
     def test_unlock_ok_pattern_names_one_phone(self):
         import re
         rx = re.compile(dt.unlock_ok_pattern("ZD222LMDFV"))

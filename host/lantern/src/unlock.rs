@@ -260,27 +260,52 @@ async fn show(
         .await
 }
 
-/// Runs the PIN dialog (blocking): its stdout parsed as a [`Pin`], `Ok(None)` if the user
-/// cancelled.
-fn ask(prompt: &Prompt, name: &str) -> Result<Option<Pin>, String> {
-    let name = escape_markup(name);
+/// Runs the PIN dialog: its stdout parsed as a [`Pin`], `Ok(None)` if the user cancelled.
+///
+/// The dialog is a `kill_on_drop` child read asynchronously: when lanternd stops, [`run`]
+/// aborts this future and the dialog is killed, so an unanswered dialog never holds the
+/// shutdown (R10). Its stdout is read into a buffer that is wiped whichever way this ends.
+async fn ask(prompt: Prompt, name: String) -> Result<Option<Pin>, String> {
+    let name = escape_markup(&name);
     let args: Vec<OsString> = prompt
         .args
         .iter()
         .map(|arg| arg.replace("{name}", &name).into())
         .collect();
-    let mut command = crate::desktop::command(&prompt.program, &args);
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
-    let output = command
-        .output()
+    let program = prompt.program.clone();
+    // Building it may block on systemctl (`desktop::command`): off the async workers.
+    let command = tokio::task::spawn_blocking(move || crate::desktop::command(&program, &args))
+        .await
         .map_err(|error| format!("could not run {}: {error}", prompt.program.display()))?;
-    let stdout = output.stdout;
-    if !output.status.success() {
-        // Cancelled: whatever it printed is wiped.
-        drop(Pin(ManuallyDrop::new(stdout)));
-        tracing::info!(status = %output.status, "PIN dialog cancelled");
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not run {}: {error}", prompt.program.display()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "the PIN dialog has no output".to_owned())?;
+    // Wiped when dropped, on every path (an abort included). The capacity holds any PIN and
+    // its newline without a reallocation, so no unwiped copy is left behind.
+    let mut out = Pin(ManuallyDrop::new(Vec::with_capacity(64)));
+    let read = tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut out.0).await;
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("PIN dialog: {error}"))?;
+    if let Err(error) = read {
+        return Err(format!("PIN dialog: {error}"));
+    }
+    if !status.success() {
+        // Cancelled: whatever it printed is wiped (`out` drops here).
+        tracing::info!(%status, "PIN dialog cancelled");
         return Ok(None);
     }
+    let stdout = std::mem::take(&mut *out.0);
     let raw = match String::from_utf8(stdout) {
         Ok(raw) => raw,
         Err(error) => {
@@ -324,7 +349,7 @@ fn begin_asking(
     let prompt = prompt.clone();
     tracing::info!(serial, from, "asking for the PIN");
     Some(Asking {
-        task: tokio::task::spawn_blocking(move || ask(&prompt, &name)),
+        task: tokio::spawn(ask(prompt, name)),
         serial: serial.to_owned(),
         stretch: lock.ended,
     })
@@ -497,7 +522,16 @@ pub async fn run(
             }
         }
     }
-    // lanternd is stopping: no notice may outlive it (each close is bounded, 5 s).
+    // lanternd is stopping: an open PIN dialog is killed (its future dropped: kill_on_drop,
+    // the buffer wiped), so it can't hold the shutdown and its answer goes nowhere.
+    if let Some(open) = asking.take() {
+        tracing::info!(
+            serial = open.serial,
+            "lanternd is stopping: the PIN dialog is closed"
+        );
+        open.task.abort();
+    }
+    // No notice may outlive lanternd (each close is bounded, 5 s).
     for (serial, lock) in locks.iter_mut() {
         if lock.shown != 0 {
             tracing::debug!(serial, id = lock.shown, "closing the unlock notice at exit");
@@ -702,8 +736,8 @@ mod tests {
 
     /// Decision 16: the dialog's text is rich text with the phone's name escaped. The program
     /// is a shell that writes its arguments to a scratch file (never the real kdialog).
-    #[test]
-    fn kdialog_prompt_is_escaped_rich_text() {
+    #[tokio::test]
+    async fn kdialog_prompt_is_escaped_rich_text() {
         let log = std::env::temp_dir().join(format!(
             "lantern-unlock-kdialog-args-{}",
             std::process::id()
@@ -718,7 +752,7 @@ mod tests {
         ];
         args.extend(Prompt::kdialog().args);
         prompt.args = args;
-        let pin = ask(&prompt, "A<B").unwrap().unwrap();
+        let pin = ask(prompt, "A<B".to_owned()).await.unwrap().unwrap();
         assert_eq!(pin.digits(), "1234");
         let got = std::fs::read_to_string(&log).unwrap();
         let _ = std::fs::remove_file(&log);

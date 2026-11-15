@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Lantern acceptance suite on a real phone + KDE Plasma (Wayland) desktop.
 
-    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-23
-    python3 tools/device_test.py --manual                            # also 8, 14, 21, 24-27 (a person)
+    python3 tools/build.py install && python3 tools/device_test.py   # items 1-7, 9-13, 15-20, 22-23, 34
+    python3 tools/device_test.py --manual                            # also 8, 14, 21, 24-27, 33 (a person)
     python3 tools/device_test.py --only 12 13                        # by number or name
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
@@ -10,7 +10,7 @@
     python3 tools/device_test.py --pair                              # Plan 4c: two phones (28-30)
     python3 tools/device_test.py --pair --manual                     # also 31 (cable pull), 32 (PIN)
 
-Items (32; 20 automatic, 8, 14, 21 and 24-27 only with --manual; 28-32 only with --pair,
+Items (34; 21 automatic, 8, 14, 21, 24-27 and 33 only with --manual; 28-32 only with --pair,
 31 and 32 also with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
@@ -34,7 +34,9 @@ Items (32; 20 automatic, 8, 14, 21 and 24-27 only with --manual; 28-32 only with
                                            30 one_phone_failure_isolated (--pair)
                                            31 unplug_one_keeps_other (--pair --manual, cable pull)
                                            32 lock_one_keeps_other (--pair --manual, O = Motorola, PIN)
-A full automatic run prints `20/20 PASS` when everything passes.
+                                           33 replug_keeps_requested_app (manual, replug, Sahaj clicks)
+                                           34 notices_close_on_quit (restarts lanternd, real session bus)
+A full automatic run prints `21/21 PASS` when everything passes.
 
 Manual items never read stdin. Before any item runs, the suite prints every selected manual
 item's steps for Sahaj (he answers through chat, often minutes later, so he gets the whole
@@ -302,6 +304,12 @@ def unlock_ok_pattern(serial):
     return rf'unlock result.*\bserial="?{re.escape(serial)}"?\s.*\bok=true\b'
 
 
+def unplugged_pattern(serial):
+    """The journal regex for lanternd's `unplugged (offline past the grace)` for phone
+    `serial` (logged when its unplug grace ends; the message, then `serial`)."""
+    return rf'unplugged \(offline past the grace\).*\bserial="?{re.escape(serial)}"?(\s|$)'
+
+
 def wait_ready(timeout=10):
     """Waits until lanternd serves SERIAL's phone."""
     st, secs = wait_until("daemon ready", timeout,
@@ -542,8 +550,15 @@ def monitor_calls(text):
     its method_return is in the log); a CloseNotification has `id`."""
     calls, pending = [], {}
     for block in text.split("\u2023"):
+        # Header keys only from the header lines (before MESSAGE): a body string that reads
+        # `Cookie=…` or `Member=…` must never redirect a call.
+        header = []
+        for line in block.splitlines():
+            if line.lstrip().startswith("MESSAGE"):
+                break
+            header.append(line)
         head = dict(re.findall(r"\b(Type|Cookie|ReplyCookie|Sender|Destination|Member)=(\S+)",
-                               block))
+                               "\n".join(header)))
         kind, member = head.get("Type"), head.get("Member")
         if kind == "method_call" and member == "Notify":
             strings = re.findall(_STRING, block)
@@ -3154,7 +3169,9 @@ class Suite:
                 note(f"phone off adb after {secs:.1f} s")
                 wait_until("lanternd sees the phone unplugged", 15,
                            lambda: not phone_status(SERIAL).get("plugged"), interval=0.5)
-                time.sleep(1)  # its (0 ms) grace has ended: nothing closes the offer below
+                # Its (0 ms) grace has ended, so nothing closes the offer below.
+                _, secs = wait_journal(unplugged_pattern(SERIAL), since, 15)
+                note(f"journal: unplugged past the grace ({secs:.1f} s)")
                 before = len(mon.notifies())
                 r = subprocess.run([LANTERN, "open", "--phone", SERIAL, SETTINGS],
                                    capture_output=True, text=True, timeout=5)

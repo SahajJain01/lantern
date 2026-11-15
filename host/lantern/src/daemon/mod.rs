@@ -1218,6 +1218,10 @@ where
                     table.set_live(&serial, false);
                     table.last_off = Some(serial.clone());
                     table.pending.remove(&serial);
+                    // R10: its notice goes, and with it any offered app ("Connect your …").
+                    prompts.send(ConnectEvent::Gone {
+                        serial: serial.clone(),
+                    });
                     // `bye`: the helper restores the phone. Only this phone's run ends.
                     let close = release(
                         &serial,
@@ -1261,6 +1265,10 @@ where
                     table.set_live(&serial, false);
                     table.last_off = Some(serial.clone());
                     table.pending.remove(&serial);
+                    // R10: its notice goes, and with it any offered app.
+                    prompts.send(ConnectEvent::Gone {
+                        serial: serial.clone(),
+                    });
                     // The helper's connection is closed before the undo runs; `run_steps`
                     // itself waits for helper processes still restoring the phone. Only this
                     // phone's run ends.
