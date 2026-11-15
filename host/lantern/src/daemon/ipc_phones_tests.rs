@@ -138,16 +138,19 @@ async fn helper_frames_only_reach_their_own_phones_windows() {
     assert_eq!(recv(&mut on_b).await, Some(video(win_b, 3)));
 }
 
+/// R7 (a): A is not the default phone (B is), so a frame that went to the default phone instead
+/// of its window's phone would show here.
 #[tokio::test]
 async fn client_frames_go_to_their_phones_helper() {
     let (mut hub, mut a, mut b) = two();
-    let _on_a = client(&mut hub, open("com.x", Some("A"))).await;
-    let mut on_b = client(&mut hub, open("com.x", Some("B"))).await;
-    opened_on(&mut a);
-    let win_b = opened_on(&mut b);
+    assert_eq!(hub.default_phone(), Some("B"));
+    let mut on_a = client(&mut hub, open("com.x", Some("A"))).await;
+    let _on_b = client(&mut hub, open("com.x", Some("B"))).await;
+    let win_a = opened_on(&mut a);
+    opened_on(&mut b);
     let input = Frame {
         kind: Kind::Input,
-        stream: win_b,
+        stream: win_a,
         payload: InputEvent::Scroll {
             x: 1.0,
             y: 2.0,
@@ -156,15 +159,16 @@ async fn client_frames_go_to_their_phones_helper() {
         }
         .encode(),
     };
-    write_frame_async(&mut on_b, &input).await.unwrap();
+    write_frame_async(&mut on_a, &input).await.unwrap();
     pump(&mut hub).await;
-    assert_eq!(b.try_recv().unwrap(), input);
-    assert_helper_quiet(&mut a, "A");
-    // Its close goes to B too.
-    drop(on_b);
+    assert_eq!(a.try_recv().unwrap(), input);
+    assert_helper_quiet(&mut b, "B");
+    // Its close goes to A too.
+    drop(on_a);
     pump(&mut hub).await;
-    let close = b.try_recv().unwrap();
-    assert_eq!((close.stream, decode(&close)), (win_b, Control::Close));
+    let close = a.try_recv().unwrap();
+    assert_eq!((close.stream, decode(&close)), (win_a, Control::Close));
+    assert_helper_quiet(&mut b, "B");
     assert_helper_quiet(&mut a, "A");
 }
 
@@ -281,18 +285,33 @@ async fn pc_copy_fans_out_and_phone_copy_skips_its_source() {
     assert_eq!(clip_text(b.try_recv().unwrap()), "pc");
 }
 
+/// R7 (b): two wedged helpers share one 1 s wait; both are reported, the healthy one gets its
+/// clip.
 #[tokio::test]
 async fn wedged_helper_is_reported_alone() {
     let mut hub = Hub::new(None);
     let (a_tx, _a) = mpsc::channel(1);
     a_tx.try_send(video(1, 0)).unwrap(); // full, never drained
     let (b_tx, mut b) = mpsc::channel(4);
+    let (c_tx, _c) = mpsc::channel(1);
+    c_tx.try_send(video(1, 0)).unwrap(); // full, never drained
     hub.session_up("A", a_tx, "shaA");
     hub.session_up("B", b_tx, "shaB");
+    hub.session_up("C", c_tx, "shaC");
     let started = Instant::now();
     let wedged = hub.on_pc_clip(offer("y")).await;
-    assert!(started.elapsed() < Duration::from_millis(1500));
-    assert_eq!(wedged, [HelperWedged { serial: "A".into() }]);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "one shared wait, not one per helper: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        wedged,
+        [
+            HelperWedged { serial: "A".into() },
+            HelperWedged { serial: "C".into() }
+        ]
+    );
     assert_eq!(clip_text(b.try_recv().unwrap()), "y");
 }
 

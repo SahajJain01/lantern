@@ -7,9 +7,11 @@
     python3 tools/device_test.py --nested                            # windows in a nested KWin
     python3 tools/device_test.py --state                             # print phone state
     python3 tools/device_test.py --manual --only 26                  # Plan 4b: Connect from a notice
-    python3 tools/device_test.py --pair                              # Plan 4c: two phones at once
+    python3 tools/device_test.py --pair                              # Plan 4c: two phones (28-30)
+    python3 tools/device_test.py --pair --manual                     # also 31 (cable pull)
 
-Items (27; 20 automatic, 8, 14, 21 and 24-27 only with --manual):
+Items (31; 20 automatic, 8, 14, 21 and 24-27 only with --manual; 28-31 only with --pair,
+31 also with --manual):
      1 session_starts_on_plug              11 title_is_label
      2 open_settings_creates_one_display   12 ime_unicode_text
      3 second_open_focuses                 13 clipboard_both_ways
@@ -27,6 +29,10 @@ Items (27; 20 automatic, 8, 14, 21 and 24-27 only with --manual):
                                            25 autoconnect_off_asks_on_plug (manual, replug, tray)
                                            26 connect_from_entry_opens_app (manual, Sahaj clicks)
                                            27 unlock_prompt_at_connect (manual, PIN phone, Sahaj types)
+                                           28 two_phones_live (--pair)
+                                           29 clipboard_fans_out (--pair, both unlocked)
+                                           30 one_phone_failure_isolated (--pair)
+                                           31 unplug_one_keeps_other (--pair --manual, cable pull)
 A full automatic run prints `20/20 PASS` when everything passes.
 
 Manual items never read stdin. Before any item runs, the suite prints every selected manual
@@ -39,13 +45,17 @@ released (`wakefulness` from `dumpsys power`), so a slow answer never fails a re
 replug is always his: `adb reconnect` once left the Xiaomi in a non-adb USB mode (18d1:4e11)
 until a physical replug, so the suite never uses it.
 
---pair (Plan 4c) runs only the two-phone items (the PAIR set; none in this file yet: later
-tasks add them), inside `two_phones`: exactly SERIAL and OTHER attached, where OTHER is
+--pair (Plan 4c) runs only the two-phone items (the PAIR set: 28-31), each inside
+`two_phones`: exactly SERIAL and OTHER attached, where OTHER is
 LANTERN_OTHER_SERIAL, else the only other attached `device`. It saves the PC clipboard,
 settings.toml (then `autoconnect = false`) and both device records' `off`/`live`, reads both
 phones' baselines, lifts LANTERN_SERIAL and connects both phones; if a phone is PIN-locked it
 asks Sahaj to unlock it (only with --manual). Its cleanup puts all of that back, checks both
 phones released and restored with lanternd stopped, and leaves lanternd serving SERIAL.
+Item 28 opens Settings on both phones at once (two windows, displays, forwards and app_ids);
+29 copies on the PC and on each phone's test screen (enabled on both only during the item; the
+PC clipboard is put back); 30 kills SERIAL's helper and disconnects SERIAL while OTHER keeps a
+Settings window; 31 has Sahaj pull SERIAL's cable for at least 15 s while OTHER keeps one.
 
 Plan 4b (phone switchboard) items: 2 checks the window's app_id from the phone's names (the
 primary phone keeps `lantern.<pkg>`, any other gets `-p<tag>`), 10/15/16 the per-phone entries
@@ -609,8 +619,8 @@ class Window:
 
 # --- phone readbacks -----------------------------------------------------------------------
 
-def lantern_displays():
-    out = adb("shell", "cmd", "display", "get-displays")
+def lantern_displays(serial=None):
+    out = adb("shell", "cmd", "display", "get-displays", serial=serial)
     return re.findall(r'Display id (\d+): DisplayInfo\{"(lantern-[^"]*)"', out)
 
 
@@ -787,17 +797,19 @@ def logcat_since(since, tags, serial=None):
     return out
 
 
-def test_activity(on):
-    """Enables (or returns to disabled) the companion's test screen via its shell-only
-    TEST_ACTIVITY broadcast; the shell may not `pm enable` another package's component."""
+def test_activity(on, serial=None):
+    """Enables (or returns to disabled) the companion's test screen on `serial` (default
+    SERIAL) via its shell-only TEST_ACTIVITY broadcast; the shell may not `pm enable` another
+    package's component."""
     out = adb("shell", "am", "broadcast", "--user", "0", "-n", f"{COMPANION}/.LinkReceiver",
-              "-a", f"{COMPANION}.TEST_ACTIVITY", "--es", "enabled", "true" if on else "false")
+              "-a", f"{COMPANION}.TEST_ACTIVITY", "--es", "enabled", "true" if on else "false",
+              serial=serial)
     check("result=1" in out, f"TEST_ACTIVITY enabled={on}: {out.strip()}")
 
 
-def test_activity_listed():
+def test_activity_listed(serial=None):
     out = adb("shell", "pm", "query-activities", "--user", "0", "-a", "android.intent.action.MAIN",
-              "-c", "android.intent.category.LAUNCHER", COMPANION)
+              "-c", "android.intent.category.LAUNCHER", COMPANION, serial=serial)
     return "TestActivity" in out
 
 
@@ -2712,6 +2724,242 @@ class Suite:
             cleanup(ok, ("restore settings.toml", restore_file),
                     ("restart lanternd", restart_ready))
 
+    # --- two phones live at once (--pair; S = SERIAL, O = OTHER) -----------------------------
+
+    def _pair_settings(self, phone, tag):
+        """A Settings window on `phone` (--phone), opened within 20 s."""
+        w = Window(SETTINGS, tag, phone=phone)
+        wait_until(f"Settings opened on {phone}", 20, lambda: w.find("opened"))
+        note(f"{phone}: opened {w.find('opened')[0][1]}")
+        return w
+
+    def _close_pair_settings(self, windows):
+        """Closes the Settings windows through KWin (each phone's app_id), then their processes."""
+        for phone, w in windows:
+            if w.p.poll() is None:
+                try:
+                    kwin_on(SETTINGS, CLOSE, "lantern_close", serial=phone)
+                    w.wait_exit(10)
+                except Fail as e:
+                    note(f"close Settings on {phone}: {e}")
+            w.kill()
+
+    def two_phones_live(self):
+        """Item 28: Settings open on both phones at once, as two windows, displays and forwards
+        of their own; a second open on S focuses its window."""
+        windows = []
+        ok = False
+        with two_phones():
+            try:
+                # 1. Both opened.
+                for phone, tag in ((SERIAL, "s-settings"), (OTHER, "o-settings")):
+                    windows.append((phone, self._pair_settings(phone, tag)))
+                # 2. lanternd lists both, with distinct ids and their phones.
+                wins = [x for x in status()["windows"] if x["pkg"] == SETTINGS]
+                note(f"status windows: {wins}")
+                check(sorted(x.get("phone") for x in wins) == sorted([SERIAL, OTHER]),
+                      f"status windows {wins}")
+                check(len({x["id"] for x in wins}) == 2, f"window ids not distinct: {wins}")
+                # 3. KWin has one window per phone, each with its phone's app_id.
+                ids = {p: app_id_of(SETTINGS, p) for p in (SERIAL, OTHER)}
+                check(ids[SERIAL] != ids[OTHER], f"same app_id on both phones: {ids}")
+                for phone in (SERIAL, OTHER):
+                    desc, _ = wait_until(
+                        f"KWin lists {phone}'s window", 5,
+                        lambda p=phone: (d := kwin_on(SETTINGS, DESCRIBE, "lantern_describe",
+                                                      serial=p)) and "count=1" in d[0] and d,
+                        interval=0.3)
+                    note(f"kwin {phone}: {desc[1] if len(desc) > 1 else desc}")
+                    check(f"resourceClass={ids[phone]} " in desc[1],
+                          f"{phone}: app_id mismatch, want {ids[phone]}: {desc[1]}")
+                # 4. One lantern display on each phone; 5. one lantern forward per serial.
+                counts = {}
+                for phone in (SERIAL, OTHER):
+                    displays = lantern_displays(phone)
+                    counts[phone] = len(displays)
+                    note(f"{phone} lantern displays: {displays}")
+                    check(len(displays) == 1, f"{phone}: {len(displays)} lantern displays")
+                    forwards = phone_state(phone)["forwards"]
+                    note(f"{phone} forwards: {forwards}")
+                    check(len(forwards) == 1, f"{phone}: lantern forwards {forwards}")
+                # 6. A second open on S focuses its window: exit 0 within 5 s, no new display.
+                second = Window(SETTINGS, "s-settings-second", phone=SERIAL)
+                code = second.wait_exit(5)
+                second.kill()
+                check(code == 0, f"second open on {SERIAL} exited {code}")
+                check(len(lantern_displays(SERIAL)) == counts[SERIAL],
+                      f"{SERIAL}: displays {lantern_displays(SERIAL)} after the second open")
+                # 7. Both closed through KWin.
+                self._close_pair_settings(windows)
+                for phone, w in windows:
+                    check(w.p.poll() is not None, f"{phone}'s window still runs")
+                ok = True
+            finally:
+                cleanup(ok, ("close both Settings windows",
+                             lambda: self._close_pair_settings(windows)))
+
+    def clipboard_fans_out(self):
+        """Item 29 (both phones unlocked): a PC copy reaches both phones; a copy on one phone
+        reaches the PC and the other phone, never back to itself. Logs carry lengths only, so
+        each step's text has its own length."""
+        tag = f"{os.getpid()}{int(time.time()) % 100000}"
+        ok = False
+        with two_phones():
+            saved = klipper("getClipboardContents")
+            saved = saved[:-1] if saved.endswith("\n") else saved
+            note(f"saved the PC clipboard text ({len(saved)} chars)")
+            try:
+                # 1. PC -> both phones.
+                pc_text = f"fan-pc-{tag}"
+                since = {p: phone_now(p) for p in (SERIAL, OTHER)}
+                klipper("setClipboardContents", pc_text)
+                want = f"clip: PC clipboard ({len(pc_text)} chars) set on the phone"
+                for phone in (SERIAL, OTHER):
+                    _, secs = wait_until(f"PC clipboard set on {phone}", 5, lambda p=phone: [
+                        m for _, m in logcat_since(since[p], ["lantern"], p) if m == want],
+                        interval=0.3)
+                    note(f"{phone}: {want!r} within {secs:.1f} s")
+                # 2. S copies; 3. O copies. Distinct lengths per step.
+                for n, (src, dst) in enumerate(((SERIAL, OTHER), (OTHER, SERIAL)), 1):
+                    text = f"fan-{'x' * n * 3}-{tag}"
+                    check(len(text) != len(pc_text), "step texts need their own lengths")
+                    test_activity(True, src)
+                    wait_until(f"test screen in {src}'s launcher", 5,
+                               lambda p=src: test_activity_listed(p), interval=0.2)
+                    since = {p: phone_now(p) for p in (SERIAL, OTHER)}
+                    w = Window(COMPANION, f"fan-{n}", phone=src,
+                               debug_input=("focus;" if NESTED else "") +
+                               f"tap:0.5,0.15;key:Ctrl+A;text:{text};key:Ctrl+A;key:Ctrl+C;close")
+                    try:
+                        wait_until(f"test screen opened on {src}", 15, lambda: w.find("opened"))
+                        wait_until(f"Klipper holds {src}'s copy", 40,
+                                   lambda: klipper("getClipboardContents").rstrip("\n") == text,
+                                   interval=0.05)
+                        got = time.monotonic()
+                        want = f"clip: PC clipboard ({len(text)} chars) set on the phone"
+                        _, secs = wait_until(f"{src}'s copy set on {dst}", 3, lambda: [
+                            m for _, m in logcat_since(since[dst], ["lantern"], dst)
+                            if m == want], interval=0.3)
+                        note(f"{src} -> PC -> {dst}: {want!r} {secs:.1f} s after Klipper")
+                        time.sleep(max(0.0, 5 - (time.monotonic() - got)))
+                        echoed = [m for _, m in logcat_since(since[src], ["lantern"], src)
+                                  if f"({len(text)} chars) set on the phone" in m]
+                        check(not echoed, f"{src} got its own copy back: {echoed}")
+                        note(f"{src}: no echo of its copy for 5 s")
+                        code = w.wait_exit(15)
+                    finally:
+                        w.kill()
+                    check(code == 0, f"test screen window on {src} exited {code}")
+                ok = True
+            finally:
+                # The user's clipboard first; disabling a test screen fails exactly when that
+                # phone dropped.
+                def restore():
+                    klipper("setClipboardContents", saved)
+                    note("restored the PC clipboard text")
+                cleanup(ok, ("restore the PC clipboard", restore),
+                        (f"disable {SERIAL}'s test screen", lambda: test_activity(False, SERIAL)),
+                        (f"disable {OTHER}'s test screen", lambda: test_activity(False, OTHER)))
+
+    def _other_unchanged(self, pids, window, since):
+        """O's helper pids are `pids`, its Settings window runs and lanternd lists it, and the
+        journal since `since` has no `session closed` for O."""
+        now = phone_state(OTHER)["helper_pids"]
+        check(set(now) == set(pids), f"{OTHER}'s helper pids {sorted(pids)} -> {sorted(now)}")
+        check(window.p.poll() is None, f"{OTHER}'s Settings window exited")
+        wins = [x for x in status()["windows"] if x.get("phone") == OTHER]
+        check(wins, f"lanternd lists no window on {OTHER}")
+        text = sh("journalctl", "--user", "-u", UNIT, "--since", since, "--no-pager", "-o", "cat",
+                  timeout=30)
+        closed = [l for l in text.splitlines() if "session closed" in l
+                  and re.search(rf'serial="?{re.escape(OTHER)}"?(\s|$)', ANSI.sub("", l))]
+        check(not closed, f"{OTHER}'s session closed: {closed}")
+
+    def one_phone_failure_isolated(self):
+        """Item 30: S's helper killed, then S disconnected: O's helper, window and session stay
+        as they are."""
+        windows = []
+        ok = False
+        with two_phones():
+            try:
+                # 1. O's helper pids and an O Settings window.
+                windows.append((OTHER, self._pair_settings(OTHER, "o-settings")))
+                o_pids = phone_state(OTHER)["helper_pids"]
+                s_pids = phone_state(SERIAL)["helper_pids"]
+                note(f"helper pids: {SERIAL} {s_pids}, {OTHER} {o_pids}")
+                check(o_pids and s_pids, "a phone has no helper")
+                # 2. S's helper killed (one quoted string for the phone's shell).
+                since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                adb("shell", "kill -9 $(pgrep -f '^app_process / dev[.]lantern[.]helper[.]Main')",
+                    serial=SERIAL)
+                # 3. S ready again with new helper pids.
+                def s_back():
+                    pids = phone_state(SERIAL)["helper_pids"]
+                    return (pids and not set(pids) & set(s_pids)
+                            and phone_status(SERIAL).get("state") == "ready" and pids)
+                pids, secs = wait_until(f"{SERIAL} ready with a new helper", 20, s_back,
+                                        interval=0.5)
+                note(f"{SERIAL} ready again after {secs:.1f} s, helper pids {pids}")
+                # 4. O untouched.
+                self._other_unchanged(o_pids, windows[0][1], since)
+                note(f"{OTHER}: same helper, window open, no session closed")
+                # 5. Disconnect S: O untouched; then connect S again.
+                note(f"lantern disconnect {SERIAL}: {lantern_cmd('disconnect', SERIAL)}")
+                wait_phone(f"{SERIAL} released", 20, released, SERIAL)
+                self._other_unchanged(o_pids, windows[0][1], since)
+                note(f"{OTHER}: unchanged after {SERIAL}'s Disconnect")
+                note(f"lantern connect {SERIAL}: {lantern_cmd('connect', SERIAL)}")
+                _, secs = wait_until(f"{SERIAL} ready", 20,
+                                     lambda: phone_status(SERIAL).get("state") == "ready",
+                                     interval=0.5)
+                note(f"{SERIAL} ready {secs:.1f} s after Connect")
+                ok = True
+            finally:
+                cleanup(ok, ("close O's Settings window",
+                             lambda: self._close_pair_settings(windows)),
+                        (f"lantern connect {SERIAL}", lambda: lantern_cmd("connect", SERIAL)))
+
+    def unplug_one_keeps_other(self):
+        """Item 31 (--pair --manual): Sahaj pulls S's cable for at least 15 s; O's session and
+        window stay as they are throughout; S connects again after the replug."""
+        windows = []
+        ok = False
+        with two_phones():
+            try:
+                # 1. An O Settings window.
+                windows.append((OTHER, self._pair_settings(OTHER, "o-settings")))
+                o_pids = phone_state(OTHER)["helper_pids"]
+                since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # 2. S off adb.
+                ask(f"Pull {SERIAL}'s cable now and keep it out at least 15 s "
+                    f"(waiting up to {MANUAL_WAIT} s).")
+                _, secs = wait_until(f"{SERIAL} off adb (cable pulled)", MANUAL_WAIT,
+                                     lambda: adb_state(SERIAL) != "device", interval=0.2)
+                note(f"{SERIAL} off adb after {secs:.1f} s")
+                # 3. For 15 s: O ready, same helper, window alive.
+                end = time.monotonic() + 15
+                while time.monotonic() < end:
+                    check(phone_status(OTHER).get("state") == "ready",
+                          f"{OTHER} not ready: {phone_status(OTHER)}")
+                    self._other_unchanged(o_pids, windows[0][1], since)
+                    time.sleep(1)
+                note(f"{OTHER}: ready, same helper, window open for 15 s")
+                # 4. S back; connected by hand (autoconnect is off in the harness).
+                ask(f"Plug {SERIAL} back in (waiting up to {MANUAL_WAIT} s).")
+                wait_back_on_adb(SERIAL)
+                wait_until(f"lanternd sees {SERIAL}", 20,
+                           lambda: phone_status(SERIAL).get("plugged"), interval=0.5)
+                note(f"lantern connect {SERIAL}: {lantern_cmd('connect', SERIAL)}")
+                _, secs = wait_until(f"{SERIAL} ready", 20,
+                                     lambda: phone_status(SERIAL).get("state") == "ready",
+                                     interval=0.5)
+                note(f"{SERIAL} ready {secs:.1f} s after Connect")
+                self._other_unchanged(o_pids, windows[0][1], since)
+                ok = True
+            finally:
+                cleanup(ok, ("close O's Settings window",
+                             lambda: self._close_pair_settings(windows)))
+
 
 ITEMS = [
     "session_starts_on_plug",
@@ -2741,13 +2989,19 @@ ITEMS = [
     "autoconnect_off_asks_on_plug",
     "connect_from_entry_opens_app",
     "unlock_prompt_at_connect",
+    "two_phones_live",
+    "clipboard_fans_out",
+    "one_phone_failure_isolated",
+    "unplug_one_keeps_other",
 ]
-# Need a person: pull the cable (8, 14, 24, 25), type the phone's PIN (21, 27) or click Connect (26).
+# Need a person: pull the cable (8, 14, 24, 25, 31), type the phone's PIN (21, 27) or click
+# Connect (26).
 MANUAL = {"usb_yank", "usb_yank_restores_keyboard", "unlock_prompt",
           "autoconnect_on_remembers_off", "autoconnect_off_asks_on_plug",
-          "connect_from_entry_opens_app", "unlock_prompt_at_connect"}
+          "connect_from_entry_opens_app", "unlock_prompt_at_connect", "unplug_one_keeps_other"}
 # Run only with --pair (inside `two_phones`); a --pair run selects only these.
-PAIR = set()
+PAIR = {"two_phones_live", "clipboard_fans_out", "one_phone_failure_isolated",
+        "unplug_one_keeps_other"}
 # The person's steps for every manual item, in order: printed for every selected manual item
 # before any item runs, and again (`>>>`) when the item starts. He does them at his pace; every
 # wait observes its edge for up to MANUAL_WAIT.
@@ -2787,6 +3041,10 @@ STEPS = {
         "When 'Unlock your edge 50 pro' shows, click Enter PIN… and type the PIN.",
         "Then leave the phone alone for 5 minutes.",
     ],
+    "unplug_one_keeps_other": [
+        "Pull the Xiaomi's cable and keep it out for at least 15 s.",
+        "Plug it back in.",
+    ],
 }
 
 
@@ -2820,8 +3078,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manual", action="store_true",
-                    help="also run items 8, 14, 21 and 24-27 (USB unplug/replug, typing "
-                         "the PIN, clicking Connect; prompts)")
+                    help="also run items 8, 14, 21, 24-27 and 31 (USB unplug/replug, "
+                         "typing the PIN, clicking Connect; prompts)")
     ap.add_argument("--state", action="store_true", help="print phone state + status and exit")
     ap.add_argument("--only", nargs="*", help="run only these items (numbers or names)")
     ap.add_argument("--nested", action="store_true",
@@ -2875,7 +3133,7 @@ def main():
             print(f"  {line}", flush=True)
     if not args.nested and desktop_locked():
         print("WARNING: the Plasma session is locked; windows get no frames, so the window items "
-              "(4-6, 12, 13, 17, 22) cannot pass. Unlock it or use --nested.", flush=True)
+              "(4-6, 12, 13, 17, 22, 28-31) cannot pass. Unlock it or use --nested.", flush=True)
     results = []
     # Preflight: lanternd serves only this phone for the run (other phones plugged in are
     # ignored); the previous value is put back at the end.
@@ -2933,6 +3191,12 @@ def main():
                 test_activity(False)
             except Exception as e:
                 print(f"WARNING: could not disable the companion's test screen: {e}", flush=True)
+        if "clipboard_fans_out" in items and OTHER:
+            for phone in (SERIAL, OTHER):
+                try:  # item 29 opens both phones' test screens
+                    test_activity(False, phone)
+                except Exception as e:
+                    print(f"WARNING: could not disable {phone}'s test screen: {e}", flush=True)
         if previous != SERIAL:
             # lanternd's environment as it was before the run, each step guarded.
             try:

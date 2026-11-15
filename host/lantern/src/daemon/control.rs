@@ -10,8 +10,8 @@ use lantern_proto::{CompanionState, PhoneReport, PhoneState};
 /// A command for the daemon's run loop. Each names its phone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Clear the phone's `off` flag and make it the wanted phone if it is plugged in (another
-    /// live phone is closed, its `off` untouched); otherwise ask the user to plug it in.
+    /// Clear the phone's `off` flag and start its session if it is plugged in (other live
+    /// phones keep theirs); otherwise ask the user to plug it in.
     /// `open` (pkg, user) is opened on it once its session is ready (within
     /// [`super::phones::Timing::pending_for`]).
     Connect {
@@ -24,7 +24,8 @@ pub enum Command {
     /// Switch the phone off, close its session if it has one, then remove Lantern from it
     /// (`undo::run_steps`). Only for a plugged-in phone.
     UndoSetup { serial: String },
-    /// End the daemon (after a running undo finishes); the live phone's `live` flag is cleared.
+    /// End the daemon (after a running undo finishes); every live phone's `live` flag is
+    /// cleared.
     Quit,
 }
 
@@ -40,9 +41,9 @@ pub struct PhoneView {
     /// The user switched it off in Lantern.
     pub off: bool,
     /// Its PIN lock is in the way: from the helper's `locked` until `unlocked`, a successful
-    /// `unlock_result`, or the end of the session. Only ever true for the live phone.
+    /// `unlock_result`, or the end of the session. Only ever true for a live phone.
     pub locked: bool,
-    /// The live session's last `companion` state and its `msg` (live phone only).
+    /// Its live session's last `companion` state and its `msg` (live phones only).
     pub companion: Option<(CompanionState, Option<String>)>,
 }
 
@@ -73,9 +74,15 @@ pub struct View {
 }
 
 impl View {
-    /// The phone being served, started, retried or reconnected (at most one).
+    /// The first phone being served, started, retried or reconnected (Task 6 replaces its
+    /// users with [`Self::live_phones`]).
     pub fn live(&self) -> Option<&PhoneView> {
         self.phones.iter().find(|p| p.state.is_live())
+    }
+
+    /// Every phone being served, started, retried or reconnected, in view order.
+    pub fn live_phones(&self) -> impl Iterator<Item = &PhoneView> {
+        self.phones.iter().filter(|p| p.state.is_live())
     }
 
     pub fn phone(&self, serial: &str) -> Option<&PhoneView> {
@@ -166,6 +173,12 @@ mod tests {
             phones: vec![a.clone(), b.clone()],
         };
         assert_eq!(view.live(), Some(&b));
+        let c = phone("c", PhoneState::Ready);
+        let two = View {
+            phones: vec![a.clone(), b.clone(), c.clone()],
+        };
+        assert_eq!(two.live_phones().collect::<Vec<_>>(), [&b, &c]);
+        assert_eq!(View::default().live_phones().count(), 0);
         assert_eq!(view.phone("a"), Some(&a));
         assert_eq!(view.phone("c"), None);
         assert_eq!(a.display_name(), "Pixel");

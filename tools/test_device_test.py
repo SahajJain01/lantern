@@ -228,6 +228,15 @@ class DeviceTestSelfTests(unittest.TestCase):
     def test_pair_items_need_pair(self):
         self.assertTrue(set(dt.PAIR) <= set(dt.ITEMS))
 
+    def test_items_28_to_31_are_pair_items(self):
+        names = dt.ITEMS[27:31]
+        self.assertEqual(names, ["two_phones_live", "clipboard_fans_out",
+                                 "one_phone_failure_isolated", "unplug_one_keeps_other"])
+        self.assertEqual(set(names), dt.PAIR)
+        self.assertEqual(dt.MANUAL & dt.PAIR, {"unplug_one_keeps_other"})
+        for name in dt.ITEMS:
+            self.assertTrue(callable(getattr(dt.Suite, name, None)), name)
+
     def test_pair_cleanup_runs_every_step_in_order(self):
         ran = []
 

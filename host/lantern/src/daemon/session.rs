@@ -1,3 +1,4 @@
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -139,15 +140,26 @@ impl SessionConn {
     /// through this keeps the reader task from stalling on a full inbound queue, which would
     /// otherwise also hide socket EOF.
     pub async fn next(&mut self) -> Inbound {
-        tokio::select! {
-            frame = self.rx.recv() => match frame {
-                Some(frame) => Inbound::Frame(frame),
-                // The reader queues why on `done` before it exits (and so before `rx` closes),
-                // so the reason is already there if it is coming at all: never wait for it.
-                None => Inbound::Ended(self.done.try_recv().unwrap_or("helper connection ended")),
-            },
-            why = self.done.recv() => Inbound::Ended(why.unwrap_or("session tasks ended")),
+        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// [`Self::next`] as a poll: queued frames first, then why the session ended. Registers
+    /// `cx` for both, so a run loop can poll many sessions in one future.
+    pub fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Inbound> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(frame)) => return Poll::Ready(Inbound::Frame(frame)),
+            // The reader queues why on `done` before it exits (and so before `rx` closes),
+            // so the reason is already there if it is coming at all: never wait for it.
+            Poll::Ready(None) => {
+                return Poll::Ready(Inbound::Ended(
+                    self.done.try_recv().unwrap_or("helper connection ended"),
+                ))
+            }
+            Poll::Pending => {}
         }
+        self.done
+            .poll_recv(cx)
+            .map(|why| Inbound::Ended(why.unwrap_or("session tasks ended")))
     }
 
     /// Closes both socket halves before waiting for the helper. A jammed peer therefore cannot

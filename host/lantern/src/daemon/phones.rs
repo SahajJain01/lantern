@@ -12,6 +12,9 @@ pub struct Timing {
     /// How long a `Connect` for a phone that isn't ready is remembered: a phone not plugged in
     /// connects if plugged in within it, and an app it carries opens once that phone is ready.
     pub pending_for: Duration,
+    /// How long after the unplug grace the start-up stale-`live` check waits for adb's first
+    /// device list before it runs anyway (decision 14).
+    pub list_wait: Duration,
 }
 
 impl Default for Timing {
@@ -19,6 +22,7 @@ impl Default for Timing {
         Self {
             unplug_grace: Duration::from_secs(10),
             pending_for: Duration::from_secs(120),
+            list_wait: Duration::from_secs(30),
         }
     }
 }
@@ -26,7 +30,7 @@ impl Default for Timing {
 /// What to do with a phone that just came online.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnPlug {
-    /// Make it the wanted phone (closing another live one, whose `off` flag is untouched).
+    /// Start its session (another live phone keeps its own).
     Connect,
     /// Leave it waiting and ask the user ("<phone> is plugged in").
     Prompt,
@@ -36,13 +40,13 @@ pub enum OnPlug {
     Ignore,
 }
 
-/// The rule for `serial` coming online, evaluated in this order:
+/// The rule for `serial` coming online, evaluated in this order. Other live phones play no
+/// part: every phone that qualifies connects (decision 4).
 /// 1. `configured` (`$LANTERN_SERIAL`) is set: Connect for that serial, Ignore for any other.
 /// 2. `pending` (a connect request for it, with or without an app, that hasn't expired):
 ///    Connect.
-/// 3. `live` (it was connected when lanternd stopped): Connect if nothing is `wanted`, else
-///    Wait.
-/// 4. `autoconnect && !off`: Connect if nothing is wanted, else Prompt.
+/// 3. `live` (it was connected when lanternd stopped): Connect.
+/// 4. `autoconnect && !off`: Connect.
 /// 5. `autoconnect && off`: Wait.
 /// 6. `!autoconnect`: Prompt.
 pub fn on_plug(
@@ -52,7 +56,6 @@ pub fn on_plug(
     off: bool,
     live: bool,
     pending: bool,
-    wanted: Option<&str>,
 ) -> OnPlug {
     if let Some(configured) = configured {
         return if configured == serial {
@@ -61,19 +64,11 @@ pub fn on_plug(
             OnPlug::Ignore
         };
     }
-    if pending {
+    if pending || live {
         return OnPlug::Connect;
     }
-    if live {
-        return if wanted.is_none() {
-            OnPlug::Connect
-        } else {
-            OnPlug::Wait
-        };
-    }
     match (autoconnect, off) {
-        (true, false) if wanted.is_none() => OnPlug::Connect,
-        (true, false) => OnPlug::Prompt,
+        (true, false) => OnPlug::Connect,
         (true, true) => OnPlug::Wait,
         (false, _) => OnPlug::Prompt,
     }
@@ -88,36 +83,29 @@ mod tests {
         let t = Timing::default();
         assert_eq!(t.unplug_grace, Duration::from_secs(10));
         assert_eq!(t.pending_for, Duration::from_secs(120));
+        assert_eq!(t.list_wait, Duration::from_secs(30));
     }
 
     #[test]
     fn on_plug_table() {
         use OnPlug::*;
-        // (configured, autoconnect, off, live, pending, wanted) for serial "s".
-        let rule = |configured, autoconnect, off, live, pending, wanted| {
-            on_plug("s", configured, autoconnect, off, live, pending, wanted)
+        // (configured, autoconnect, off, live, pending) for serial "s".
+        let rule = |configured, autoconnect, off, live, pending| {
+            on_plug("s", configured, autoconnect, off, live, pending)
         };
         // 1. configured: Connect for that serial whatever else holds, Ignore for any other.
-        assert_eq!(rule(Some("s"), false, true, false, false, None), Connect);
-        assert_eq!(
-            rule(Some("s"), false, true, false, false, Some("x")),
-            Connect
-        );
-        assert_eq!(rule(Some("x"), true, false, true, true, None), Ignore);
-        // 2. pending: Connect, even off, with autoconnect off and another phone wanted.
-        assert_eq!(rule(None, false, true, false, true, Some("x")), Connect);
-        // 3. live: Connect if nothing is wanted, else Wait.
-        assert_eq!(rule(None, false, false, true, false, None), Connect);
-        assert_eq!(rule(None, false, false, true, false, Some("x")), Wait);
-        // 4. autoconnect and not off: Connect if nothing is wanted, else Prompt.
-        assert_eq!(rule(None, true, false, false, false, None), Connect);
-        assert_eq!(rule(None, true, false, false, false, Some("x")), Prompt);
+        assert_eq!(rule(Some("s"), false, true, false, false), Connect);
+        assert_eq!(rule(Some("x"), true, false, true, true), Ignore);
+        // 2. pending: Connect, even off with autoconnect off.
+        assert_eq!(rule(None, false, true, false, true), Connect);
+        // 3. live: Connect, even with autoconnect off.
+        assert_eq!(rule(None, false, false, true, false), Connect);
+        // 4. autoconnect and not off: Connect.
+        assert_eq!(rule(None, true, false, false, false), Connect);
         // 5. autoconnect and off: Wait.
-        assert_eq!(rule(None, true, true, false, false, None), Wait);
-        assert_eq!(rule(None, true, true, false, false, Some("x")), Wait);
-        // 6. autoconnect off: Prompt, off or not, wanted or not.
-        assert_eq!(rule(None, false, false, false, false, None), Prompt);
-        assert_eq!(rule(None, false, true, false, false, None), Prompt);
-        assert_eq!(rule(None, false, false, false, false, Some("x")), Prompt);
+        assert_eq!(rule(None, true, true, false, false), Wait);
+        // 6. autoconnect off: Prompt, off or not.
+        assert_eq!(rule(None, false, false, false, false), Prompt);
+        assert_eq!(rule(None, false, true, false, false), Prompt);
     }
 }

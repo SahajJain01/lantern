@@ -4,12 +4,12 @@ pub mod control;
 pub mod ipc;
 pub mod phones;
 pub mod registry;
+pub mod runs;
 pub mod session;
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +32,9 @@ use crate::daemon::control::{
     Command, ConnectEvent, Notifier, Opener, PhoneView, UndoRunner, View,
 };
 use crate::daemon::phones::{on_plug, OnPlug, Timing};
+use crate::daemon::runs::{PhoneRun, RunEvent, Runs};
 use crate::daemon::session::{start_with_companion, HandshakeError};
+use crate::notices::escape_markup;
 use crate::settings::{self, Settings, SettingsHandle};
 use crate::unlock::{self, LockEvent};
 
@@ -64,42 +66,103 @@ impl RetryPolicy {
     }
 }
 
-/// Ends the active session, if any. Its window clients are closed with it: windows belong to
-/// one helper session and cannot survive a restart.
-async fn close_session(session: &mut Option<(SessionConn, Instant)>, hub: &mut Hub) {
-    if let Some((session, _)) = session.take() {
-        let serial = session.serial().to_owned();
-        hub.session_down(&serial);
+/// Ends `serial`'s session, if its run has one. Its window clients are closed at once
+/// (`hub.session_down`): windows belong to one helper session and cannot survive a restart.
+/// The returned future sends `bye` and waits for the helper; the caller runs it (in the
+/// background, so another phone's frames keep flowing meanwhile).
+fn close_run<F>(
+    serial: &str,
+    run: &mut PhoneRun<F>,
+    hub: &mut Hub,
+) -> Option<BoxFuture<'static, ()>> {
+    let (session, _) = run.active.take()?;
+    hub.session_down(serial);
+    let serial = serial.to_owned();
+    Some(Box::pin(async move {
         session.close().await;
         tracing::info!(serial, "session closed");
-    }
+    }))
 }
 
-/// A wedged helper ends its own session only: `Some(why)` when it is the active one's.
-fn wedged_ends(
-    active: &Option<(SessionConn, Instant)>,
-    wedged: HelperWedged,
-) -> Option<&'static str> {
-    match active {
-        Some((session, _)) if session.serial() == wedged.serial => Some("helper stopped reading"),
-        _ => {
-            tracing::warn!(
-                serial = wedged.serial,
-                "a helper that isn't live stopped reading"
-            );
-            None
+/// Ends whatever runs for `serial` and forgets its run; its flags are the caller's. A phone
+/// offline in its grace keeps the rest of it in `leaving`. Every other phone's run is
+/// untouched. Returns its session's close, as [`close_run`].
+fn release<F>(
+    serial: &str,
+    why: &str,
+    runs: &mut Runs<F>,
+    hub: &mut Hub,
+    leaving: &mut HashMap<String, Instant>,
+) -> Option<BoxFuture<'static, ()>>
+where
+    F: Future<Output = Result<SessionConn>>,
+{
+    let mut run = runs.release(serial)?;
+    run.cancel_start(serial, why);
+    if let Some(until) = run.grace {
+        leaving.insert(serial.to_owned(), until);
+    }
+    close_run(serial, &mut run, hub)
+}
+
+/// Session closes running in the background; quitting waits for them.
+#[derive(Default)]
+struct Closing(Vec<tokio::task::JoinHandle<()>>);
+
+impl Closing {
+    fn spawn(&mut self, close: Option<BoxFuture<'static, ()>>) {
+        self.0.retain(|task| !task.is_finished());
+        if let Some(close) = close {
+            self.0.push(tokio::spawn(close));
+        }
+    }
+
+    /// Waits for every close still running (each is bounded by `SessionConn::close`).
+    async fn finish(&mut self) {
+        let tasks = std::mem::take(&mut self.0);
+        if tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::join_all(tasks),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("session closes still running at exit");
         }
     }
 }
 
-type Starting<F> = Option<(String, Pin<Box<F>>)>;
+/// Ends every phone's run and waits until each session got `bye` and closed. No flag changes.
+async fn close_all<F>(runs: &mut Runs<F>, hub: &mut Hub, closing: &mut Closing, why: &str)
+where
+    F: Future<Output = Result<SessionConn>>,
+{
+    let mut closes = Vec::new();
+    for serial in runs.serials() {
+        if let Some(mut run) = runs.release(&serial) {
+            run.cancel_start(&serial, why);
+            closes.extend(close_run(&serial, &mut run, hub));
+        }
+    }
+    futures_util::future::join_all(closes).await;
+    closing.finish().await;
+}
 
-fn cancel_start<F>(starting: &mut Starting<F>, why: &str) {
-    if let Some((serial, future)) = starting.take() {
-        // Dropping the start future drops its PendingSession, which kills the helper and
-        // removes the forward.
-        drop(future);
-        tracing::info!(serial, why, "session start cancelled");
+/// A wedged helper ends its own session only, and only while it is live.
+fn wedged_ends<F>(runs: &Runs<F>, wedged: HelperWedged, ended: &mut Vec<(String, &'static str)>)
+where
+    F: Future<Output = Result<SessionConn>>,
+{
+    if runs
+        .get(&wedged.serial)
+        .is_some_and(|run| run.active.is_some())
+    {
+        ended.push((wedged.serial, "helper stopped reading"));
+    } else {
+        tracing::warn!(
+            serial = wedged.serial,
+            "a helper that isn't live stopped reading"
+        );
     }
 }
 
@@ -132,7 +195,8 @@ pub struct Parts {
     /// The device records (`devices/<serial>.json`) holding each phone's `off`/`live` flags.
     /// With `None` the flags live in memory only.
     pub state_dir: Option<PathBuf>,
-    /// The unplug grace and how long a connect-and-open request waits.
+    /// The unplug grace, how long a connect-and-open request waits and how long the start-up
+    /// live check waits for adb's first device list.
     pub timing: Timing,
     /// Gets the "plugged in" / "plug it in" / refused-open prompts (`try_send`: a full channel
     /// drops one). Set only when the connect prompt runs: it also makes an open for a phone that
@@ -446,22 +510,6 @@ impl Table {
             .is_some_and(|p| p.until > Instant::now())
     }
 
-    /// Drops every connect request except `serial`'s: the user's latest choice of
-    /// phone wins, so an older request can't switch to its phone when that one is plugged.
-    fn keep_pending_for(&mut self, serial: &str) {
-        self.pending.retain(|s, p| {
-            let keep = s == serial;
-            if !keep {
-                tracing::info!(
-                    serial = s,
-                    open = ?p.open,
-                    "connect request dropped: another phone chosen"
-                );
-            }
-            keep
-        });
-    }
-
     /// The phones the view lists besides the plugged ones: records, else this run's flags.
     fn others(&self) -> Vec<String> {
         let mut all: Vec<String> = self.known.clone();
@@ -490,28 +538,34 @@ impl Prompts {
 }
 
 /// Every branch is polled concurrently: a session start in flight never blocks the stop signal,
-/// device events or clients, and helper death is noticed through `SessionConn::closed`. The live
-/// session's inbound frames are always drained (routed to window clients).
+/// device events or clients, and helper death is noticed through each session's inbound queue.
+/// Every live session's inbound frames are always drained (routed to window clients), starting
+/// from a rotating phone so none starves.
 ///
-/// The phone table decides what is served (see [`phones::on_plug`]):
-/// - `wanted` is the only start target; retries keep it. At most one phone is wanted.
-/// - The wanted phone going offline closes its session and starts the unplug grace; back within
-///   it, it restarts at once without asking; past it, its `live` flag is cleared and nothing
-///   else starts.
+/// Every checked phone has its own run ([`Runs`]): session, start, backoff and unplug grace.
+/// One phone's failure, retry, offline, Disconnect or Undo never closes, restarts or sends
+/// frames to another phone's session or windows. The phone table decides what is served (see
+/// [`phones::on_plug`]):
+/// - Any phone that qualifies connects, whatever else is live; nothing is switched away.
+/// - A wanted phone going offline closes its own session and starts its unplug grace; back
+///   within it, it restarts at once without asking; past it, its `live` flag is cleared and
+///   its run is forgotten.
+/// - A failed start or a helper death backs off on that phone's run only (a wedged helper
+///   ends its own session alone). A handshake protocol error still ends lanternd.
 /// - Disconnect and Undo set the phone's `off` (and clear `live`) before its session closes;
-///   Connect clears `off`. Switching to another phone closes the old one without touching its
-///   `off`. A stop signal leaves every flag as it is; Quit clears the live phone's `live`.
-/// - The latest choice of phone wins: a Connect, or a phone connecting on plug-in, drops every
-///   other phone's connect-and-open request. A phone left waiting loses its `live` flag.
-/// - Nothing starts while an undo runs, and commands other than Quit are ignored meanwhile.
-/// - Every phone that isn't live gets the same unplug grace: a plugged phone that isn't wanted
-///   going offline, or the wanted phone released while offline in its grace (keeping the rest
-///   of it). Back within the grace is a blip: it isn't asked and nothing changes, so a loose
-///   cable never re-pops a notice. Past it, `Gone`.
+///   Connect clears `off`. A stop signal leaves every flag as it is; Quit clears the `live`
+///   flag of every wanted phone.
+/// - Connect-and-open requests are per phone: a choice for one phone never drops another's.
+///   Disconnect and Undo drop that phone's own.
+/// - One undo at a time: a Connect for the phone being undone, or an Undo of a second phone,
+///   is refused with a notice saying why. Commands for other phones run normally meanwhile.
+/// - Every phone that isn't wanted gets the same unplug grace: a plugged phone that isn't
+///   wanted going offline, or a wanted phone released while offline in its grace (keeping the
+///   rest of it). Back within the grace is a blip: it isn't asked and nothing changes, so a
+///   loose cable never re-pops a notice. Past it, `Gone`.
 /// - A phone's connect notice closes (`Gone`) when it gets ready or is gone for good (the end
 ///   of its grace, wanted or not).
-// `release!` resets `retry_at` before a switch schedules the new phone's start.
-#[allow(clippy::too_many_arguments, unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 async fn drive<E, S, F, D>(
     mut hub: Hub,
     mut offers: Option<mpsc::Receiver<PcOffer>>,
@@ -549,74 +603,38 @@ where
     };
     hub.set_configured(configured.clone());
     let configured = configured.as_deref();
-    // Records with a stale `live` flag are cleared once the grace after start has passed, but
-    // never before adb's first device list has been handled (`listed`): a phone that list
-    // reports must not lose its flag to a slow adb.
+    // Records with a stale `live` flag are cleared once the grace after start has passed and
+    // adb's first device list has been handled (`listed`: a phone that list reports must not
+    // lose its flag to a slow adb), or at the latest `list_wait` later (decision 14).
     let mut listed = false;
-    let mut startup = state_dir
-        .as_ref()
-        .map(|_| Instant::now() + timing.unplug_grace);
+    let started_at = Instant::now();
+    let mut startup = state_dir.is_some();
     let mut table = Table::new(state_dir);
     let mut prompts = Prompts {
         events: connect_events,
     };
-    // The one phone to serve.
-    let mut wanted: Option<String> = None;
-    // The wanted phone is offline: the end of its unplug grace.
-    let mut grace: Option<Instant> = None;
+    let mut runs: Runs<F> = Runs::new();
     // Plugged phones that aren't wanted and went offline (or were released in their grace): the
     // end of each one's unplug grace. Back within it is a blip: nothing is asked or changed.
     // Past it, `Gone` (the prompt ignores it for a phone with no notice).
     let mut leaving: HashMap<String, Instant> = HashMap::new();
-    let mut active: Option<(SessionConn, Instant)> = None;
-    let mut starting: Starting<F> = None;
-    let mut retry_at: Option<Instant> = None;
-    let mut failures: u32 = 0;
     let mut undoing: Undoing = None;
-
-    // Ends whatever runs for the wanted phone and forgets it; evaluates to its serial. Its
-    // flags are the caller's. A phone offline in its grace keeps the rest of it in `leaving`.
-    macro_rules! release {
-        ($why:expr) => {{
-            cancel_start(&mut starting, $why);
-            close_session(&mut active, &mut hub).await;
-            retry_at = None;
-            failures = 0;
-            let old = wanted.take();
-            if let (Some(until), Some(old)) = (grace.take(), old.as_ref()) {
-                leaving.insert(old.clone(), until);
-            }
-            old
-        }};
-    }
+    let mut closing = Closing::default();
 
     loop {
-        let idle = active.is_none() && starting.is_none() && undoing.is_none();
-        // The top-level status: the live phone, else the phone switched off most recently while
-        // it stays plugged (and off), else idle.
+        // The top-level status when no phone is live: the phone switched off most recently
+        // while it stays plugged (and off), else idle.
         let paused = table
             .last_off
             .clone()
-            .filter(|s| wanted.is_none() && table.plugged(s) && table.off(s));
+            .filter(|s| runs.is_empty() && table.plugged(s) && table.off(s));
         hub.set_paused(paused);
-        // In a block: the closure borrows `undoing`, which must not live across an await.
         let now_view = {
             let state_of = |serial: &str| -> PhoneState {
                 if undoing.as_ref().is_some_and(|(s, _)| s == serial) {
                     PhoneState::Undoing
-                } else if wanted.as_deref() == Some(serial) {
-                    if active.is_some() {
-                        PhoneState::Ready
-                    } else if starting.is_some() {
-                        PhoneState::Starting
-                    } else if grace.is_some() {
-                        PhoneState::Reconnecting
-                    } else if failures > 0 {
-                        PhoneState::Retrying
-                    } else {
-                        // A start due now is as good as starting.
-                        PhoneState::Starting
-                    }
+                } else if let Some(state) = runs.state(serial) {
+                    state
                 } else if table.plugged(serial) {
                     if table.off(serial) {
                         PhoneState::Off
@@ -628,8 +646,10 @@ where
                 }
             };
             let mut listed: Vec<String> = table.plugged.clone();
-            if let Some(w) = wanted.as_ref().filter(|w| !listed.contains(w)) {
-                listed.push(w.clone());
+            for wanted in runs.serials() {
+                if !listed.contains(&wanted) {
+                    listed.push(wanted);
+                }
             }
             let mut rest: Vec<(String, String)> = table
                 .others()
@@ -668,15 +688,21 @@ where
                 true
             });
         }
-        let wake = retry_at.unwrap_or_else(Instant::now);
-        let grace_end = grace.unwrap_or_else(Instant::now);
-        let startup_end = startup.unwrap_or_else(Instant::now);
+        let wake = runs.next_wake();
+        let wake_at = wake.unwrap_or_else(Instant::now);
+        let startup_end = started_at
+            + timing.unplug_grace
+            + if listed {
+                Duration::ZERO
+            } else {
+                timing.list_wait
+            };
         let leave_end = leaving.values().min().copied().unwrap_or_else(Instant::now);
-        // Set when the live session must be torn down and restarted.
-        let mut ended: Option<&'static str> = None;
+        // Sessions that must be torn down and restarted (helper death, wedged helper), with why.
+        let mut ended: Vec<(String, &'static str)> = Vec::new();
         // Set when the daemon must end (signal or Quit).
         let mut quit: Option<&'static str> = None;
-        // Quit (not a stop signal) clears the live phone's `live` flag.
+        // Quit (not a stop signal) clears the `live` flag of every wanted phone.
         let mut clear_live = false;
         // Commands to apply after this turn's event.
         let mut queued: Vec<Command> = Vec::new();
@@ -697,8 +723,7 @@ where
             }
             event = events.next() => {
                 let Some(event) = event else {
-                    cancel_start(&mut starting, "device stream ended");
-                    close_session(&mut active, &mut hub).await;
+                    close_all(&mut runs, &mut hub, &mut closing, "device stream ended").await;
                     if let Some((serial, undo)) = undoing.take() {
                         tracing::info!(serial, "waiting for undo-setup to finish");
                         let (ok, output) = undo.await;
@@ -717,15 +742,14 @@ where
                             table.plugged.push(serial.clone());
                         }
                         names.refresh(&serial);
-                        // The wanted phone back after its grace ended (its expiry not handled
+                        // A wanted phone back after its grace ended (its expiry not handled
                         // yet, e.g. a zero grace) is a real plug-in: expire it here first.
-                        if wanted.as_deref() == Some(serial.as_str())
-                            && grace.is_some_and(|until| until <= Instant::now())
+                        if runs
+                            .get(&serial)
+                            .and_then(|run| run.grace)
+                            .is_some_and(|until| until <= Instant::now())
                         {
-                            grace = None;
-                            wanted = None;
-                            retry_at = None;
-                            failures = 0;
+                            runs.release(&serial);
                             tracing::info!(serial, "back after the unplug grace ended; a new plug-in");
                             table.set_live(&serial, false);
                             prompts.send(ConnectEvent::Gone { serial: serial.clone() });
@@ -741,11 +765,11 @@ where
                             }
                             None => false,
                         };
-                        if wanted.as_deref() == Some(serial.as_str()) {
-                            if grace.take().is_some() {
+                        if let Some(run) = runs.get_mut(&serial) {
+                            if run.grace.take().is_some() {
                                 tracing::info!(serial, "back within the unplug grace; reconnecting");
-                                failures = 0;
-                                retry_at = Some(Instant::now());
+                                run.failures = 0;
+                                run.retry_at = Some(Instant::now());
                             }
                         } else if undoing.as_ref().is_some_and(|(s, _)| *s == serial) {
                             tracing::info!(serial, "phone is being undone; not starting");
@@ -763,43 +787,31 @@ where
                                 flags.off,
                                 flags.live,
                                 table.pending(&serial),
-                                wanted.as_deref(),
                             );
                             tracing::info!(serial, ?rule, autoconnect, off = flags.off, live = flags.live, "plugged in");
                             match rule {
+                                // Other live phones keep their sessions.
                                 OnPlug::Connect => {
-                                    if let Some(old) = release!("another phone connects") {
-                                        table.set_live(&old, false);
-                                    }
-                                    table.keep_pending_for(&serial);
-                                    wanted = Some(serial);
-                                    retry_at = Some(Instant::now());
+                                    runs.want(&serial);
                                 }
                                 OnPlug::Prompt => {
                                     let name = names.get(&serial).unwrap_or_else(|| serial.clone());
                                     prompts.send(ConnectEvent::PluggedIn { serial, name });
                                 }
-                                OnPlug::Wait => {
-                                    // Left waiting: it is no longer the phone to resume, so a
-                                    // later blip doesn't connect it without a click.
-                                    if flags.live {
-                                        table.set_live(&serial, false);
-                                    }
-                                }
-                                OnPlug::Ignore => {}
+                                OnPlug::Wait | OnPlug::Ignore => {}
                             }
                         }
                     }
                     DeviceEvent::Offline(serial) => {
                         let was_plugged = table.plugged(&serial);
                         table.plugged.retain(|s| *s != serial);
-                        if wanted.as_deref() == Some(serial.as_str()) {
+                        if let Some(run) = runs.get_mut(&serial) {
                             tracing::info!(serial, grace = ?timing.unplug_grace, "device offline; waiting for it to come back");
-                            cancel_start(&mut starting, "device offline");
-                            close_session(&mut active, &mut hub).await;
-                            retry_at = None;
-                            failures = 0;
-                            grace = Some(Instant::now() + timing.unplug_grace);
+                            run.cancel_start(&serial, "device offline");
+                            closing.spawn(close_run(&serial, run, &mut hub));
+                            run.retry_at = None;
+                            run.failures = 0;
+                            run.grace = Some(Instant::now() + timing.unplug_grace);
                         } else if was_plugged {
                             tracing::info!(serial, "device offline");
                             // Back within the grace is a blip; its notice closes only past it.
@@ -814,22 +826,30 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep_until(wake), if idle && retry_at.is_some() => {
-                retry_at = None;
-                if let Some(serial) = wanted.clone().filter(|s| table.plugged(s)) {
-                    tracing::info!(serial, attempt = failures + 1, "starting session");
-                    starting = Some((serial.clone(), Box::pin(starter(serial))));
+            _ = tokio::time::sleep_until(wake_at), if wake.is_some() => {
+                let now = Instant::now();
+                for serial in runs.serials() {
+                    let Some(run) = runs.get_mut(&serial) else { continue };
+                    if run.grace.is_some_and(|until| until <= now) {
+                        runs.release(&serial);
+                        tracing::info!(serial, "unplugged (offline past the grace)");
+                        table.set_live(&serial, false);
+                        prompts.send(ConnectEvent::Gone { serial });
+                        continue;
+                    }
+                    let due = run.active.is_none()
+                        && run.starting.is_none()
+                        && run.retry_at.is_some_and(|at| at <= now);
+                    if !due {
+                        continue;
+                    }
+                    run.retry_at = None;
+                    let undone = undoing.as_ref().is_some_and(|(s, _)| *s == serial);
+                    if table.plugged(&serial) && !undone {
+                        tracing::info!(serial, attempt = run.failures + 1, "starting session");
+                        run.starting = Some(Box::pin(starter(serial.clone())));
+                    }
                 }
-            }
-            _ = tokio::time::sleep_until(grace_end), if grace.is_some() => {
-                grace = None;
-                if let Some(serial) = wanted.take() {
-                    tracing::info!(serial, "unplugged (offline past the grace)");
-                    table.set_live(&serial, false);
-                    prompts.send(ConnectEvent::Gone { serial });
-                }
-                retry_at = None;
-                failures = 0;
             }
             _ = tokio::time::sleep_until(leave_end), if !leaving.is_empty() => {
                 let now = Instant::now();
@@ -844,10 +864,13 @@ where
                     prompts.send(ConnectEvent::Gone { serial });
                 }
             }
-            _ = tokio::time::sleep_until(startup_end), if listed && startup.is_some() => {
-                startup = None;
+            _ = tokio::time::sleep_until(startup_end), if startup => {
+                startup = false;
+                if !listed {
+                    tracing::info!(wait = ?timing.list_wait, "no device list from adb yet; checking live flags anyway");
+                }
                 for serial in table.known.clone() {
-                    if table.plugged(&serial) || wanted.as_deref() == Some(serial.as_str()) {
+                    if table.plugged(&serial) || runs.is_wanted(&serial) {
                         continue;
                     }
                     if table.read(&serial).live {
@@ -856,49 +879,56 @@ where
                     }
                 }
             }
-            result = async { starting.as_mut().expect("guarded").1.as_mut().await }, if starting.is_some() => {
-                let (serial, _) = starting.take().expect("guarded");
-                match result {
-                    Ok(session) => {
-                        tracing::info!(serial, helper = session.helper_sha(), "session ready");
-                        hub.session_up(&serial, session.tx.clone(), session.helper_sha());
-                        // The start has just recorded the phone's name.
-                        names.refresh(&serial);
-                        active = Some((session, Instant::now()));
-                        table.set_live(&serial, true);
-                        prompts.send(ConnectEvent::Gone { serial: serial.clone() });
-                        if let Some(Pending { open: Some((pkg, user)), until }) =
-                            table.pending.remove(&serial)
-                        {
-                            if until > Instant::now() {
-                                tracing::info!(serial, pkg, user, "opening the requested app");
-                                if let Some(opener) = &opener {
-                                    opener(&serial, &pkg, user);
-                                }
-                            } else {
-                                tracing::info!(serial, pkg, "connect-and-open request expired");
+            event = runs.next() => match event {
+                RunEvent::Started(serial, Ok(session)) => {
+                    tracing::info!(serial, helper = session.helper_sha(), "session ready");
+                    hub.session_up(&serial, session.tx.clone(), session.helper_sha());
+                    // The start has just recorded the phone's name.
+                    names.refresh(&serial);
+                    if let Some(run) = runs.get_mut(&serial) {
+                        run.active = Some((session, Instant::now()));
+                    }
+                    table.set_live(&serial, true);
+                    prompts.send(ConnectEvent::Gone { serial: serial.clone() });
+                    if let Some(Pending { open: Some((pkg, user)), until }) =
+                        table.pending.remove(&serial)
+                    {
+                        if until > Instant::now() {
+                            tracing::info!(serial, pkg, user, "opening the requested app");
+                            if let Some(opener) = &opener {
+                                opener(&serial, &pkg, user);
                             }
+                        } else {
+                            tracing::info!(serial, pkg, "connect-and-open request expired");
                         }
                     }
-                    Err(error) if HandshakeError::find(&error).is_some() => {
-                        // The embedded helper answers the same way on every attempt; retrying
-                        // would only spin. Stop with the explained error (non-zero exit).
-                        tracing::error!(serial, error = format!("{error:#}"), "helper protocol mismatch; not retrying");
-                        close_session(&mut active, &mut hub).await;
-                        return Err(error.context(format!("session start on {serial} failed")));
-                    }
-                    Err(error) => {
-                        failures += 1;
-                        let delay = policy.delay(failures);
+                }
+                RunEvent::Started(serial, Err(error)) if HandshakeError::find(&error).is_some() => {
+                    // The embedded helper answers the same way on every attempt; retrying
+                    // would only spin. Stop with the explained error (non-zero exit).
+                    tracing::error!(serial, error = format!("{error:#}"), "helper protocol mismatch; not retrying");
+                    close_all(&mut runs, &mut hub, &mut closing, "helper protocol mismatch").await;
+                    return Err(error.context(format!("session start on {serial} failed")));
+                }
+                RunEvent::Started(serial, Err(error)) => {
+                    if let Some(run) = runs.get_mut(&serial) {
+                        run.failures += 1;
+                        let delay = policy.delay(run.failures);
                         tracing::error!(serial, error = format!("{error:#}"), retry_in = ?delay, "session start failed");
-                        retry_at = Some(Instant::now() + delay);
+                        run.retry_at = Some(Instant::now() + delay);
                     }
                 }
-            }
+                RunEvent::Inbound(serial, Inbound::Frame(frame)) => {
+                    if let Err(wedged) = hub.on_helper(&serial, frame).await {
+                        wedged_ends(&runs, wedged, &mut ended);
+                    }
+                }
+                RunEvent::Inbound(serial, Inbound::Ended(why)) => ended.push((serial, why)),
+            },
             (ok, output) = async { undoing.as_mut().expect("guarded").1.as_mut().await }, if undoing.is_some() => {
                 let (serial, _) = undoing.take().expect("guarded");
                 undo_done(&serial, ok, &output, &mut names, notify.as_ref());
-                // The phone stays off (set before the undo); nothing else starts.
+                // The phone stays off (set before the undo); nothing starts for it.
                 table.refresh_known();
             }
             pin = async { unlock.as_mut().expect("guarded").recv().await }, if unlock.is_some() => {
@@ -920,7 +950,7 @@ where
                                 );
                             }
                         }
-                        Err(wedged) => ended = wedged_ends(&active, wedged),
+                        Err(wedged) => wedged_ends(&runs, wedged, &mut ended),
                     },
                     None => {
                         tracing::debug!("unlock channel closed");
@@ -930,7 +960,7 @@ where
             }
             event = hub.next_event() => {
                 if let Err(wedged) = hub.on_client(event).await {
-                    ended = wedged_ends(&active, wedged);
+                    wedged_ends(&runs, wedged, &mut ended);
                 }
                 queued.extend(hub.take_commands());
                 for (serial, pkg, user) in hub.take_refused() {
@@ -948,9 +978,7 @@ where
                     // To the live phones only: nothing is queued for a later session.
                     Some(offer) => {
                         for wedged in hub.on_pc_clip(offer).await {
-                            if let Some(why) = wedged_ends(&active, wedged) {
-                                ended = Some(why);
-                            }
+                            wedged_ends(&runs, wedged, &mut ended);
                         }
                     }
                     None => {
@@ -959,27 +987,15 @@ where
                     }
                 }
             }
-            inbound = async { active.as_mut().expect("guarded").0.next().await }, if active.is_some() => {
-                match inbound {
-                    Inbound::Frame(frame) => {
-                        let serial = active.as_ref().expect("guarded").0.serial().to_owned();
-                        if let Err(wedged) = hub.on_helper(&serial, frame).await {
-                            ended = wedged_ends(&active, wedged);
-                        }
-                    }
-                    Inbound::Ended(why) => ended = Some(why),
-                }
-            }
         }
         if let Some(why) = quit {
             tracing::info!("{why} received");
             if clear_live {
-                if let Some(serial) = wanted.clone() {
+                for serial in runs.serials() {
                     table.set_live(&serial, false);
                 }
             }
-            cancel_start(&mut starting, why);
-            close_session(&mut active, &mut hub).await;
+            close_all(&mut runs, &mut hub, &mut closing, why).await;
             if let Some((serial, undo)) = undoing.take() {
                 tracing::info!(serial, "waiting for undo-setup to finish before quitting");
                 let (ok, output) = undo.await;
@@ -987,30 +1003,25 @@ where
             }
             return Ok(());
         }
-        if let Some(why) = ended {
-            let lived = active
-                .as_ref()
-                .map(|(_, since)| since.elapsed())
-                .unwrap_or_default();
-            let serial = active
-                .as_ref()
-                .map(|(s, _)| s.serial().to_owned())
-                .unwrap_or_default();
+        for (serial, why) in ended {
+            // Only that phone's session; a second report for it in the same turn finds it gone.
+            let Some(run) = runs.get_mut(&serial) else {
+                continue;
+            };
+            let Some(lived) = run.active.as_ref().map(|(_, since)| since.elapsed()) else {
+                continue;
+            };
             tracing::warn!(serial, why, ?lived, "helper session ended unexpectedly");
-            close_session(&mut active, &mut hub).await;
+            closing.spawn(close_run(&serial, run, &mut hub));
             if lived >= policy.stable_after {
-                failures = 0;
+                run.failures = 0;
             }
-            failures += 1;
-            let delay = policy.delay(failures);
+            run.failures += 1;
+            let delay = policy.delay(run.failures);
             tracing::info!(serial, retry_in = ?delay, "restarting session");
-            retry_at = Some(Instant::now() + delay);
+            run.retry_at = Some(Instant::now() + delay);
         }
         for cmd in queued {
-            if undoing.is_some() {
-                tracing::info!(?cmd, "undo-setup running; command ignored");
-                continue;
-            }
             let serial = match &cmd {
                 Command::Connect { serial, .. }
                 | Command::Disconnect { serial }
@@ -1021,16 +1032,25 @@ where
                 tracing::info!(serial, ?cmd, "not LANTERN_SERIAL; command ignored");
                 continue;
             }
+            let being_undone = undoing.as_ref().map(|(s, _)| s.clone());
             match cmd {
+                Command::Connect { serial, .. } if being_undone.as_ref() == Some(&serial) => {
+                    tracing::info!(serial, "connect refused: undo-setup is running on it");
+                    let name = names.get(&serial).unwrap_or_else(|| serial.clone());
+                    if let Some(notify) = &notify {
+                        notify(
+                            &format!("Lantern is still being removed from {name}"),
+                            "Connect it again when that's done.",
+                        );
+                    }
+                }
                 Command::Connect { serial, open } => {
                     tracing::info!(serial, ?open, "connected in Lantern");
                     // Its "Plug in" notice (or its session's Gone) takes over from the grace.
                     leaving.remove(&serial);
                     table.set_off(&serial, false);
-                    // The latest choice wins: a request for another phone must not switch later.
-                    table.keep_pending_for(&serial);
                     let app = open.as_ref().map(|(pkg, user)| hub.app_name(pkg, *user));
-                    let ready = active.as_ref().is_some_and(|(s, _)| s.serial() == serial);
+                    let ready = runs.get(&serial).is_some_and(|run| run.active.is_some());
                     let plugged = table.plugged(&serial);
                     let open = match (open, &opener, ready) {
                         (Some((pkg, user)), Some(opener), true) => {
@@ -1042,6 +1062,7 @@ where
                     // Remembered for `pending_for`: an app to open once it is ready, and for a
                     // phone that isn't plugged in, the connect itself ("It connects if you plug
                     // it in within 2 minutes"). A plain Connect keeps an app still asked for.
+                    // Another phone's request is left alone (decision 5).
                     if open.is_some() || !plugged {
                         let now = Instant::now();
                         let kept = table
@@ -1058,20 +1079,20 @@ where
                     if !plugged {
                         let name = names.get(&serial).unwrap_or_else(|| serial.clone());
                         prompts.send(ConnectEvent::PlugIn { serial, name, app });
-                    } else if wanted.as_deref() == Some(serial.as_str()) {
+                    } else if let Some(run) = runs.get_mut(&serial) {
                         // Already wanted: a start in backoff is retried now.
-                        if active.is_none() && starting.is_none() && retry_at.is_some() {
-                            failures = 0;
-                            retry_at = Some(Instant::now());
+                        if run.active.is_none() && run.starting.is_none() && run.retry_at.is_some()
+                        {
+                            run.failures = 0;
+                            run.retry_at = Some(Instant::now());
                         }
                     } else {
-                        if let Some(old) = release!("another phone connects") {
-                            tracing::info!(serial = old, "switched to another phone");
-                            table.set_live(&old, false);
-                        }
-                        wanted = Some(serial);
-                        retry_at = Some(Instant::now());
+                        // Other live phones keep their sessions.
+                        runs.want(&serial);
                     }
+                }
+                Command::Disconnect { serial } if being_undone.as_ref() == Some(&serial) => {
+                    tracing::info!(serial, "undo-setup running on it; it is off already");
                 }
                 Command::Disconnect { serial } => {
                     tracing::info!(serial, "disconnected in Lantern");
@@ -1080,12 +1101,36 @@ where
                     table.set_live(&serial, false);
                     table.last_off = Some(serial.clone());
                     table.pending.remove(&serial);
-                    if wanted.as_deref() == Some(serial.as_str()) {
-                        // `bye`: the helper restores the phone.
-                        release!("disconnected in Lantern");
-                    }
+                    // `bye`: the helper restores the phone. Only this phone's run ends.
+                    let close = release(
+                        &serial,
+                        "disconnected in Lantern",
+                        &mut runs,
+                        &mut hub,
+                        &mut leaving,
+                    );
+                    closing.spawn(close);
+                }
+                Command::UndoSetup { serial } if being_undone.as_ref() == Some(&serial) => {
+                    tracing::info!(serial, "undo-setup is already running on it");
                 }
                 Command::UndoSetup { serial } => {
+                    if let Some(other) = &being_undone {
+                        tracing::info!(
+                            serial,
+                            other,
+                            "undo-setup refused: another undo is running"
+                        );
+                        let other = names.get(other).unwrap_or_else(|| other.clone());
+                        let name = names.get(&serial).unwrap_or_else(|| serial.clone());
+                        if let Some(notify) = &notify {
+                            notify(
+                                &format!("Lantern is busy removing itself from {other}"),
+                                &format!("Try {} again when that's done.", escape_markup(&name)),
+                            );
+                        }
+                        continue;
+                    }
                     let Some(run) = &undo else {
                         tracing::warn!("undo-setup is not available in this daemon");
                         continue;
@@ -1099,12 +1144,20 @@ where
                     table.set_live(&serial, false);
                     table.last_off = Some(serial.clone());
                     table.pending.remove(&serial);
-                    if wanted.as_deref() == Some(serial.as_str()) {
-                        // The helper's connection is closed before the undo runs; `run_steps`
-                        // itself waits for helper processes still restoring the phone.
-                        release!("undo-setup");
-                    }
-                    undoing = Some((serial.clone(), run(serial)));
+                    // The helper's connection is closed before the undo runs; `run_steps`
+                    // itself waits for helper processes still restoring the phone. Only this
+                    // phone's run ends.
+                    let close = release(&serial, "undo-setup", &mut runs, &mut hub, &mut leaving);
+                    let steps = run(serial.clone());
+                    undoing = Some((
+                        serial,
+                        Box::pin(async move {
+                            if let Some(close) = close {
+                                close.await;
+                            }
+                            steps.await
+                        }),
+                    ));
                 }
                 Command::Quit => unreachable!("Quit is handled when it arrives"),
             }
