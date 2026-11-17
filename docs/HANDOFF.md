@@ -1,4 +1,4 @@
-# Lantern — handoff (Plan 4c implemented, 2026-11-15)
+# Lantern — handoff (end of Plan 4c, 2026-11-18)
 
 Start here in a new session. Read this file, then `README.md`, then the spec
 `docs/superpowers/specs/2026-11-07-lantern-design.md`.
@@ -59,7 +59,7 @@ Start here in a new session. Read this file, then `README.md`, then the spec
     and every task checked a before/after fingerprint of his real files (identical).
 - **Plan 4c** (`docs/superpowers/plans/2026-11-15-lantern-many-phones.md`, design
   `docs/superpowers/specs/2026-11-14-lantern-multi-phone-design.md` G6–G8 and the 2026-11-15
-  addendum: G9 and the Plan 4b rough edges): **implemented, device acceptance pending**, on
+  addendum: G9 and the Plan 4b rough edges): **done and merged into `main`** (2026-11-18), device acceptance 33/34 (see below), on
   branch `plan4c-many-phones` (worktree `.worktrees/plan4c`, base `main` `5a9ab86`). Device steps
   were deferred by Sahaj's instruction to one acceptance run at the end (Task 8 Steps 2–8, see
   "Plan 4c device acceptance"). Task 1 passed review after one fix round; Tasks 2–7 passed
@@ -79,14 +79,34 @@ is switched on from its tray row. While connected it is kept awake, the Lantern 
 selected, and its screen stays on unless `screen_off = true`. Each phone's apps are a top-level
 category in the launcher, named after the phone.
 
-### Plan 4c device acceptance (pending)
+### Plan 4c device acceptance (2026-11-16/18, desktop unlocked) — 33/34
 
-_Placeholder: the controller fills this in after the run (Task 8 Steps 2–8): Pass A (`build.py
-install && device_test.py`, expected 21/21: items 1–7, 9–13, 15–20, 22, 23, 34), Pass B
-(`--pair --manual --only 28 29 30`, expected 3/3), the manual items (8, 14; `--pair` 31, 32; the
-Motorola's 27, 21; with the Motorola unplugged 24, 25, 26, 33) and the hand checks (two checked
-tray rows, the Remove dialog's escaped name, two taskbar groups, both phones' settings
-restored)._
+- **Pass A** (both phones attached, Xiaomi pinned): **21/21 PASS** (1–7, 9–13, 15–20, 22, 23, 34).
+- **Pass B** (`--pair --manual --only 28 29 30`): **3/3** after one re-run. Item 28 first failed at
+  its baseline: the Motorola's `enabled_input_methods` held `dev.lantern.companion/.LanternIme`
+  with no session (field finding 2's leftover, journaled into `orig`, so every restore put it
+  back). Cleared with `ime disable`; Gboard stayed default. Two windows (`win` 1/2) on separate
+  phones, adb-chosen forward ports, per-phone KWin app ids.
+- **Manual:** 8 and 14 PASS (item 8's first pass ever: `cleanup: panel on` since the yank);
+  31 and 32 PASS (second run; the first lost the Motorola off USB mid-item); 21 and 27 PASS on
+  the Motorola (27: the "Unlock your edge 50 pro" notice 0.2 s after ready, 5 minutes unlocked
+  with the panel Off, same helper — G9 and "kept unlocked while connected" hold); 25 and 33 PASS
+  (33: the replug notice said "Connect it to open Settings here." and Connect opened it); 24 PASS
+  on its third run (earlier runs: a second pull given too early, then a suite setup race).
+- **Not passed: item 26** (Connect on "Connect your Xiaomi 11T Pro" opens the app). Four runs never
+  got a Connect click to lanternd (a 36-minute wait then a cable pull, twice; two suite setup
+  races). The same open-after-Connect path passed in item 33 and in Plan 4b's hand check.
+- **Found during acceptance (follow-ups):**
+  - After a reboot lanternd started before the session PATH held `~/.local/bin`, so every `adb`
+    spawn failed (`failed to start adb track-devices: No such file`) until it was quit. Resolve
+    adb independently of the boot PATH.
+  - A poisoned `enabled_input_methods` `orig` (already containing the Lantern IME) persists across
+    sessions: strip the Lantern IME from `orig` when journaling.
+  - Suite: `serves()` reads a phone as not served in the window right after a cleanup or preflight
+    restart (live flag pending), so `read_baseline` fails "released"; treat a plugged `live` phone
+    as served or wait for the restart to settle.
+  - Hand checks (two tray rows screenshot, Remove dialog rendering) not done separately; two live
+    phones with a window from each were used by Sahaj during the run.
 
 ### Plan 4b device acceptance (2026-11-14/15, desktop unlocked)
 
@@ -589,15 +609,10 @@ Also settled during execution (ledger rulings):
 
 ## Next
 
-1. **Plan 4c device acceptance** (Task 8 Steps 2–8 of the plan, with Sahaj): back up the real
-   launcher files, menu fragments, Lantern state and settings; ask before `build.py install` if
-   `lantern status` shows windows he is using; give him every step in one message; run Pass A,
-   Pass B, the manual items one at a time and the hand checks; verify from the lanternd journal
-   and logcat. Every wrong PIN counts toward the Motorola's lockout. Then fill in "Plan 4c device
-   acceptance" above and commit `docs: Plan 4c acceptance, protocol and README updates`.
-2. Final whole-branch review (triage every `minor (deferred)` ledger line), then merge
-   `plan4c-many-phones` into `main` (fast-forward), copy the SDD ledger to the main checkout and
-   fix "Where things stand".
+1. **Small follow-up (from Plan 4c acceptance):** resolve `adb` independent of the boot PATH;
+   strip the Lantern IME from a journaled `enabled_input_methods` `orig`; fix the suite's
+   `serves()` race after a restart; then re-run item 26 with Sahaj (click Connect promptly).
+2. Ctrl shortcuts in Windows App (field finding 3): probe, then fill `scanCode` in the helper.
 
 Still open from earlier lists (later plans):
 
